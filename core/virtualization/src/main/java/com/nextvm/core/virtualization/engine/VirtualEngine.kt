@@ -873,7 +873,19 @@ class VirtualEngine @Inject constructor(
      * Returns null on any failure; the caller falls back to the manual
      * VirtualClassLoader path.
      */
-    private fun createFrameworkClassLoader(app: VirtualApp): ClassLoader? {
+    /** Framework LoadedApk per guest instance (android.app.LoadedApk, kept as Any). */
+    private val frameworkLoadedApks = mutableMapOf<String, Any>()
+
+    /** The framework LoadedApk created for this instance, if the framework path engaged. */
+    fun frameworkLoadedApkFor(instanceId: String): Any? = frameworkLoadedApks[instanceId]
+
+    /**
+     * Obtain (and cache) the framework LoadedApk for a guest via
+     * ActivityThread.getPackageInfoNoCheck on the guest's
+     * ApplicationInfo. Returns null on any failure.
+     */
+    private fun createFrameworkLoadedApk(app: VirtualApp): Any? {
+        frameworkLoadedApks[app.instanceId]?.let { return it }
         return try {
             val baseInfo = serviceManager.packageManager.getApplicationInfo(app.packageName)
                 ?: return null
@@ -901,6 +913,15 @@ class VirtualEngine @Inject constructor(
                 }
                 uid = android.os.Process.myUid()
                 deviceProtectedDataDir = dataDir
+                // LoadedApk.makeApplication() instantiates
+                // ApplicationInfo.className; the VPMS copies leave it
+                // null, which silently substitutes a default
+                // android.app.Application — a packer's stub Application
+                // would then never run at all. The install parse stored
+                // the real manifest application class on the VirtualApp.
+                if (app.applicationClassName != null) {
+                    className = app.applicationClassName
+                }
             }
             val atClass = Class.forName("android.app.ActivityThread")
             val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
@@ -911,6 +932,17 @@ class VirtualEngine @Inject constructor(
                 .getMethod("getPackageInfoNoCheck", ApplicationInfo::class.java, compatClass)
                 .invoke(activityThread, appInfo, compat)
                 ?: return null
+            frameworkLoadedApks[app.instanceId] = loadedApk
+            loadedApk
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Framework LoadedApk failed for ${app.packageName}")
+            null
+        }
+    }
+
+    private fun createFrameworkClassLoader(app: VirtualApp): ClassLoader? {
+        return try {
+            val loadedApk = createFrameworkLoadedApk(app) ?: return null
             val classLoader = loadedApk.javaClass.getMethod("getClassLoader")
                 .invoke(loadedApk) as? ClassLoader
                 ?: return null
@@ -1424,7 +1456,8 @@ class VirtualEngine @Inject constructor(
                 classLoader = classLoader,
                 virtualContext = virtualContext,
                 providerNames = providerNames,
-                providerAuthorities = providerAuthorities
+                providerAuthorities = providerAuthorities,
+                frameworkLoadedApk = frameworkLoadedApks[instanceId]
             )
 
             Timber.tag(TAG).i("Guest Application booted successfully for $instanceId")

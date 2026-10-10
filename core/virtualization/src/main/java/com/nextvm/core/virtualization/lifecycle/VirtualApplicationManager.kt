@@ -112,7 +112,8 @@ class VirtualApplicationManager @Inject constructor() {
         classLoader: ClassLoader,
         virtualContext: Context,
         providerNames: List<String> = emptyList(),
-        providerAuthorities: Map<String, String> = emptyMap()
+        providerAuthorities: Map<String, String> = emptyMap(),
+        frameworkLoadedApk: Any? = null
     ): Application? {
         // Check if already bound
         val existing = applications[instanceId]
@@ -126,6 +127,23 @@ class VirtualApplicationManager @Inject constructor() {
         Timber.tag(TAG).d("  providers: ${providerNames.size}")
 
         try {
+            // B2: framework-native bind — when a framework LoadedApk is
+            // available for this guest, the Application is created and
+            // attached by the framework itself instead of being
+            // hand-assembled onto the host's (patched) LoadedApk.
+            if (frameworkLoadedApk != null) {
+                val fwApp = bindViaFrameworkLoadedApk(
+                    instanceId = instanceId,
+                    packageName = packageName,
+                    loadedApk = frameworkLoadedApk,
+                    virtualContext = virtualContext,
+                    providerNames = providerNames,
+                    providerAuthorities = providerAuthorities
+                )
+                if (fwApp != null) return fwApp
+                // fall through to the legacy bind path
+            }
+
             // Step 1: Prepare ApplicationInfo on the virtual context
             val appInfo = buildApplicationInfo(packageName, apkPath, virtualContext)
 
@@ -196,6 +214,105 @@ class VirtualApplicationManager @Inject constructor() {
             Timber.tag(TAG).e(e, "Failed to bind application for $packageName ($instanceId)")
             applications.remove(instanceId)
             return null
+        }
+    }
+
+    /**
+     * Framework-native bind (B2): build the guest's app ContextImpl
+     * from its framework LoadedApk and let LoadedApk.makeApplication()
+     * create + attach the Application — the same construction a real
+     * app goes through in ActivityThread.handleBindApplication().
+     *
+     * The legacy path instead instantiates the Application by
+     * reflection and attaches it to a VirtualContext whose underlying
+     * LoadedApk is the HOST's (with guest paths patched into it). Any
+     * code inspecting the Application's LoadedApk/ContextImpl object
+     * graph (packers do) sees the seam. Here mLoadedApk, the resources,
+     * the data dirs and the class loader are all genuinely the guest's
+     * own framework objects.
+     *
+     * Providers and onCreate keep the same ordering as the legacy path.
+     * Returns null if the framework construction fails; the caller
+     * then falls back to the legacy bind.
+     */
+    private fun bindViaFrameworkLoadedApk(
+        instanceId: String,
+        packageName: String,
+        loadedApk: Any,
+        virtualContext: Context,
+        providerNames: List<String>,
+        providerAuthorities: Map<String, String>
+    ): Application? {
+        return try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
+                ?: return null
+            val loadedApkClass = Class.forName("android.app.LoadedApk")
+            val contextImplClass = Class.forName("android.app.ContextImpl")
+            val createAppContext = contextImplClass.getDeclaredMethod(
+                "createAppContext", atClass, loadedApkClass
+            )
+            createAppContext.isAccessible = true
+            val appContext = createAppContext.invoke(null, activityThread, loadedApk) as Context
+
+            val guestClassLoader = loadedApkClass.getMethod("getClassLoader")
+                .invoke(loadedApk) as? ClassLoader ?: return null
+
+            // Same CheckJNI guard as the legacy attach path.
+            disableCheckJniForGuest()
+
+            val application = try {
+                loadedApkClass.getMethod(
+                    "makeApplication",
+                    Boolean::class.javaPrimitiveType,
+                    Instrumentation::class.java
+                ).invoke(loadedApk, false, null) as? Application
+            } catch (e: NoSuchMethodException) {
+                loadedApkClass.getMethod(
+                    "makeApplicationInner",
+                    Boolean::class.javaPrimitiveType,
+                    Instrumentation::class.java,
+                    Boolean::class.javaPrimitiveType
+                ).invoke(loadedApk, false, null, false) as? Application
+            } ?: return null
+
+            val record = ApplicationRecord(
+                instanceId = instanceId,
+                packageName = packageName,
+                application = application,
+                classLoader = guestClassLoader,
+                applicationClassName = application.javaClass.name
+            )
+            applications[instanceId] = record
+
+            if (virtualContext is com.nextvm.core.sandbox.VirtualContext) {
+                virtualContext.setGuestApplication(application)
+            }
+            record.state = ApplicationState.ATTACHED
+
+            if (providerNames.isNotEmpty()) {
+                initContentProviders(
+                    instanceId = instanceId,
+                    providers = providerNames,
+                    authorities = providerAuthorities,
+                    classLoader = guestClassLoader,
+                    virtualContext = appContext,
+                    application = application
+                )
+                record.state = ApplicationState.PROVIDERS_INSTALLED
+            }
+
+            callApplicationOnCreate(application)
+            record.state = ApplicationState.RUNNING
+            Timber.tag(TAG).i(
+                "Framework LoadedApk bind complete for $packageName " +
+                    "(app=${application.javaClass.name}, base=${application.baseContext?.javaClass?.simpleName})"
+            )
+            application
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Framework LoadedApk bind failed for $packageName, falling back to legacy bind")
+            applications.remove(instanceId)
+            null
         }
     }
 
