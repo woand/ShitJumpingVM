@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -52,6 +53,7 @@
 #include <mutex>
 #include <cerrno>
 #include <signal.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <sys/syscall.h>
 #include <android/dlext.h>
@@ -1369,6 +1371,11 @@ static bool install_plt_hooks() {
     return true;
 }
 
+// Seccomp raw-syscall diagnostic: forward declaration (impl below).
+// Refreshed after every late-patch pass so libraries loaded by the
+// guest (e.g. a packer's .so) become attributable in the trap log.
+static void sc_refresh_modules();
+
 /**
  * Re-run the GOT patch pass so libraries loaded after nativeInit
  * (via dlopen / android_dlopen_ext / Runtime.nativeLoad) receive the
@@ -1392,6 +1399,7 @@ static void patch_newly_loaded_libraries() {
              added, added == 1 ? "y" : "ies");
     }
 
+    sc_refresh_modules();
     in_pass = false;
 }
 
@@ -1523,6 +1531,1590 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeSetProcessName(
         prctl(PR_SET_NAME, comm, 0, 0, 0);
         LOGI("process renamed: comm=%s", comm);
         env->ReleaseStringUTFChars(name, n);
+    }
+}
+
+/**
+ * =====================================================================
+ * Seccomp raw-syscall diagnostic
+ * =====================================================================
+ * Every /proc fake the GOT hooks serve sits behind libc. A library
+ * that issues svc instructions directly (a standard anti-hook
+ * technique for strong packers) never touches libc and always sees
+ * the REAL /proc — which would perfectly explain why no amount of
+ * read-path spoofing changed the SecNeo outcome.
+ *
+ * This installs a seccomp filter that TRAPs the path-bearing
+ * syscalls (openat, openat2, readlinkat, faccessat, faccessat2,
+ * newfstatat) process-wide. A SIGSYS handler attributes each trap to
+ * the loaded module containing the svc PC, logs the interesting ones
+ * (any /proc path, any call from a packer library, any unattributed
+ * PC) to a diag file, then EMULATES the call unchanged through a
+ * one-instruction trampoline — the only IP the filter lets through
+ * for these numbers — and resumes the thread. Diagnostic only: no
+ * result is ever altered. The handler uses no libc calls (manual
+ * formatting, trampoline write), so it is safe on any thread.
+ * =====================================================================
+ */
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+
+#ifndef AUDIT_ARCH_AARCH64
+#define AUDIT_ARCH_AARCH64 0xC00000B7
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 0
+#endif
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+
+#if defined(__aarch64__)
+// The trampoline: the only svc the filter allows for trapped numbers.
+// x0 = nr, x1..x4 = syscall args (C calling convention); the asm
+// shuffles them into syscall registers. nv_seccomp_svc_point is the
+// exact address of the svc instruction, baked into the BPF program.
+__asm__(
+    ".text\n"
+    ".globl nv_seccomp_svc\n"
+    ".type nv_seccomp_svc, %function\n"
+    "nv_seccomp_svc:\n"
+    "    mov x8, x0\n"
+    "    mov x0, x1\n"
+    "    mov x1, x2\n"
+    "    mov x2, x3\n"
+    "    mov x3, x4\n"
+    ".globl nv_seccomp_svc_point\n"
+    "nv_seccomp_svc_point:\n"
+    "    svc #0\n"
+    "    ret\n");
+extern "C" long nv_seccomp_svc(long nr, long a0, long a1, long a2, long a3);
+extern "C" char nv_seccomp_svc_point;
+
+namespace {
+
+struct ScModule {
+    uintptr_t lo, hi;
+    char name[48];
+};
+
+// Guest package name captured at arm time for the handler's pure-C
+// path rewriting (the std::string spoof globals are not handler-safe).
+char g_sc_guest_pkg[128] = {0};
+int sc_rewrite_fd_target(const char* in, char* out, int cap);
+
+ScModule g_sc_modules[2048];
+volatile int g_sc_module_count = 0;
+volatile int g_sc_log_fd = -1;
+volatile long g_sc_logged = 0;
+struct sigaction g_sc_prev_action;
+__thread volatile int g_sc_in_handler = 0;
+
+int sc_phdr_cb(struct dl_phdr_info* info, size_t, void*) {
+    if (g_sc_module_count >= 2048) return 0;
+    uintptr_t lo = ~static_cast<uintptr_t>(0), hi = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)& p = info->dlpi_phdr[i];
+        if (p.p_type != PT_LOAD) continue;
+        uintptr_t s = info->dlpi_addr + p.p_vaddr;
+        uintptr_t e = s + p.p_memsz;
+        if (s < lo) lo = s;
+        if (e > hi) hi = e;
+    }
+    if (hi == 0) return 0;
+    ScModule& m = g_sc_modules[g_sc_module_count];
+    m.lo = lo;
+    m.hi = hi;
+    const char* n = (info->dlpi_name && info->dlpi_name[0]) ? info->dlpi_name : "[exe]";
+    const char* base = n;
+    for (const char* p = n; *p; p++) if (*p == '/') base = p + 1;
+    size_t i = 0;
+    for (; base[i] && i < sizeof(m.name) - 1; i++) m.name[i] = base[i];
+    m.name[i] = 0;
+    g_sc_module_count++;
+    return 0;
+}
+
+const ScModule* sc_find(uintptr_t pc) {
+    int count = g_sc_module_count;
+    for (int i = 0; i < count; i++) {
+        if (pc >= g_sc_modules[i].lo && pc < g_sc_modules[i].hi) return &g_sc_modules[i];
+    }
+    return nullptr;
+}
+
+const char* sc_strstr(const char* hay, const char* needle) {
+    if (!*needle) return hay;
+    for (const char* h = hay; *h; h++) {
+        const char* a = h;
+        const char* b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return h;
+    }
+    return nullptr;
+}
+
+bool sc_streq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+void sc_app(char* buf, int& len, int cap, const char* s) {
+    while (*s && len < cap - 1) buf[len++] = *s++;
+}
+
+void sc_app_dec(char* buf, int& len, int cap, long v) {
+    unsigned long long u;
+    if (v < 0) {
+        if (len < cap - 1) buf[len++] = '-';
+        u = static_cast<unsigned long long>(-(v + 1)) + 1;
+    } else {
+        u = static_cast<unsigned long long>(v);
+    }
+    char t[24];
+    int n = 0;
+    if (u == 0) t[n++] = '0';
+    while (u) { t[n++] = static_cast<char>('0' + (u % 10)); u /= 10; }
+    while (n > 0 && len < cap - 1) buf[len++] = t[--n];
+}
+
+void sc_app_hex(char* buf, int& len, int cap, unsigned long long v) {
+    char t[20];
+    int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v) {
+        int d = static_cast<int>(v & 15);
+        t[n++] = static_cast<char>(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    }
+    while (n > 0 && len < cap - 1) buf[len++] = t[--n];
+}
+
+void sc_write_diag(long nr, const ScModule* mod, uintptr_t pc,
+                   const char* path, long dirfd) {
+    int fd = g_sc_log_fd;
+    if (fd < 0) return;
+    char buf[512];
+    int len = 0;
+    const int cap = static_cast<int>(sizeof(buf));
+    sc_app(buf, len, cap, "SC");
+    sc_app_dec(buf, len, cap, nr);
+    sc_app(buf, len, cap, " tid=");
+    sc_app_dec(buf, len, cap, nv_seccomp_svc(__NR_gettid, 0, 0, 0, 0));
+    sc_app(buf, len, cap, " by=");
+    if (mod) {
+        sc_app(buf, len, cap, mod->name);
+        sc_app(buf, len, cap, "+0x");
+        sc_app_hex(buf, len, cap, pc - mod->lo);
+    } else {
+        sc_app(buf, len, cap, "?@0x");
+        sc_app_hex(buf, len, cap, pc);
+    }
+    sc_app(buf, len, cap, " dirfd=");
+    sc_app_dec(buf, len, cap, dirfd);
+    sc_app(buf, len, cap, " path=");
+    sc_app(buf, len, cap, path);
+    sc_app(buf, len, cap, "\n");
+    buf[len] = 0;
+    nv_seccomp_svc(__NR_write, fd, reinterpret_cast<long>(buf), len, 0);
+}
+
+bool sc_is_trapped_nr(long nr) {
+    return nr == __NR_openat || nr == __NR_openat2 || nr == __NR_readlinkat ||
+           nr == __NR_faccessat || nr == __NR_faccessat2 || nr == __NR_newfstatat ||
+           nr == 130 || nr == 131 || nr == 134 || nr == 135;
+}
+
+// ---- Phase 1b: serve rewritten /proc maps from the handler ----
+// The shell reads /proc/self/maps through direct svc openat; feed it
+// a memfd holding the transformed content (same rules as the GOT
+// layer: guest virtual paths rewritten to stock-install form, lines
+// belonging to the host/hook engine dropped). Pure C, trampoline
+// syscalls only, static buffers under a spinlock.
+const int kScMapsCap = 768 * 1024;
+char g_sc_maps_raw[768 * 1024];
+char g_sc_maps_out[768 * 1024];
+volatile int g_sc_maps_lock = 0;
+
+bool sc_path_is_maps(const char* p) {
+    if (sc_streq(p, "/proc/self/maps")) return true;
+    if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' &&
+        p[4] == 'c' && p[5] == '/' && p[6] >= '0' && p[6] <= '9') {
+        int i = 6;
+        while (p[i] >= '0' && p[i] <= '9') i++;
+        return sc_streq(p + i, "/maps");
+    }
+    return false;
+}
+
+long sc_serve_maps(long oflags) {
+    if ((oflags & 3) != 0) return -1;  // O_RDONLY only
+    while (__sync_lock_test_and_set(&g_sc_maps_lock, 1)) {
+    }
+    static const char kSelfMaps[] = "/proc/self/maps";
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(kSelfMaps), 0, 0);
+    if (fd < 0) {
+        __sync_lock_release(&g_sc_maps_lock);
+        return -1;
+    }
+    long total = 0;
+    while (total < kScMapsCap) {
+        long n = nv_seccomp_svc(__NR_read, fd,
+                                reinterpret_cast<long>(g_sc_maps_raw + total),
+                                kScMapsCap - total, 0);
+        if (n < 0) { total = -1; break; }
+        if (n == 0) break;
+        total += n;
+    }
+    nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+    if (total <= 0 || total >= kScMapsCap) {
+        __sync_lock_release(&g_sc_maps_lock);
+        return -1;
+    }
+    static const char* kHidden[] = {"nextvm", "lsplant", "dobby", "bhook",
+                                    "xhook", "substrate", "xposed"};
+    long olen = 0;
+    long pos = 0;
+    while (pos < total) {
+        long eol = pos;
+        while (eol < total && g_sc_maps_raw[eol] != '\n') eol++;
+        if (eol < total) eol++;  // include newline
+        // Locate the pathname: first '/' after the inode column —
+        // approximated by the first '/' in the line (the address and
+        // perms fields contain none).
+        long ps = -1;
+        for (long i = pos; i < eol; i++) {
+            if (g_sc_maps_raw[i] == '/') { ps = i; break; }
+        }
+        bool drop = false;
+        char rw[512];
+        int rlen = -1;
+        long path_len = 0;
+        if (ps >= 0) {
+            path_len = eol - ps;
+            if (path_len > 0 && g_sc_maps_raw[eol - 1] == '\n') path_len--;
+            if (path_len > 500) path_len = 0;  // leave unrewritten
+            if (path_len > 0) {
+                char pbuf[512];
+                for (long i = 0; i < path_len; i++) pbuf[i] = g_sc_maps_raw[ps + i];
+                pbuf[path_len] = 0;
+                if (sc_strstr(pbuf, "/files/virtual/apks/") ||
+                    sc_strstr(pbuf, "/files/virtual/data/")) {
+                    rlen = sc_rewrite_fd_target(pbuf, rw, 500);
+                } else {
+                    for (int k = 0; k < 7; k++) {
+                        if (sc_strstr(pbuf, kHidden[k])) { drop = true; break; }
+                    }
+                }
+            }
+        }
+        if (!drop) {
+            long head = (ps >= 0) ? (ps - pos) : (eol - pos);
+            if (olen + head + (rlen > 0 ? rlen : 0) + 2 >= kScMapsCap) {
+                __sync_lock_release(&g_sc_maps_lock);
+                return -1;
+            }
+            for (long i = 0; i < head; i++) g_sc_maps_out[olen++] = g_sc_maps_raw[pos + i];
+            if (ps >= 0 && rlen > 0) {
+                for (int i = 0; i < rlen; i++) g_sc_maps_out[olen++] = rw[i];
+                g_sc_maps_out[olen++] = '\n';
+            } else if (ps >= 0) {
+                for (long i = ps; i < eol; i++) g_sc_maps_out[olen++] = g_sc_maps_raw[i];
+            }
+        }
+        pos = eol;
+    }
+    long mfd = nv_seccomp_svc(__NR_memfd_create,
+                              reinterpret_cast<long>("jit-cache"),
+                              (oflags & 02000000) ? 1 : 0, 0, 0);
+    if (mfd < 0) {
+        __sync_lock_release(&g_sc_maps_lock);
+        return -1;
+    }
+    long written = 0;
+    bool ok = true;
+    while (written < olen) {
+        long n = nv_seccomp_svc(__NR_write, mfd,
+                                reinterpret_cast<long>(g_sc_maps_out + written),
+                                olen - written, 0);
+        if (n <= 0) { ok = false; break; }
+        written += n;
+    }
+    if (ok) nv_seccomp_svc(__NR_lseek, mfd, 0, 0, 0);
+    if (!ok) {
+        nv_seccomp_svc(__NR_close, mfd, 0, 0, 0);
+        __sync_lock_release(&g_sc_maps_lock);
+        return -1;
+    }
+    __sync_lock_release(&g_sc_maps_lock);
+    return mfd;
+}
+
+// Lean mode (flag files/sc-lean): the handler is a pure passthrough
+// — emulate via the trampoline and resume, with NO logging, NO
+// serving, NO rewriting. Bisection tool for the trap path.
+bool g_sc_lean = false;
+
+void sc_handle(int sig, siginfo_t* info, void* uctx) {
+    if (g_sc_lean && info->si_code == SYS_SECCOMP) {
+        ucontext_t* uc = static_cast<ucontext_t*>(uctx);
+        long r = nv_seccomp_svc(info->si_syscall,
+                                uc->uc_mcontext.regs[0],
+                                uc->uc_mcontext.regs[1],
+                                uc->uc_mcontext.regs[2],
+                                uc->uc_mcontext.regs[3]);
+        uc->uc_mcontext.regs[0] = r;
+        uc->uc_mcontext.pc =
+            reinterpret_cast<uintptr_t>(info->si_call_addr) + 4;
+        return;
+    }
+    // Debug probe: prove the handler runs and record what arrived,
+    // before any branching. Bounded; written unconditionally so traps
+    // on other threads cannot hide behind the reentrancy flag.
+    if (g_sc_log_fd >= 0) {
+        static volatile long probe_count = 0;
+        if (probe_count < 100000) {
+            probe_count++;
+            char pb[160];
+            int plen = 0;
+            const int pcap = static_cast<int>(sizeof(pb));
+            sc_app(pb, plen, pcap, "H code=");
+            sc_app_dec(pb, plen, pcap, info->si_code);
+            sc_app(pb, plen, pcap, " nr=");
+            sc_app_dec(pb, plen, pcap, info->si_syscall);
+            sc_app(pb, plen, pcap, " pc=0x");
+            sc_app_hex(pb, plen, pcap,
+                       reinterpret_cast<uintptr_t>(info->si_call_addr));
+            sc_app(pb, plen, pcap, "\n");
+            pb[plen] = 0;
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(pb), plen, 0);
+        }
+    }
+    if (info->si_code != SYS_SECCOMP || !sc_is_trapped_nr(info->si_syscall)) {
+        // Foreign SIGSYS (e.g. a self-sent tgkill): mark it before chaining.
+        if (g_sc_log_fd >= 0) {
+            char xb[160];
+            int xl = 0;
+            const int xcap = static_cast<int>(sizeof(xb));
+            sc_app(xb, xl, xcap, "X code=");
+            sc_app_dec(xb, xl, xcap, info->si_code);
+            sc_app(xb, xl, xcap, " nr=");
+            sc_app_dec(xb, xl, xcap, info->si_syscall);
+            sc_app(xb, xl, xcap, " pc=0x");
+            sc_app_hex(xb, xl, xcap,
+                       reinterpret_cast<uintptr_t>(info->si_call_addr));
+            sc_app(xb, xl, xcap, "\n");
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(xb), xl, 0);
+        }
+        // Not one of ours: chain to the previous disposition.
+        if ((g_sc_prev_action.sa_flags & SA_SIGINFO) && g_sc_prev_action.sa_sigaction) {
+            g_sc_prev_action.sa_sigaction(sig, info, uctx);
+            return;
+        }
+        if (g_sc_prev_action.sa_handler == SIG_IGN) return;
+        if (g_sc_prev_action.sa_handler &&
+            g_sc_prev_action.sa_handler != SIG_DFL) {
+            g_sc_prev_action.sa_handler(sig);
+            return;
+        }
+        sigaction(SIGSYS, &g_sc_prev_action, nullptr);
+        raise(sig);
+        return;
+    }
+
+    ucontext_t* uc = static_cast<ucontext_t*>(uctx);
+    long nr = info->si_syscall;
+    long a0 = uc->uc_mcontext.regs[0];
+    long a1 = uc->uc_mcontext.regs[1];
+    long a2 = uc->uc_mcontext.regs[2];
+    long a3 = uc->uc_mcontext.regs[3];
+
+    // Signal-channel syscalls: the only way to weaponize SIGSYS
+    // against this filter (block it, reset its disposition, or send
+    // it directly). Log every call; neutralize the SIGSYS cases.
+    if (nr == 130 || nr == 131 || nr == 134 || nr == 135) {
+        uintptr_t pc = reinterpret_cast<uintptr_t>(info->si_call_addr);
+        const ScModule* mod = sc_find(pc);
+        if (g_sc_log_fd >= 0) {
+            static volatile long sig_logged = 0;
+            if (sig_logged < 512) {
+                sig_logged++;
+                char sb[256];
+                int sl = 0;
+                const int scap = static_cast<int>(sizeof(sb));
+                sc_app(sb, sl, scap, "S nr=");
+                sc_app_dec(sb, sl, scap, nr);
+                sc_app(sb, sl, scap, " a0=");
+                sc_app_dec(sb, sl, scap, a0);
+                sc_app(sb, sl, scap, " a1=0x");
+                sc_app_hex(sb, sl, scap, static_cast<uintptr_t>(a1));
+                if (nr == 135 && a1) {
+                    sc_app(sb, sl, scap, " set=0x");
+                    sc_app_hex(sb, sl, scap,
+                               static_cast<uintptr_t>(
+                                   *reinterpret_cast<unsigned long*>(a1)));
+                }
+                sc_app(sb, sl, scap, " a2=");
+                sc_app_dec(sb, sl, scap, a2);
+                sc_app(sb, sl, scap, " by=");
+                sc_app(sb, sl, scap, mod ? mod->name : "?");
+                sc_app(sb, sl, scap, "\n");
+                sb[sl] = 0;
+                nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                               reinterpret_cast<long>(sb), sl, 0);
+            }
+        }
+        long ret = 0;
+        if (nr == 135) {  // rt_sigprocmask
+            if (a1 && (a0 == 0 || a0 == 2)) {  // BLOCK / SETMASK
+                unsigned long m =
+                    *reinterpret_cast<unsigned long*>(a1) &
+                    ~(1UL << 30);
+                ret = nv_seccomp_svc(nr, a0,
+                                     reinterpret_cast<long>(&m), a2, a3);
+            } else {
+                ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+            }
+        } else if (nr == 134) {  // rt_sigaction
+            if (a0 == 31 && a1 != 0) {
+                // Refuse SIGSYS disposition changes; fake the old
+                // action as this handler and report success.
+                if (a2) {
+                    unsigned long* o =
+                        reinterpret_cast<unsigned long*>(a2);
+                    o[0] = reinterpret_cast<unsigned long>(
+                        reinterpret_cast<void*>(&sc_handle));
+                    o[1] = 4;  // SA_SIGINFO
+                    o[2] = 0;
+                    o[3] = 0;
+                }
+                ret = 0;
+            } else {
+                ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+            }
+        } else {  // 130 tkill (sig in a1) / 131 tgkill (sig in a2)
+            long sig_arg = (nr == 130) ? a1 : a2;
+            if (sig_arg == 31) {
+                ret = 0;  // swallowed: SIGSYS is never sent for them
+            } else {
+                ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+            }
+        }
+        uc->uc_mcontext.regs[0] = ret;
+        uc->uc_mcontext.pc =
+            reinterpret_cast<uintptr_t>(info->si_call_addr) + 4;
+        return;
+    }
+
+    char sc_path[168];
+    sc_path[0] = 0;
+    bool sc_have_path = false;
+    if (!g_sc_in_handler) {
+        g_sc_in_handler = 1;
+        // All trapped numbers carry the path pointer in arg1.
+        char path[168];
+        int plen = 0;
+        const char* p = reinterpret_cast<const char*>(static_cast<uintptr_t>(a1));
+        if (p) {
+            while (plen < static_cast<int>(sizeof(path)) - 1 && p[plen]) {
+                path[plen] = p[plen];
+                plen++;
+            }
+        }
+        path[plen] = 0;
+        for (int i = 0; i <= plen; i++) sc_path[i] = path[i];
+        sc_have_path = true;
+        bool proc_path = false;
+        for (int i = 0; i + 4 < plen; i++) {
+            if (path[i] == '/' && path[i + 1] == 'p' && path[i + 2] == 'r' &&
+                path[i + 3] == 'o' && path[i + 4] == 'c') {
+                proc_path = true;
+                break;
+            }
+        }
+        uintptr_t pc = reinterpret_cast<uintptr_t>(info->si_call_addr);
+        const ScModule* mod = sc_find(pc);
+        bool shell_lib = mod && sc_streq(mod->name, "libDexHelper.so");
+        if ((proc_path || shell_lib || mod == nullptr) && g_sc_logged < 4000) {
+            g_sc_logged++;
+            sc_write_diag(nr, mod, pc, path, a0);
+        }
+        g_sc_in_handler = 0;
+    }
+
+    if (g_sc_log_fd >= 0) {
+        char eb[8];
+        int el = 0;
+        sc_app(eb, el, 8, "E\n");
+        nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                       reinterpret_cast<long>(eb), el, 0);
+    }
+    // Phase 1b: direct-svc readers of /proc maps get the rewritten
+    // view via a memfd, exactly like the GOT layer serves libc readers.
+    long ret = -1;
+    bool served_maps = false;
+    if (sc_have_path && (nr == __NR_openat || nr == __NR_openat2) &&
+        sc_path_is_maps(sc_path)) {
+        long oflags = -1;
+        if (nr == __NR_openat) {
+            oflags = a2;
+        } else if (a2) {
+            oflags = static_cast<long>(
+                *reinterpret_cast<uint64_t*>(a2));  // open_how.flags
+        }
+        if (oflags >= 0) {
+            long mfd = sc_serve_maps(oflags);
+            if (mfd >= 0) {
+                ret = mfd;
+                served_maps = true;
+                if (g_sc_log_fd >= 0) {
+                    char mb[8];
+                    int ml = 0;
+                    sc_app(mb, ml, 8, "M\n");
+                    nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                                   reinterpret_cast<long>(mb), ml, 0);
+                }
+            }
+        }
+    }
+    if (!served_maps) {
+        // Emulate the call unchanged through the trampoline and resume
+        // just past the svc instruction.
+        ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+    }
+    if (g_sc_log_fd >= 0) {
+        char rb[8];
+        int rl = 0;
+        sc_app(rb, rl, 8, "R\n");
+        nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                       reinterpret_cast<long>(rb), rl, 0);
+    }
+    // Phase 1a: fd symlink targets served to direct-svc callers must
+    // be rewritten exactly like the GOT layer rewrites them for libc
+    // callers — the raw targets betray the virtual layout.
+    if (nr == __NR_readlinkat && ret > 0) {
+        char* buf = reinterpret_cast<char*>(a2);
+        long bufsz = a3;
+        if (buf && bufsz > 1 && ret <= bufsz && ret < 500) {
+            char orig[512];
+            long n = ret;
+            for (long i = 0; i < n; i++) orig[i] = buf[i];
+            orig[n] = 0;
+            char rw[512];
+            int rlen = sc_rewrite_fd_target(orig, rw, 500);
+            if (rlen > 0 && rlen < bufsz) {
+                for (int i = 0; i < rlen; i++) buf[i] = rw[i];
+                ret = rlen;
+            }
+        }
+    }
+    uc->uc_mcontext.regs[0] = ret;
+    uc->uc_mcontext.pc = reinterpret_cast<uintptr_t>(info->si_call_addr) + 4;
+}
+
+}  // namespace
+
+#endif  // __aarch64__
+
+volatile sig_atomic_t g_sc_armed = 0;
+
+static void sc_refresh_modules() {
+#if defined(__aarch64__)
+    if (!g_sc_armed) return;
+    g_sc_module_count = 0;
+    dl_iterate_phdr(sc_phdr_cb, nullptr);
+#endif
+}
+
+namespace {
+
+// Control-experiment switch, set in sc_arm when the flag file
+bool g_sc_maps_real = false;
+
+// files/sc-empty-filter exists: install the filter with impossible
+// syscall numbers so NOTHING traps. Separates "a second filter
+// exists" (Seccomp_filters=2) effects from trap-handling effects.
+bool g_sc_empty_filter = false;
+
+// Per-syscall trap mask (flag files/sc-trapmask, two hex chars):
+// bit0 openat, bit1 openat2, bit2 readlinkat, bit3 faccessat,
+// bit4 faccessat2, bit5 newfstatat. Masked-out numbers are replaced
+// with impossible ones, like the empty-filter control.
+unsigned g_sc_trap_mask = 0x3F;
+
+// Installs the supervision filter. In notif mode the outcome is
+// SECCOMP_RET_USER_NOTIF and the return value is the listener fd
+// (>= 0); in trap mode the outcome is SECCOMP_RET_TRAP and the
+// return value is 0. Returns -1 on failure.
+//
+// v18 rationale: RET_TRAP delivers a SIGSYS, and any thread that
+// issues a trapped syscall while SIGSYS is transiently blocked
+// (bionic thread start, signal plumbing) is force-killed by the
+// kernel with the handler never running — this both caused false
+// deaths and made the real killer invisible. USER_NOTIF generates
+// no signal at all: a supervisor thread answers each call.
+long sc_install_filter_ex(bool notif, bool with_signals = true,
+                          bool tsync = true) {
+#if !defined(__aarch64__)
+    (void)notif;
+    (void)with_signals;
+    (void)tsync;
+    return -1;
+#else
+    const unsigned s_kill = with_signals ? 129 : 0x3FFFFF10u;
+    const unsigned s_tkill = with_signals ? 130 : 0x3FFFFF11u;
+    const unsigned s_tgkill = with_signals ? 131 : 0x3FFFFF12u;
+    const unsigned s_sigaction = with_signals ? 134 : 0x3FFFFF13u;
+    const unsigned s_sigprocmask = with_signals ? 135 : 0x3FFFFF14u;
+    const unsigned s_tgsigqueue = with_signals ? 297 : 0x3FFFFF15u;
+    const unsigned s_pidfd = with_signals ? 424 : 0x3FFFFF16u;
+    const unsigned t_openat = (g_sc_trap_mask & 0x01) ? __NR_openat : 0x3FFFFF00u;
+    const unsigned t_openat2 = (g_sc_trap_mask & 0x02) ? __NR_openat2 : 0x3FFFFF01u;
+    const unsigned t_readlinkat = (g_sc_trap_mask & 0x04) ? __NR_readlinkat : 0x3FFFFF02u;
+    const unsigned t_faccessat = (g_sc_trap_mask & 0x08) ? __NR_faccessat : 0x3FFFFF03u;
+    const unsigned t_faccessat2 = (g_sc_trap_mask & 0x10) ? __NR_faccessat2 : 0x3FFFFF04u;
+    const unsigned t_newfstatat = (g_sc_trap_mask & 0x20) ? __NR_newfstatat : 0x3FFFFF05u;
+    uintptr_t svc = reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point);
+    uint32_t lo = static_cast<uint32_t>(svc & 0xffffffffu);
+    uint32_t hi = static_cast<uint32_t>(svc >> 32);
+    const unsigned kOutcome = notif ? SECCOMP_RET_USER_NOTIF
+                                    : SECCOMP_RET_TRAP;
+    // Layout (24 insns): arch check -> nr dispatch (13 numbers,
+    // indices 3..15) -> trampoline-IP check (17..21) -> OUTCOME
+    // (22) / ALLOW (23). Signal-channel numbers are always in the
+    // dispatch: under NOTIF they can be watched and neutralized
+    // without any signal ever being generated.
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 21),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 13, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 1, 0),
+        BPF_STMT(BPF_JMP | BPF_JA, 6),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo, 0, 3),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo + 8, 2, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog;
+    prog.len = static_cast<unsigned short>(sizeof(f) / sizeof(f[0]));
+    prog.filter = f;
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (notif) {
+        unsigned flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        if (tsync) flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        long fd = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                          flags, &prog);
+        if (fd >= 0) {
+            LOGI("seccomp-diag: USER_NOTIF filter installed, listener=%ld flags=0x%x",
+                 fd, flags);
+            return fd;
+        }
+        LOGE("seccomp-diag: USER_NOTIF install FAILED (errno=%d flags=0x%x)",
+             errno, flags);
+        return -1;
+    }
+    long rc = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                      SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (TSYNC)");
+        return 0;
+    }
+    int e1 = errno;
+    rc = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (prctl, single thread + inheritors)");
+        return 0;
+    }
+    LOGE("seccomp-diag: filter install FAILED (seccomp errno=%d, prctl errno=%d)",
+         e1, errno);
+    return -1;
+#endif
+}
+
+// Pure-C mirror of rewrite_virtual_path for fd symlink targets,
+// used inside the SIGSYS handler (no allocation, no libc calls).
+// Returns the rewritten length, or -1 when no rewrite applies.
+#if defined(__aarch64__)
+int sc_rewrite_fd_target(const char* in, char* out, int cap) {
+    if (g_sc_guest_pkg[0] == 0) return -1;
+    char core[512];
+    int clen = 0;
+    while (in[clen] && clen < 500) { core[clen] = in[clen]; clen++; }
+    core[clen] = 0;
+    bool deleted = false;
+    if (clen >= 11 && sc_streq(core + clen - 11, " (deleted)")) {
+        core[clen - 11] = 0;
+        clen -= 11;
+        deleted = true;
+    }
+    int olen = 0;
+    auto emit = [&](const char* s) {
+        while (*s && olen < cap - 12) out[olen++] = *s++;
+    };
+    auto emit_synth_apk = [&]() {
+        emit("/data/app/~~VmK8x2==/");
+        emit(g_sc_guest_pkg);
+        emit("-VmK8x2==/base.apk");
+    };
+    const char* apks_marker = sc_strstr(core, "/files/virtual/apks/");
+    const char* data_marker = sc_strstr(core, "/files/virtual/data/");
+    if (apks_marker && clen >= 4 && sc_streq(core + clen - 4, ".apk")) {
+        const char* fname = core + clen;
+        while (fname > core && fname[-1] != '/') fname--;
+        const char* usplit = sc_strstr(fname, "_split_");
+        const char* split = usplit ? sc_strstr(fname, "split_") : nullptr;
+        if (split) {
+            emit("/data/app/~~VmK8x2==/");
+            emit(g_sc_guest_pkg);
+            emit("-VmK8x2==/");
+            emit(split);
+        } else {
+            emit_synth_apk();
+        }
+    } else if (data_marker) {
+        const char* rest = data_marker + 20;  // strlen("/files/virtual/data/")
+        while (*rest && *rest != '/') rest++;
+        if (*rest == '/') rest++;
+        if (!*rest) return -1;
+        if (rest[0] == 'l' && rest[1] == 'i' && rest[2] == 'b' && rest[3] == '/') {
+            const char* b = rest + 4;
+            const char* p = b;
+            while (*p) { if (*p == '/') b = p + 1; p++; }
+            emit("/data/app/~~VmK8x2==/");
+            emit(g_sc_guest_pkg);
+            emit("-VmK8x2==/lib/arm64/");
+            emit(b);
+        } else {
+            emit("/data/data/");
+            emit(g_sc_guest_pkg);
+            emit("/");
+            emit(rest);
+        }
+    } else if (sc_strstr(core, "nextvm")) {
+        emit_synth_apk();
+    } else {
+        return -1;
+    }
+    if (deleted) emit(" (deleted)");
+    out[olen] = 0;
+    return olen;
+}
+#endif  // __aarch64__
+
+#if defined(__aarch64__)
+// Watchdog: sample the main thread's real signal masks and seccomp
+// filter count from /proc/self/status, read raw through the
+// trampoline (bypasses both the filter and the GOT spoof). Logs a WD
+// line whenever the SIGSYS bit of SigBlk/SigCgt or the filter count
+// changes — distinguishes the shell resetting our SIGSYS disposition
+// (SigCgt bit drops), blocking SIGSYS (SigBlk bit rises), or stacking
+// its own seccomp filter (Seccomp_filters rises) before the fatal
+// trap that never reaches our handler.
+// Per-thread blocked-SIGSYS census: a fatal trap can only bypass
+// the handler on a thread whose mask blocks SIGSYS persistently, so
+// sample every thread's SigBlk bit 30 plus its comm. A tid is logged
+// (WD2) when the bit is set in two consecutive polls — handler
+// occupancy alone rarely spans two 5ms polls, so persistent sightings
+// name the threads that would die on their next trapped syscall.
+struct ScTidState {
+    long tid;
+    int blocked_streak;
+    int logged;
+};
+ScTidState g_sc_tid_states[256];
+
+void sc_watchdog_threads() {
+    static const char kTask[] = "/proc/self/task";
+    long dfd = nv_seccomp_svc(__NR_openat, -100,
+                              reinterpret_cast<long>(kTask),
+                              0200000 /*O_DIRECTORY*/, 0);
+    if (dfd < 0) return;
+    char dbuf[4096];
+    long n = nv_seccomp_svc(61 /*getdents64*/, dfd,
+                            reinterpret_cast<long>(dbuf),
+                            sizeof(dbuf), 0);
+    nv_seccomp_svc(__NR_close, dfd, 0, 0, 0);
+    if (n <= 0) return;
+    long self = nv_seccomp_svc(__NR_getpid, 0, 0, 0, 0);
+    long off = 0;
+    while (off < n) {
+        // linux_dirent64: ino(8) off(8) reclen(2) type(1) name[]
+        unsigned short reclen =
+            static_cast<unsigned short>(dbuf[off + 16]) |
+            (static_cast<unsigned short>(dbuf[off + 17]) << 8);
+        if (reclen == 0) break;
+        const char* name = dbuf + off + 19;
+        long tid = 0;
+        bool numeric = name[0] >= '0' && name[0] <= '9';
+        if (numeric) {
+            for (int i = 0; name[i] >= '0' && name[i] <= '9'; i++)
+                tid = tid * 10 + (name[i] - '0');
+        }
+        off += reclen;
+        if (!numeric || tid == 0 || tid == self) continue;
+        char path[96];
+        int pl = 0;
+        const int pcap = static_cast<int>(sizeof(path));
+        sc_app(path, pl, pcap, "/proc/self/task/");
+        sc_app_dec(path, pl, pcap, tid);
+        sc_app(path, pl, pcap, "/status");
+        path[pl] = 0;
+        long fd = nv_seccomp_svc(__NR_openat, -100,
+                                 reinterpret_cast<long>(path), 0, 0);
+        if (fd < 0) continue;
+        char sbuf[3072];
+        long sn = nv_seccomp_svc(__NR_read, fd,
+                                 reinterpret_cast<long>(sbuf),
+                                 sizeof(sbuf) - 1, 0);
+        nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+        if (sn <= 0) continue;
+        sbuf[sn] = 0;
+        const char* bp = sc_strstr(sbuf, "SigBlk:");
+        if (!bp) continue;
+        bp += 7;
+        while (*bp == '\t' || *bp == ' ') bp++;
+        long v = 0;
+        bool any = false;
+        while ((*bp >= '0' && *bp <= '9') || (*bp >= 'a' && *bp <= 'f')) {
+            v = v * 16 + (*bp <= '9' ? *bp - '0' : *bp - 'a' + 10);
+            bp++;
+            any = true;
+        }
+        if (!any) continue;
+        int blocked = static_cast<int>((v >> 30) & 1);
+        ScTidState* st = nullptr;
+        for (int i = 0; i < 256; i++) {
+            if (g_sc_tid_states[i].tid == tid) { st = &g_sc_tid_states[i]; break; }
+            if (g_sc_tid_states[i].tid == 0) {
+                g_sc_tid_states[i].tid = tid;
+                st = &g_sc_tid_states[i];
+                break;
+            }
+        }
+        if (!st) continue;
+        if (blocked) {
+            st->blocked_streak++;
+            if (st->blocked_streak >= 2 && !st->logged && g_sc_log_fd >= 0) {
+                st->logged = 1;
+                char comm[64];
+                int cl = 0;
+                const int ccap = static_cast<int>(sizeof(comm));
+                sc_app(comm, cl, ccap, "/proc/self/task/");
+                sc_app_dec(comm, cl, ccap, tid);
+                sc_app(comm, cl, ccap, "/comm");
+                comm[cl] = 0;
+                char cname[64];
+                cname[0] = 0;
+                long cfd = nv_seccomp_svc(__NR_openat, -100,
+                                          reinterpret_cast<long>(comm), 0, 0);
+                if (cfd >= 0) {
+                    long cn = nv_seccomp_svc(__NR_read, cfd,
+                                              reinterpret_cast<long>(cname),
+                                              sizeof(cname) - 1, 0);
+                    nv_seccomp_svc(__NR_close, cfd, 0, 0, 0);
+                    if (cn > 0) {
+                        if (cname[cn - 1] == '\n') cn--;
+                        cname[cn] = 0;
+                    }
+                }
+                char line[192];
+                int l = snprintf(line, sizeof(line),
+                                 "WD2 tid=%ld comm=%s blk31=1 streak=%d\n",
+                                 tid, cname, st->blocked_streak);
+                if (l > 0) {
+                    ssize_t u = write(g_sc_log_fd, line, l);
+                    (void)u;
+                }
+            }
+        } else {
+            st->blocked_streak = 0;
+        }
+    }
+}
+
+void* sc_watchdog_main(void*) {
+    char buf[4096];
+    long prev_blk = -2, prev_cgt = -2, prev_filters = -2;
+    static const char kStatus[] = "/proc/self/status";
+    for (int iter = 0; iter < 4000 && g_sc_armed; iter++) {
+        sc_watchdog_threads();
+        long fd = nv_seccomp_svc(__NR_openat, -100,
+                                 reinterpret_cast<long>(kStatus), 0, 0);
+        if (fd >= 0) {
+            long n = nv_seccomp_svc(__NR_read, fd,
+                                     reinterpret_cast<long>(buf),
+                                     sizeof(buf) - 1, 0);
+            nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+            if (n > 0) {
+                buf[n] = 0;
+                auto hexfield = [&buf](const char* name) -> long {
+                    const char* p = sc_strstr(buf, name);
+                    if (!p) return -1;
+                    p += strlen(name);
+                    while (*p == '\t' || *p == ' ') p++;
+                    long v = 0;
+                    bool any = false;
+                    while ((*p >= '0' && *p <= '9') ||
+                           (*p >= 'a' && *p <= 'f')) {
+                        v = v * 16 + (*p <= '9' ? *p - '0' : *p - 'a' + 10);
+                        p++;
+                        any = true;
+                    }
+                    return any ? v : -1;
+                };
+                long blk = hexfield("SigBlk:");
+                long cgt = hexfield("SigCgt:");
+                long filters = -1;
+                const char* fp = sc_strstr(buf, "Seccomp_filters:");
+                if (fp) {
+                    fp += 16;
+                    while (*fp == '\t' || *fp == ' ') fp++;
+                    long v = 0;
+                    bool any = false;
+                    while (*fp >= '0' && *fp <= '9') {
+                        v = v * 10 + (*fp - '0');
+                        fp++;
+                        any = true;
+                    }
+                    filters = any ? v : -1;
+                }
+                long blk31 = (blk >= 0) ? ((blk >> 30) & 1) : -1;
+                long cgt31 = (cgt >= 0) ? ((cgt >> 30) & 1) : -1;
+                if (blk31 != prev_blk || cgt31 != prev_cgt ||
+                    filters != prev_filters) {
+                    prev_blk = blk31;
+                    prev_cgt = cgt31;
+                    prev_filters = filters;
+                    if (g_sc_log_fd >= 0) {
+                        char line[160];
+                        int l = snprintf(line, sizeof(line),
+                                         "WD blk31=%ld cgt31=%ld filters=%ld iter=%d\n",
+                                         blk31, cgt31, filters, iter);
+                        if (l > 0) {
+                            ssize_t u = write(g_sc_log_fd, line, l);
+                            (void)u;
+                        }
+                    }
+                }
+            }
+        }
+        usleep(5000);
+    }
+    return nullptr;
+}
+#endif  // __aarch64__
+
+// ---- USER_NOTIF supervisor (v18) ----
+// In this mode no SIGSYS handler exists at all. The supervisor
+// thread answers every trapped syscall through the listener fd, so
+// a caller with SIGSYS blocked simply waits for the answer instead
+// of being force-killed by the kernel, and signal-channel calls
+// (kill/tkill/tgkill/sigaction/sigprocmask/...) can be watched and
+// neutralized directly.
+#if defined(__aarch64__)
+int g_sc_listener_fd = -1;
+volatile int g_sc_mode = 0;  // 0 pending, 1 notif, 2 trap, 3 off
+
+// The NDK's <linux/seccomp.h> omits SECCOMP_IOCTL_NOTIF_SIZES and
+// its sibling macros need <sys/ioctl.h> for _IOW/_IOWR; spell the
+// numbers out with the header's struct types (stable UAPI).
+#define SC_NOTIF_RECV _IOWR('!', 0, struct seccomp_notif)
+#define SC_NOTIF_SEND _IOWR('!', 1, struct seccomp_notif_resp)
+#define SC_NOTIF_ID_VALID _IOW('!', 2, uint64_t)
+#define SC_NOTIF_ADDFD _IOW('!', 3, struct seccomp_notif_addfd)
+
+void sc_slogf(const char* fmt, ...) {
+    if (g_sc_log_fd < 0) return;
+    char buf[640];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        ssize_t u = write(g_sc_log_fd, buf, n);
+        (void)u;
+    }
+}
+
+bool sc_tid_is_own_thread(long tid) {
+    // Authoritative test: the Tgid in /proc/<tid>/status, read with
+    // plain libc (the supervisor is unfiltered, so no trampoline is
+    // needed). The earlier trampoline openat of /proc/self/task/<tid>
+    // returned false for this process's own main thread in the
+    // supervisor context (v23 misrouted its maps serve to ADDFD and
+    // wedged it), so that mechanism is no longer trusted here.
+    char p[64];
+    snprintf(p, sizeof(p), "/proc/%ld/status", tid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return tid == static_cast<long>(getpid());
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    const char* t = strstr(buf, "Tgid:");
+    if (!t) return false;
+    long tg = strtol(t + 5, nullptr, 10);
+    return tg == static_cast<long>(getpid());
+}
+
+// Copies a NUL-terminated string out of the notifying thread's
+// address space: directly when it is one of our own threads, via
+// /proc/<tid>/mem when it is a forked descendant.
+int sc_copy_remote_str(long tid, unsigned long addr, char* out, int cap) {
+    out[0] = 0;
+    if (!addr) return 0;
+    if (sc_tid_is_own_thread(tid)) {
+        const char* p = reinterpret_cast<const char*>(
+            static_cast<uintptr_t>(addr));
+        int n = 0;
+        while (n < cap - 1 && p[n]) {
+            out[n] = p[n];
+            n++;
+        }
+        out[n] = 0;
+        return n;
+    }
+    char mp[64];
+    int l = 0;
+    const int mcap = static_cast<int>(sizeof(mp));
+    sc_app(mp, l, mcap, "/proc/");
+    sc_app_dec(mp, l, mcap, tid);
+    sc_app(mp, l, mcap, "/mem");
+    mp[l] = 0;
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(mp), 0, 0);
+    if (fd >= 0) {
+        int n = 0;
+        while (n < cap - 1) {
+            char c = 0;
+            long r = nv_seccomp_svc(67 /*pread64*/, fd,
+                                    reinterpret_cast<long>(&c), 1,
+                                    static_cast<long>(addr) + n);
+            if (r != 1 || c == 0) break;
+            out[n++] = c;
+        }
+        out[n] = 0;
+        nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+        if (n > 0) return n;
+    }
+    // Fallback: the descendant is a fork of this process and made
+    // itself undumpable, so its memory is unreadable — but its
+    // static strings (checklists, path tables) were written before
+    // the fork and are byte-identical at the same address in our
+    // own address space. Read them via /proc/self/mem (fails
+    // cleanly on unmapped addresses instead of faulting).
+    long sfd = nv_seccomp_svc(__NR_openat, -100,
+                              reinterpret_cast<long>("/proc/self/mem"),
+                              0, 0);
+    if (sfd < 0) return 0;
+    int n = 0;
+    while (n < cap - 1) {
+        char c = 0;
+        long r = nv_seccomp_svc(67 /*pread64*/, sfd,
+                                reinterpret_cast<long>(&c), 1,
+                                static_cast<long>(addr) + n);
+        if (r != 1 || c == 0) break;
+        out[n++] = c;
+    }
+    out[n] = 0;
+    nv_seccomp_svc(__NR_close, sfd, 0, 0, 0);
+    return n;
+}
+
+// Serves one notification. Returns true when the notification was
+// fully consumed by SECCOMP_IOCTL_NOTIF_ADDFD (no SEND needed).
+bool sc_serve_notif(struct seccomp_notif* req,
+                    struct seccomp_notif_resp* resp) {
+    resp->id = req->id;
+    resp->val = 0;
+    resp->error = 0;
+    resp->flags = 0;
+    long nr = req->data.nr;
+    unsigned long a0 = req->data.args[0];
+    unsigned long a1 = req->data.args[1];
+    unsigned long a2 = req->data.args[2];
+    unsigned long a3 = req->data.args[3];
+    uintptr_t ip = static_cast<uintptr_t>(req->data.instruction_pointer);
+    const ScModule* mod = sc_find(ip);
+    const char* modname = mod ? mod->name : "?";
+
+    // Signal-channel calls first: watch them, and never let a
+    // SIGSYS be sent at the guest's request.
+    long sig = -1;
+    if (nr == 129 || nr == 130 || nr == 424) sig = static_cast<long>(a1);
+    if (nr == 131 || nr == 297) sig = static_cast<long>(a2);
+    if (sig >= 0) {
+        if (sig == 31) {
+            sc_slogf("NS nr=%ld sig=31 SWALLOWED by=%s tid=%u\n",
+                     nr, modname, req->pid);
+            resp->val = 0;
+            return false;
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+    if (nr == 134) {  // rt_sigaction
+        if (a0 == 31 && a1 != 0) {
+            sc_slogf("NS134 set SIGSYS disposition by=%s tid=%u\n",
+                     modname, req->pid);
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+    if (nr == 135) {  // rt_sigprocmask
+        if (sc_tid_is_own_thread(req->pid) && a1 &&
+            (a0 == 0 || a0 == 2)) {
+            unsigned long m = *reinterpret_cast<unsigned long*>(
+                static_cast<uintptr_t>(a1));
+            if ((m >> 30) & 1) {
+                sc_slogf("NS135 block SIGSYS how=%lu by=%s tid=%u\n",
+                         a0, modname, req->pid);
+            }
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+
+    if (nr == __NR_openat || nr == __NR_openat2 ||
+        nr == __NR_readlinkat || nr == __NR_faccessat ||
+        nr == __NR_faccessat2 || nr == __NR_newfstatat) {
+        char path[256];
+        sc_copy_remote_str(req->pid, a1, path, sizeof(path));
+        bool proc_path = false;
+        for (int i = 0; path[i] && i + 4 < 250; i++) {
+            if (path[i] == '/' && path[i + 1] == 'p' &&
+                path[i + 2] == 'r' && path[i + 3] == 'o' &&
+                path[i + 4] == 'c') {
+                proc_path = true;
+                break;
+            }
+        }
+        bool shell_lib = mod && sc_streq(mod->name, "libDexHelper.so");
+        if ((proc_path || shell_lib || mod == nullptr) &&
+            g_sc_logged < 4000) {
+            g_sc_logged++;
+            sc_slogf("SC%ld tid=%u by=%s+0x%lx dirfd=%ld path=%s\n",
+                     nr, req->pid, modname,
+                     mod ? static_cast<unsigned long>(ip - mod->lo) : 0UL,
+                     static_cast<long>(a0), path);
+        }
+        if (nr == __NR_readlinkat) {
+            if (!sc_tid_is_own_thread(req->pid)) {
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                return false;
+            }
+            long r = nv_seccomp_svc(nr, static_cast<long>(a0),
+                                    static_cast<long>(a1),
+                                    static_cast<long>(a2),
+                                    static_cast<long>(a3));
+            if (r < 0) {
+                // Let the kernel produce the genuine result.
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+                return false;
+            }
+            if (r > 0) {
+                char* buf = reinterpret_cast<char*>(
+                    static_cast<uintptr_t>(a2));
+                long bufsz = static_cast<long>(a3);
+                if (buf && bufsz > 1 && r <= bufsz && r < 500) {
+                    char orig[512];
+                    for (long i = 0; i < r; i++) orig[i] = buf[i];
+                    orig[r] = 0;
+                    char rw[512];
+                    int rlen = sc_rewrite_fd_target(orig, rw, 500);
+                    if (rlen > 0 && rlen < bufsz) {
+                        for (int i = 0; i < rlen; i++) buf[i] = rw[i];
+                        r = rlen;
+                    }
+                }
+            }
+            resp->val = r;
+            return false;
+        }
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            sc_path_is_maps(path)) {
+            long oflags = -1;
+            if (nr == __NR_openat) {
+                oflags = static_cast<long>(a2);
+            } else if (a2 && sc_tid_is_own_thread(req->pid)) {
+                oflags = static_cast<long>(
+                    *reinterpret_cast<uint64_t*>(
+                        static_cast<uintptr_t>(a2)));
+            }
+            if (oflags >= 0 && (oflags & 3) == 0 &&
+                !g_sc_maps_real) {
+                long mfd = sc_serve_maps(oflags);
+                if (mfd >= 0) {
+                    uint64_t idv = req->id;
+                    if (ioctl(g_sc_listener_fd, SC_NOTIF_ID_VALID,
+                              &idv) != 0) {
+                        close(static_cast<int>(mfd));
+                        sc_slogf("NMAPDROP pid=%u (died during "
+                                 "serve)\n", req->pid);
+                        return true;
+                    }
+                    if (sc_tid_is_own_thread(req->pid)) {
+                        // Same-process supervision: supervisor and
+                        // target share one fd table, so the memfd
+                        // is already a valid fd for the caller.
+                        // Answer with the fd number directly in the
+                        // response value — no ADDFD (on this kernel
+                        // an in-process ADDFD answered "success" yet
+                        // the caller never resumed; v19-v21 all
+                        // wedged right there). Ownership passes to
+                        // the caller: do NOT close.
+                        resp->val = mfd;
+                        resp->error = 0;
+                        resp->flags = 0;
+                        sc_slogf("NMAP tid=%u fd=%ld (direct)\n",
+                                 req->pid, mfd);
+                        return false;
+                    }
+                    // Descendant (forked checker): its fd table is
+                    // a fork copy, so our memfd number means nothing
+                    // there — install it into the child's table with
+                    // ADDFD (the standard cross-process use case).
+                    struct seccomp_notif_addfd ad;
+                    memset(&ad, 0, sizeof(ad));
+                    ad.id = req->id;
+                    ad.srcfd = static_cast<unsigned>(mfd);
+                    ad.newfd_flags = (oflags & 02000000) ? 02000000 : 0;
+                    long nfd = ioctl(g_sc_listener_fd,
+                                     SC_NOTIF_ADDFD, &ad);
+                    close(static_cast<int>(mfd));
+                    if (nfd >= 0) {
+                        sc_slogf("NMAPX tid=%u fd=%ld\n", req->pid, nfd);
+                        return true;
+                    }
+                    sc_slogf("NMAPXFAIL tid=%u errno=%d\n",
+                             req->pid, errno);
+                }
+            }
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            return false;
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+    resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    return false;
+}
+
+void* sc_supervisor_thread(void*) {
+    while (g_sc_mode == 0) usleep(200);
+    if (g_sc_mode == 2) {
+        sc_watchdog_main(nullptr);
+        return nullptr;
+    }
+    if (g_sc_mode != 1) return nullptr;
+    fcntl(g_sc_listener_fd, F_SETFL, O_NONBLOCK);
+    static volatile int sc_pool_spawned = 0;
+    bool is_first_worker =
+        __sync_bool_compare_and_swap(&sc_pool_spawned, 0, 1);
+    if (is_first_worker) {
+        for (int i = 1; i < 4; i++) {
+            pthread_t extra;
+            pthread_create(&extra, nullptr, sc_supervisor_thread,
+                           nullptr);
+        }
+    }
+    void* reqbuf = malloc(sizeof(struct seccomp_notif));
+    void* respbuf = malloc(sizeof(struct seccomp_notif_resp));
+    if (!reqbuf || !respbuf) return nullptr;
+    static volatile unsigned sc_serve_seq = 0;
+    int idle = 0;
+    while (g_sc_armed) {
+        memset(reqbuf, 0, sizeof(struct seccomp_notif));
+        if (ioctl(g_sc_listener_fd, SC_NOTIF_RECV, reqbuf) == 0) {
+            struct seccomp_notif* req =
+                static_cast<struct seccomp_notif*>(reqbuf);
+            uint64_t id = req->id;
+            unsigned seq = ++sc_serve_seq;
+            if (ioctl(g_sc_listener_fd, SC_NOTIF_ID_VALID, &id) == 0) {
+                struct seccomp_notif_resp* resp =
+                    static_cast<struct seccomp_notif_resp*>(respbuf);
+                memset(resp, 0, sizeof(struct seccomp_notif_resp));
+                bool consumed = sc_serve_notif(req, resp);
+                if (!consumed) {
+                    uint64_t id2 = req->id;
+                    if (ioctl(g_sc_listener_fd, SC_NOTIF_ID_VALID,
+                              &id2) == 0) {
+                        resp->id = req->id;
+                        long sr = ioctl(g_sc_listener_fd,
+                                        SC_NOTIF_SEND, resp);
+                        if (sr != 0) {
+                            sc_slogf("SENDFAIL #%u nr=%lld "
+                                     "errno=%d\n",
+                                     seq,
+                                     (long long)req->data.nr,
+                                     errno);
+                        }
+                    } else {
+                        sc_slogf("DROP #%u nr=%lld pid=%u (died "
+                                 "during serve)\n",
+                                 seq, (long long)req->data.nr,
+                                 req->pid);
+                    }
+                }
+            }
+        } else {
+            usleep(1000);
+            if (is_first_worker && (++idle % 200) == 0) {
+                sc_watchdog_threads();
+            }
+        }
+    }
+    return nullptr;
+}
+#endif  // __aarch64__
+
+int sc_arm(const char* log_path) {
+#if !defined(__aarch64__)
+    (void)log_path;
+    return -1;
+#else
+    if (g_sc_armed) return 0;
+    g_sc_module_count = 0;
+    dl_iterate_phdr(sc_phdr_cb, nullptr);
+
+    // Capture the guest package for handler-side rewriting.
+    {
+        const std::string& pkg = g_spoofed_package_name;
+        size_t n = pkg.size();
+        if (n > 120) n = 120;
+        memcpy(g_sc_guest_pkg, pkg.data(), n);
+        g_sc_guest_pkg[n] = 0;
+    }
+
+    // Per-process log file: <log_path>-<pid>.log, so a dying stub's
+    // evidence is not wiped by the next stub's arm.
+    char eff_path[512];
+    {
+        int el = 0;
+        const int ecap = static_cast<int>(sizeof(eff_path));
+        sc_app(eff_path, el, ecap, log_path);
+        sc_app(eff_path, el, ecap, "-");
+        sc_app_dec(eff_path, el, ecap, getpid());
+        sc_app(eff_path, el, ecap, ".log");
+        eff_path[el] = 0;
+    }
+
+    int fd = open(eff_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    g_sc_log_fd = fd;
+    if (fd >= 0) {
+        char hdr[256];
+        int len = 0;
+        const int cap = static_cast<int>(sizeof(hdr));
+        sc_app(hdr, len, cap, "SECCOMP-DIAG armed, modules=");
+        sc_app_dec(hdr, len, cap, g_sc_module_count);
+        sc_app(hdr, len, cap, " trampoline=0x");
+        sc_app_hex(hdr, len, cap,
+                   reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point));
+        sc_app(hdr, len, cap, "\n");
+        hdr[len] = 0;
+        ssize_t unused = write(fd, hdr, len);
+        (void)unused;
+        // Dump the module table once per arm so unattributed trap PCs
+        // can be resolved offline against the same process's ranges.
+        for (int i = 0; i < g_sc_module_count; i++) {
+            char ml[512];
+            int mlen = 0;
+            const int mcap = static_cast<int>(sizeof(ml));
+            sc_app(ml, mlen, mcap, "MOD 0x");
+            sc_app_hex(ml, mlen, mcap, g_sc_modules[i].lo);
+            sc_app(ml, mlen, mcap, "-0x");
+            sc_app_hex(ml, mlen, mcap, g_sc_modules[i].hi);
+            sc_app(ml, mlen, mcap, " ");
+            sc_app(ml, mlen, mcap, g_sc_modules[i].name);
+            sc_app(ml, mlen, mcap, "\n");
+            ml[mlen] = 0;
+            ssize_t u2 = write(fd, ml, mlen);
+            (void)u2;
+        }
+    }
+
+    {
+        // Control flag: <log dir>/sc-empty-filter
+        char flag[512];
+        int fl = 0;
+        const int fcap = static_cast<int>(sizeof(flag));
+        const char* slash = nullptr;
+        for (const char* p = log_path; *p; p++) {
+            if (*p == '/') slash = p;
+        }
+        if (slash) {
+            for (const char* p = log_path; p < slash; p++) {
+                if (fl < fcap - 1) flag[fl++] = *p;
+            }
+        }
+        sc_app(flag, fl, fcap, "/sc-empty-filter");
+        flag[fl] = 0;
+        int ffd = open(flag, O_RDONLY);
+        if (ffd >= 0) {
+            close(ffd);
+            g_sc_empty_filter = true;
+            if (g_sc_log_fd >= 0) {
+                const char note[] = "MODE empty-filter (control)\n";
+                ssize_t u = write(g_sc_log_fd, note, sizeof(note) - 1);
+                (void)u;
+            }
+        }
+    }
+    {
+        // Bisection flags: sc-lean (existence), sc-trapmask (2 hex).
+        char flag2[512];
+        const int fcap = static_cast<int>(sizeof(flag2));
+        const char* slash = nullptr;
+        for (const char* p = log_path; *p; p++) {
+            if (*p == '/') slash = p;
+        }
+        const int dirlen = slash ? static_cast<int>(slash - log_path) : 0;
+        auto sibling = [&](const char* leaf) -> const char* {
+            int fl = 0;
+            for (int i = 0; i < dirlen && fl < fcap - 24; i++)
+                flag2[fl++] = log_path[i];
+            sc_app(flag2, fl, fcap, leaf);
+            flag2[fl] = 0;
+            return flag2;
+        };
+        int lfd = open(sibling("/sc-lean"), O_RDONLY);
+        if (lfd >= 0) {
+            close(lfd);
+            g_sc_lean = true;
+        }
+        int rfd = open(sibling("/sc-maps-real"), O_RDONLY);
+        if (rfd >= 0) {
+            close(rfd);
+            g_sc_maps_real = true;
+        }
+        int mfd = open(sibling("/sc-trapmask"), O_RDONLY);
+        if (mfd >= 0) {
+            char mb[8] = {0};
+            ssize_t mn = read(mfd, mb, sizeof(mb) - 1);
+            close(mfd);
+            if (mn > 0) {
+                unsigned v = 0;
+                bool any = false;
+                for (int i = 0; i < mn; i++) {
+                    char c = mb[i];
+                    int d = (c >= '0' && c <= '9') ? c - '0'
+                            : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                            : (c >= 'A' && c <= 'F') ? c - 'A' + 10
+                                                     : -1;
+                    if (d < 0) break;
+                    v = v * 16 + static_cast<unsigned>(d);
+                    any = true;
+                }
+                if (any) g_sc_trap_mask = v & 0x3F;
+            }
+        }
+        if (g_sc_empty_filter) g_sc_trap_mask = 0;
+        if (g_sc_log_fd >= 0) {
+            char note[96];
+            int nl = 0;
+            const int ncap = static_cast<int>(sizeof(note));
+            sc_app(note, nl, ncap, "MODE lean=");
+            sc_app_dec(note, nl, ncap, g_sc_lean ? 1 : 0);
+            sc_app(note, nl, ncap, " trapmask=0x");
+            sc_app_hex(note, nl, ncap, g_sc_trap_mask);
+            sc_app(note, nl, ncap, " maps_real=");
+            sc_app_dec(note, nl, ncap, g_sc_maps_real ? 1 : 0);
+            sc_app(note, nl, ncap, "\n");
+            note[nl] = 0;
+            ssize_t u = write(g_sc_log_fd, note, nl);
+            (void)u;
+        }
+    }
+
+    // The supervisor thread starts BEFORE any filter exists, so
+    // its own creation cannot be trapped; it waits for the mode.
+    g_sc_mode = 0;
+    {
+        pthread_t th;
+        if (pthread_create(&th, nullptr, sc_supervisor_thread,
+                           nullptr) == 0) {
+            pthread_detach(th);
+        }
+    }
+    long lfd = sc_install_filter_ex(true);
+    if (lfd < 0) {
+        // Retry without TSYNC (covers the calling thread and all
+        // threads created afterwards, which includes the guest's).
+        lfd = sc_install_filter_ex(true, true, false);
+    }
+    if (lfd >= 0) {
+        g_sc_listener_fd = static_cast<int>(lfd);
+        g_sc_armed = 1;
+        g_sc_mode = 1;
+        LOGI("seccomp-diag: armed (USER_NOTIF), log=%s modules=%d",
+             log_path, g_sc_module_count);
+        return 0;
+    }
+    // Fallback: RET_TRAP + SIGSYS handler, WITHOUT the signal
+    // numbers (trapping rt_sigprocmask kills newborn threads whose
+    // start path restores the signal mask while SIGSYS is blocked).
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sc_handle;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSYS, &sa, &g_sc_prev_action);
+    if (sc_install_filter_ex(false, false) != 0) {
+        g_sc_mode = 3;
+        return -1;
+    }
+    g_sc_armed = 1;
+    g_sc_mode = 2;
+    LOGI("seccomp-diag: armed (TRAP fallback), log=%s modules=%d",
+         log_path, g_sc_module_count);
+    return 0;
+#endif
+}
+
+}  // namespace
+
+/**
+ * Arm the seccomp raw-syscall diagnostic in this (guest stub)
+ * process. MUST match Kotlin: nativeArmSeccompDiag(logPath: String)
+ */
+JNIEXPORT void JNICALL
+Java_com_nextvm_core_hook_NativeHookBridge_nativeArmSeccompDiag(
+    JNIEnv* env, jobject thiz, jstring logPath)
+{
+    (void)thiz;
+    const char* p = env->GetStringUTFChars(logPath, nullptr);
+    if (p) {
+        int rc = sc_arm(p);
+        LOGI("seccomp-diag: arm rc=%d", rc);
+        env->ReleaseStringUTFChars(logPath, p);
     }
 }
 

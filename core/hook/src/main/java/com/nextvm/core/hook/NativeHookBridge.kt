@@ -378,6 +378,19 @@ class NativeHookBridge @Inject constructor() {
     }
 
     /**
+     * Arm the seccomp raw-syscall diagnostic in this process: traps
+     * path-bearing syscalls (openat/readlinkat/...) issued via direct
+     * svc — which bypass every libc GOT hook — attributes them to the
+     * calling library, and logs them to [logPath]. Results are never
+     * altered. Call once per guest stub process, before bind.
+     */
+    fun armSeccompDiag(logPath: String) {
+        if (nativeHooksAvailable) {
+            nativeArmSeccompDiag(logPath)
+        }
+    }
+
+    /**
      * Override a system property value.
      * Hooks __system_property_get to return our value.
      */
@@ -683,6 +696,8 @@ class NativeHookBridge @Inject constructor() {
     private external fun nativeSpoofProcSelf(pid: Int, packageName: String)
 
     private external fun nativeSetProcessName(name: String)
+
+    private external fun nativeArmSeccompDiag(logPath: String)
 
     /** Override a system property at native level. */
     private external fun nativeSpoofSystemProperty(key: String, value: String)

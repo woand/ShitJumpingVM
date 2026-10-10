@@ -1406,6 +1406,16 @@ class VirtualEngine @Inject constructor(
                 Timber.tag(TAG).w(e, "spoofProcSelf failed for $packageName")
             }
 
+            // Arm the seccomp raw-syscall diagnostic: anything in this
+            // process that issues path syscalls via direct svc (past
+            // every libc hook) gets attributed and logged.
+            try {
+                val diagLog = File(context.filesDir, "seccomp-diag.log")
+                nativeHookBridge.armSeccompDiag(diagLog.absolutePath)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "armSeccompDiag failed for $packageName")
+            }
+
             // Capture the stub slot BEFORE any renaming below:
             // VirtualCallerResolver parses the slot out of the process
             // name to route PM calls; once the name becomes the guest's,

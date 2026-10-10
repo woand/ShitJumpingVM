@@ -248,6 +248,42 @@ class VirtualApplicationManager @Inject constructor() {
             val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
                 ?: return null
             val loadedApkClass = Class.forName("android.app.LoadedApk")
+
+            // Identity toward the real system must be the HOST's.
+            // The framework LoadedApk carries the guest package in
+            // mPackageName, and every ContextImpl created from it
+            // derives mOpPackageName + mAttributionSource from that
+            // field — so the guest's first Settings/DeviceConfig
+            // provider call reaches the system with the guest package
+            // as calling identity and dies on
+            // AppOpsManager.checkPackage (guest pkg does not belong
+            // to the host uid) with a SecurityException. Mirror the
+            // LoadedApk-clone path's defense (see ActivityThreadHook):
+            // patch mPackageName to the host package BEFORE any
+            // ContextImpl is created from this LoadedApk. The
+            // LoadedApk stays registered under the guest name in
+            // ActivityThread.mPackages, and guest code keeps seeing
+            // the guest package through the VirtualContext wrapper.
+            val hostPkg = (virtualContext as? android.content.ContextWrapper)
+                ?.baseContext?.packageName
+                ?: runCatching {
+                    atClass.getMethod("currentApplication").invoke(null)
+                        as? android.app.Application
+                }.getOrNull()?.packageName
+            if (hostPkg != null && hostPkg != packageName) {
+                runCatching {
+                    val pkgField = loadedApkClass.getDeclaredField("mPackageName")
+                    pkgField.isAccessible = true
+                    pkgField.set(loadedApk, hostPkg)
+                    Timber.tag(TAG).i(
+                        "Patched framework LoadedApk mPackageName " +
+                            "$packageName -> $hostPkg (system-facing identity)"
+                    )
+                }.onFailure {
+                    Timber.tag(TAG).w(it, "Failed to patch LoadedApk mPackageName")
+                }
+            }
+
             val contextImplClass = Class.forName("android.app.ContextImpl")
             val createAppContext = contextImplClass.getDeclaredMethod(
                 "createAppContext", atClass, loadedApkClass
