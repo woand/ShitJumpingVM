@@ -3,6 +3,7 @@ package com.nextvm.core.virtualization.engine
 import android.content.Context
 import android.content.Intent
 import com.nextvm.core.apk.VirtualClassLoader
+import android.content.pm.ApplicationInfo
 import com.nextvm.core.binder.BinderProxyManager
 import com.nextvm.core.binder.VirtualCallerResolver
 import com.nextvm.core.binder.proxy.ContentResolverProxy
@@ -839,17 +840,102 @@ class VirtualEngine @Inject constructor(
                 virtualRoot.mkdirs()
             }
             val app = findApp(instanceId)
-            VirtualClassLoader.createClassLoader(
+            val frameworkCl = app?.let { createFrameworkClassLoader(it) }
+            val cl = frameworkCl ?: VirtualClassLoader.createClassLoader(
                 apkPath = apkPath,
                 instanceId = instanceId,
                 parentDir = virtualRoot,
                 prebuiltLibrarySearchPath = app?.librarySearchPath?.ifEmpty { null },
                 splitApkPaths = app?.splitApkPaths ?: emptyList()
-            ).also { cl ->
-                val pkg = findApp(instanceId)?.packageName ?: instanceId.substringBefore('_')
-                GuestClassLoaderRegistry.register(pkg, instanceId, cl)
-            }
+            )
+            val pkg = app?.packageName ?: instanceId.substringBefore('_')
+            GuestClassLoaderRegistry.register(pkg, instanceId, cl)
+            cl
         }
+    }
+
+    /**
+     * Build the guest ClassLoader through the framework's own LoadedApk
+     * machinery (ActivityThread.getPackageInfoNoCheck ->
+     * LoadedApk.getClassLoader) instead of a hand-assembled
+     * PathClassLoader.
+     *
+     * A manually constructed PathClassLoader differs from a
+     * framework-built one in ways native code can observe: its
+     * shared-library fields start out null (patched afterwards with
+     * Unsafe), its linker namespace is created by hand with hand-picked
+     * arguments, and its DexPathList is assembled outside
+     * ApplicationLoaders/ClassLoaderFactory. Strong packers whose ART
+     * hooks walk these structures (SecNeo's DexFileLoader) are the
+     * suspected victims. This path makes the guest's class-loader
+     * object graph identical in construction to a real app's.
+     *
+     * Returns null on any failure; the caller falls back to the manual
+     * VirtualClassLoader path.
+     */
+    private fun createFrameworkClassLoader(app: VirtualApp): ClassLoader? {
+        return try {
+            val baseInfo = serviceManager.packageManager.getApplicationInfo(app.packageName)
+                ?: return null
+            val appInfo = ApplicationInfo(baseInfo).apply {
+                sourceDir = app.apkPath
+                publicSourceDir = app.apkPath
+                dataDir = app.dataDir
+                nativeLibraryDir = app.libDir
+                processName = app.packageName
+                targetSdkVersion = app.targetSdkVersion
+                if (app.splitApkPaths.isNotEmpty()) {
+                    splitSourceDirs = app.splitApkPaths.toTypedArray()
+                    splitPublicSourceDirs = app.splitApkPaths.toTypedArray()
+                    // LoadedApk walks splitNames in lockstep with
+                    // splitSourceDirs; the VPMS copy leaves it null,
+                    // which NPEs inside LoadedApk.getClassLoader for
+                    // split guests. Prefer the install-parse names.
+                    splitNames = serviceManager.packageManager
+                        .getRecord(app.packageName)?.packageInfo?.splitNames
+                        ?: app.splitApkPaths.map { path ->
+                            path.substringAfterLast('/')
+                                .removeSuffix(".apk")
+                                .substringAfter("_split_", "")
+                        }.toTypedArray()
+                }
+                uid = android.os.Process.myUid()
+                deviceProtectedDataDir = dataDir
+            }
+            val atClass = Class.forName("android.app.ActivityThread")
+            val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
+                ?: return null
+            val compatClass = Class.forName("android.content.res.CompatibilityInfo")
+            val compat = compatClass.getField("DEFAULT_COMPATIBILITY_INFO").get(null)
+            val loadedApk = atClass
+                .getMethod("getPackageInfoNoCheck", ApplicationInfo::class.java, compatClass)
+                .invoke(activityThread, appInfo, compat)
+                ?: return null
+            val classLoader = loadedApk.javaClass.getMethod("getClassLoader")
+                .invoke(loadedApk) as? ClassLoader
+                ?: return null
+            Timber.tag(TAG).i(
+                "Framework LoadedApk classloader for ${app.packageName}: " +
+                    "${classLoader.javaClass.name}, parents: ${parentChainOf(classLoader)}"
+            )
+            classLoader
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(
+                e,
+                "Framework classloader failed for ${app.packageName}, falling back to manual"
+            )
+            null
+        }
+    }
+
+    private fun parentChainOf(classLoader: ClassLoader): String {
+        val names = mutableListOf<String>()
+        var current: ClassLoader? = classLoader.parent
+        while (current != null) {
+            names.add(current.javaClass.simpleName)
+            current = current.parent
+        }
+        return names.joinToString(" -> ")
     }
 
     /**
