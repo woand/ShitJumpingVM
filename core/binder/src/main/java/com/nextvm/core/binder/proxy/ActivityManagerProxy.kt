@@ -1,5 +1,6 @@
 package com.nextvm.core.binder.proxy
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
@@ -39,6 +40,17 @@ class ActivityManagerProxy(
 
     companion object {
         private const val TAG = "AMProxy"
+
+        // BootTrace traced AMS methods + per-process cap.
+        private val TRACE_METHODS = setOf(
+            "startService", "bindService", "bindServiceInstance",
+            "stopService", "getContentProvider", "getContentProviderExternal",
+            "broadcastIntent", "broadcastIntentWithFeature",
+            "registerReceiver", "registerReceiverWithFeature",
+            "startActivity", "startActivityAsUser"
+        )
+        private const val TRACE_MAX = 400
+        private val traceCount = java.util.concurrent.atomic.AtomicInteger(0)
 
         // GMS / Play Store packages that need routing through the GMS bridge
         private val GMS_PACKAGES = setOf(
@@ -99,6 +111,20 @@ class ActivityManagerProxy(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+        // BootTrace: targeted tracing of the calls a guest's init
+        // pipeline depends on (service starts/binds, provider
+        // acquisition, broadcasts, receiver registration). Exists to
+        // find init steps whose completion signal never arrives in
+        // the sandbox: the request and its immediate result are
+        // logged under tag "BootTrace" for the first TRACE_MAX calls.
+        val traced = method.name in TRACE_METHODS
+        if (traced) traceAmsCall(method.name, args, null, -1)
+        val result = invokeDispatch(proxy, method, args)
+        if (traced) traceAmsCall(method.name, args, result, 0)
+        return result
+    }
+
+    private fun invokeDispatch(proxy: Any, method: Method, args: Array<out Any>?): Any? {
         val methodName = method.name
 
         return try {
@@ -565,6 +591,35 @@ class ActivityManagerProxy(
             @Suppress("UNCHECKED_CAST")
             val processList = result as? List<Any> ?: return result
 
+            // ProcTrace (diagnostic, v30): AMS builds this list from
+            // its own records, so the guest's own entry still carries
+            // the STUB identity (com.nextvm.app:p0) even though every
+            // Java/proc-level name channel already reports the guest
+            // name. If a guest (or SDK) gates its init pipeline on
+            // isMainProcess via this list, this is the one channel
+            // that fails. Log the call + the caller's own entry,
+            // change nothing.
+            try {
+                val myPid = android.os.Process.myPid()
+                val sb = StringBuilder("call own=")
+                var found = false
+                for (e in processList) {
+                    val info = e as? android.app.ActivityManager.RunningAppProcessInfo
+                        ?: continue
+                    if (info.pid == myPid) {
+                        found = true
+                        sb.append("{pid=").append(info.pid)
+                            .append(" name=").append(info.processName)
+                            .append(" pkgs=").append(info.pkgList?.joinToString(","))
+                            .append(" imp=").append(info.importance).append('}')
+                    }
+                }
+                if (!found) sb.append("ABSENT")
+                sb.append(" total=").append(processList.size)
+                Timber.tag("ProcTrace").i(sb.toString())
+            } catch (_: Throwable) {
+            }
+
             // For now, pass through — fine-grained filtering can be added
             // when anti-detection for specific apps is needed
             return result
@@ -664,6 +719,51 @@ class ActivityManagerProxy(
     private fun invokeOriginal(method: Method, args: Array<out Any>?): Any? {
         return if (args != null) method.invoke(original, *args)
         else method.invoke(original)
+    }
+
+    // ==================== BootTrace ====================
+
+    private fun traceAmsCall(
+        methodName: String,
+        args: Array<out Any>?,
+        result: Any?,
+        phase: Int
+    ) {
+        val n = traceCount.incrementAndGet()
+        if (n > TRACE_MAX) return
+        val sb = StringBuilder()
+        sb.append(if (phase < 0) ">> " else "<< ").append(methodName)
+        if (args != null) {
+            for (a in args) {
+                when (a) {
+                    is Intent -> sb.append(" intent{cmp=").append(a.component?.flattenToShortString())
+                        .append(" act=").append(a.action)
+                        .append(" pkg=").append(a.`package`).append('}')
+                    is String -> sb.append(" str=").append(a)
+                    else -> { /* binder/callback objects: class name only */
+                        if (a != null && phase < 0) {
+                            val cn = a.javaClass.name
+                            if (cn.contains("ServiceConnection") ||
+                                cn.contains("IApplicationThread") ||
+                                cn.contains("ContentProvider")
+                            ) sb.append(" arg=").append(cn)
+                        }
+                    }
+                }
+            }
+        }
+        if (phase >= 0) {
+            sb.append(" -> ").append(
+                when (result) {
+                    null -> "null"
+                    is ComponentName -> "cmp=" + result.flattenToShortString()
+                    is Int -> "int=$result"
+                    is Boolean -> "bool=$result"
+                    else -> result.javaClass.simpleName
+                }
+            )
+        }
+        Timber.tag("BootTrace").i(sb.toString())
     }
 
     /**

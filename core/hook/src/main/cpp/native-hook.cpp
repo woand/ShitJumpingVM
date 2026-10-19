@@ -803,10 +803,113 @@ static FILE* hooked_fopen(const char* path, const char* mode) {
     return real_fopen(actual_path, mode);
 }
 
+// ==================== PropTrace (v32, diagnostic, record-only) ====================
+//
+// On a real device the Unicom guest, ~0.5s after process start and
+// before its splash completes, enumerates the whole system property
+// space (~298 distinct names in a ~150ms burst — a fingerprint
+// harvest, visible as bionic's own "Access denied finding property" /
+// "name length >= 31" logcat warnings). In the sandbox that sweep
+// never runs, and the guest stalls before any framework IPC
+// (v28/v30/v31 all zero). PropTrace records which properties the
+// guest reads through this hook, in first-seen order with the
+// returned value — one run shows whether the sweep starts at all
+// and where the reads stop.
+//
+// Deliberately primitive, because this hook sits on a path everything
+// uses (see the hooked_syscall emutls/malloc recursion post-mortem):
+// fixed static storage, no allocation, no std:: containers, no TLS,
+// no libc beyond string/memory compares and one raw clock syscall.
+// A spinlock guards the table; a contended lock just skips recording.
+// Emitting goes through LOGI, and liblog may itself read properties —
+// an atomic in-trace counter makes such nested entries no-ops.
+// Active only in guest processes (spoofed package set), for a 15s
+// window from the first guest read, at most 384 distinct names.
+
+#define PT_MAX_NAMES 384
+#define PT_NAME_LEN 96
+#define PT_WINDOW_MS 15000
+
+static char pt_names[PT_MAX_NAMES][PT_NAME_LEN];
+static volatile int pt_count = 0;
+static volatile int pt_lock = 0;
+static volatile int pt_in_trace = 0;
+static volatile long long pt_t0_ms = -1;
+static volatile int pt_window_closed = 0;
+
+static long long pt_now_ms() {
+    struct timespec ts;
+    syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool pt_try_lock() {
+    for (int i = 0; i < 4096; i++) {
+        if (__atomic_exchange_n(&pt_lock, 1, __ATOMIC_ACQUIRE) == 0) return true;
+    }
+    return false;
+}
+
+// Returns: slot index if `name` is newly recorded, -2 if this call
+// closed the window (caller emits the summary once), else -1.
+static int pt_note_name(const char* name, long long* out_rel_ms) {
+    if (name == nullptr || name[0] == '\0') return -1;
+    if (g_spoofed_package_name.empty()) return -1;  // guest processes only
+    if (__atomic_load_n(&pt_in_trace, __ATOMIC_RELAXED) > 0) return -1;
+    if (!pt_try_lock()) return -1;
+    int result = -1;
+    long long now = pt_now_ms();
+    if (pt_t0_ms < 0) pt_t0_ms = now;
+    long long rel = now - pt_t0_ms;
+    if (!pt_window_closed) {
+        if (rel > PT_WINDOW_MS || pt_count >= PT_MAX_NAMES) {
+            pt_window_closed = 1;
+            result = -2;
+        } else {
+            bool seen = false;
+            for (int i = 0; i < pt_count; i++) {
+                if (strncmp(pt_names[i], name, PT_NAME_LEN) == 0) { seen = true; break; }
+            }
+            if (!seen) {
+                strncpy(pt_names[pt_count], name, PT_NAME_LEN - 1);
+                pt_names[pt_count][PT_NAME_LEN - 1] = '\0';
+                *out_rel_ms = rel;
+                result = pt_count++;
+            }
+        }
+    }
+    __atomic_store_n(&pt_lock, 0, __ATOMIC_RELEASE);
+    return result;
+}
+
+static void pt_emit(const char* name, long long rel_ms, const char* value, int len) {
+    __atomic_add_fetch(&pt_in_trace, 1, __ATOMIC_ACQUIRE);
+    char vbuf[49];
+    int n = 0;
+    if (value != nullptr && len > 0) {
+        n = len > 48 ? 48 : len;
+        memcpy(vbuf, value, (size_t)n);
+    }
+    vbuf[n] = '\0';
+    LOGI("PropTrace: +%lldms %s -> len=%d val=%s", rel_ms, name, len, vbuf);
+    __atomic_sub_fetch(&pt_in_trace, 1, __ATOMIC_RELEASE);
+}
+
+static void pt_emit_summary() {
+    __atomic_add_fetch(&pt_in_trace, 1, __ATOMIC_ACQUIRE);
+    LOGI("PropTrace: window closed, distinct=%d", (int)pt_count);
+    __atomic_sub_fetch(&pt_in_trace, 1, __ATOMIC_RELEASE);
+}
+
 /**
  * Hooked __system_property_get() — returns spoofed device properties.
  */
 static int hooked_system_property_get(const char* name, char* value) {
+    // PropTrace (v32): record first-seen property reads in guests.
+    long long pt_rel = 0;
+    int pt_slot = pt_note_name(name, &pt_rel);
+    if (pt_slot == -2) pt_emit_summary();
+
     // Check if we have a spoofed value for this property
     if (name != nullptr && !g_property_spoofs.empty()) {
         std::string prop_name(name);
@@ -818,12 +921,15 @@ static int hooked_system_property_get(const char* name, char* value) {
             memcpy(value, spoofed.c_str(), len);
             value[len] = '\0';
             LOGD("property_get: %s -> %s (spoofed)", name, value);
+            if (pt_slot >= 0) pt_emit(name, pt_rel, value, static_cast<int>(len));
             return static_cast<int>(len);
         }
     }
 
     // No spoof — call real implementation
-    return real_system_property_get(name, value);
+    int r = real_system_property_get(name, value);
+    if (pt_slot >= 0) pt_emit(name, pt_rel, value, r);
+    return r;
 }
 
 /**

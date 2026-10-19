@@ -140,7 +140,11 @@ class VirtualApplicationManager @Inject constructor() {
                     providerNames = providerNames,
                     providerAuthorities = providerAuthorities
                 )
-                if (fwApp != null) return fwApp
+                if (fwApp != null) {
+                    scheduleGuestStackDumps()
+                    scheduleHijackTrace(packageName)
+                    return fwApp
+                }
                 // fall through to the legacy bind path
             }
 
@@ -208,12 +212,354 @@ class VirtualApplicationManager @Inject constructor() {
             record.state = ApplicationState.RUNNING
             Timber.tag(TAG).i("Application.onCreate() complete for $packageName")
 
+            scheduleGuestStackDumps()
+            scheduleHijackTrace(packageName)
             return application
 
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to bind application for $packageName ($instanceId)")
             applications.remove(instanceId)
             return null
+        }
+    }
+
+    // ==================== Guest stack diagnostics ====================
+    // One-shot per process: after a guest Application binds, dump all
+    // thread stacks (+ the main Looper's pending messages) at
+    // +0.3/+0.7/+1.2/+2/+3/+8/+20s into a stackdump-<pid>.log under the
+    // Application's filesDir (for a framework-bound guest that resolves
+    // to the guest sandbox files dir; readable via run-as).
+    // Exists to answer "the guest UI is up but never advances — what
+    // is it waiting on?" with the actual Java frames instead of
+    // black-box guessing.
+
+    @Volatile private var stackDumpsScheduled = false
+
+    private fun scheduleGuestStackDumps() {
+        if (stackDumpsScheduled) return
+        stackDumpsScheduled = true
+        Thread {
+            try {
+                val hostApp = Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null)
+                    as? android.app.Application ?: return@Thread
+                val out = java.io.File(
+                    hostApp.filesDir, "stackdump-${android.os.Process.myPid()}.log"
+                )
+                // Cadence (v29): logcat comparison against a real
+                // device localized the guest's init-pipeline stall to
+                // the first ~1.5s after process start (bind lands at
+                // ~+0.45s), so sample densely across bind+0.3..+3s
+                // to catch threads mid-flight at the stall moment;
+                // +8s/+20s remain as steady-state anchors.
+                val marks = listOf(
+                    300L to "t+0.3s",
+                    700L to "t+0.7s",
+                    1_200L to "t+1.2s",
+                    2_000L to "t+2s",
+                    3_000L to "t+3s",
+                    8_000L to "t+8s",
+                    20_000L to "t+20s"
+                )
+                var elapsed = 0L
+                for ((at, label) in marks) {
+                    val wait = at - elapsed
+                    if (wait > 0) Thread.sleep(wait)
+                    elapsed = at
+                    dumpGuestStacks(out, label)
+                }
+            } catch (_: Throwable) {
+                // diagnostics must never disturb the guest
+            }
+        }.apply { isDaemon = true; name = "nv-stackdump" }.start()
+    }
+
+    private fun dumpGuestStacks(out: java.io.File, label: String) {
+        val sb = StringBuilder()
+        sb.append("==== ").append(label).append(" ====\n")
+        // Main Looper pending messages first: a scheduled-but-never-
+        // fired navigation message (or an empty queue) is the fastest
+        // discriminator for splash stalls.
+        try {
+            val queue = android.os.Looper.getMainLooper().queue
+            val mf = queue.javaClass.getDeclaredField("mMessages")
+            mf.isAccessible = true
+            var msg = mf.get(queue)
+            var n = 0
+            sb.append("main looper queue:\n")
+            while (msg != null && n < 20) {
+                val cls = msg.javaClass
+                val whenF = cls.getDeclaredField("when").apply { isAccessible = true }
+                val cbF = cls.getDeclaredField("callback").apply { isAccessible = true }
+                val tgtF = cls.getDeclaredField("target").apply { isAccessible = true }
+                val whatF = cls.getDeclaredField("what").apply { isAccessible = true }
+                val nextF = cls.getDeclaredField("next").apply { isAccessible = true }
+                sb.append("  when=+").append(
+                    (whenF.getLong(msg) - android.os.SystemClock.uptimeMillis()) / 1000.0
+                ).append("s what=").append(whatF.getInt(msg))
+                    .append(" callback=").append(cbF.get(msg)?.javaClass?.name)
+                    .append(" target=").append(tgtF.get(msg)?.javaClass?.name)
+                    .append('\n')
+                msg = nextF.get(msg)
+                n++
+            }
+            if (n == 0) sb.append("  (empty)\n")
+        } catch (e: Throwable) {
+            sb.append("main looper queue: <").append(e.javaClass.simpleName).append(">\n")
+        }
+        val traces = Thread.getAllStackTraces()
+        // Main thread first, then the rest (Rx/pool/player threads are
+        // the interesting waiters).
+        val ordered = traces.keys.sortedWith(
+            compareBy({ if (it.name == "main") 0 else 1 }, { it.name })
+        )
+        for (t in ordered) {
+            sb.append("--- \"").append(t.name).append("\" ").append(t.state).append('\n')
+            val frames = traces[t] ?: continue
+            for ((i, f) in frames.withIndex()) {
+                if (i >= 30) break
+                sb.append("    at ").append(f.toString()).append('\n')
+            }
+        }
+        try {
+            out.appendText(sb.toString())
+        } catch (_: Throwable) {
+        }
+    }
+
+    // ==================== Hijack SDK completion trace (v33) ====================
+    // v34 adds the discriminating experiment: after each sample, if
+    // ActivityThread.mInstrumentation is hijack's ProxyInstrumentation,
+    // swap it (and every existing Activity's mInstrumentation) back to
+    // the proxy's oriInstrumentation (the engine's NextVmInstrumentation).
+    // v33 proved the proxy sits in its "hijack suspected" state
+    // permanently in the sandbox (oriClassType=0); if the splash then
+    // advances to MainActivity, the proxy's extracted callbacks were
+    // the gate. If nothing changes, the hijack line is closed.
+    // One-shot per process, unicom only. Static analysis showed the
+    // guest's App.attachBaseContext() calls
+    // com.sdk.hijack.api.HijackSDK.initailise(Application) first thing,
+    // which (a) sets hidden-API exemptions via reflection, (b) wraps
+    // ActivityThread.mInstrumentation in its ProxyInstrumentation,
+    // (c) registers ActivityLifecycleCallbacks, then sets its own
+    // isRegisterActivityLifecycleCallbacks flag as the last step.
+    // Whether all of that actually completes inside the sandbox is
+    // invisible from outside (registerContext swallows failures), so
+    // at +1/+4/+12s after bind we reflectively read back the end
+    // state: the flag, ProxyInstrumentation.instance, the live
+    // ActivityThread/Application instrumentation objects, the
+    // registered lifecycle callbacks, and each running Activity's
+    // mInstrumentation. Log tag "HijackTrace" + a
+    // hijacktrace-<pid>.log next to the stackdumps.
+
+    @Volatile private var hijackTraceScheduled = false
+
+    private fun scheduleHijackTrace(packageName: String) {
+        if (packageName != "com.sinovatech.unicom.ui") return
+        if (hijackTraceScheduled) return
+        hijackTraceScheduled = true
+        Thread {
+            try {
+                val hostApp = Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null)
+                    as? android.app.Application ?: return@Thread
+                val out = java.io.File(
+                    hostApp.filesDir, "hijacktrace-${android.os.Process.myPid()}.log"
+                )
+                val marks = listOf(
+                    1_000L to "t+1s", 4_000L to "t+4s",
+                    12_000L to "t+12s", 25_000L to "t+25s"
+                )
+                var elapsed = 0L
+                for ((at, label) in marks) {
+                    val wait = at - elapsed
+                    if (wait > 0) Thread.sleep(wait)
+                    elapsed = at
+                    sampleHijackState(out, label)
+                    unwrapHijackProxy(out, label)
+                }
+            } catch (_: Throwable) {
+                // diagnostics must never disturb the guest
+            }
+        }.apply { isDaemon = true; name = "nv-hijacktrace" }.start()
+    }
+
+    private fun fieldOf(cls: Class<*>, name: String): java.lang.reflect.Field {
+        var c: Class<*>? = cls
+        while (c != null) {
+            try {
+                return c.getDeclaredField(name).apply { isAccessible = true }
+            } catch (_: NoSuchFieldException) {
+                c = c.superclass
+            }
+        }
+        throw NoSuchFieldException(name + " on " + cls.name)
+    }
+
+    private fun sampleHijackState(out: java.io.File, label: String) {
+        val sb = StringBuilder()
+        sb.append("==== ").append(label).append(" ====\n")
+        fun line(s: String) {
+            sb.append(s).append('\n')
+            Timber.tag("HijackTrace").i("%s %s", label, s)
+        }
+        try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            val at = atCls.getMethod("currentActivityThread").invoke(null)
+            if (at == null) {
+                line("ActivityThread: null")
+                out.appendText(sb.toString())
+                return
+            }
+            // (b) live ActivityThread instrumentation
+            val atInstr = fieldOf(atCls, "mInstrumentation").get(at)
+            line("ActivityThread.mInstrumentation = " + (atInstr?.javaClass?.name ?: "null"))
+            // guest Application + its classloader (loads the SDK classes)
+            val app = atCls.getMethod("getApplication").invoke(at)
+                as? android.app.Application
+            line("Application = " + (app?.javaClass?.name ?: "null"))
+            val guestCl = app?.javaClass?.classLoader
+            // (c) registered lifecycle callbacks on the Application
+            if (app != null) {
+                try {
+                    val cbs = fieldOf(Class.forName("android.app.Application"),
+                        "mActivityLifecycleCallbacks").get(app) as? java.util.ArrayList<*>
+                    if (cbs == null) {
+                        line("lifecycleCallbacks = null")
+                    } else {
+                        line("lifecycleCallbacks.size = " + cbs.size)
+                        for (cb in cbs) line("  cb: " + (cb?.javaClass?.name ?: "null"))
+                    }
+                } catch (e: Throwable) {
+                    line("lifecycleCallbacks: <" + e.javaClass.simpleName + ">")
+                }
+            }
+            // SDK end-state statics, read through the guest classloader
+            if (guestCl != null) {
+                try {
+                    val sdk = Class.forName("com.sdk.hijack.api.HijackSDK", false, guestCl)
+                    val done = fieldOf(sdk, "isRegisterActivityLifecycleCallbacks")
+                        .getBoolean(null)
+                    line("HijackSDK.isRegisterActivityLifecycleCallbacks = " + done)
+                } catch (e: Throwable) {
+                    line("HijackSDK flag: <" + e.javaClass.simpleName + ">")
+                }
+                try {
+                    val pi = Class.forName(
+                        "com.sdk.hijack.base.ProxyInstrumentation", false, guestCl)
+                    val inst = fieldOf(pi, "instance").get(null)
+                    line("ProxyInstrumentation.instance = " +
+                        (if (inst == null) "null" else "set(sameAsAT=" + (inst === atInstr) + ")"))
+                    if (inst != null) {
+                        try {
+                            val ori = fieldOf(pi, "oriInstrumentation").get(inst)
+                            val typ = fieldOf(pi, "oriClassType").getInt(inst)
+                            line("  oriInstrumentation = " +
+                                (ori?.javaClass?.name ?: "null") + " oriClassType = " + typ)
+                        } catch (e: Throwable) {
+                            line("  ori: <" + e.javaClass.simpleName + ">")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    line("ProxyInstrumentation.instance: <" + e.javaClass.simpleName + ">")
+                }
+            }
+            // per-Activity instrumentation (registerActivity's target)
+            try {
+                val actsAny = fieldOf(atCls, "mActivities").get(at)
+                if (actsAny == null) {
+                    line("mActivities = null")
+                } else {
+                    val entries = actsAny.javaClass.getMethod("entrySet")
+                        .invoke(actsAny) as java.util.Set<*>
+                    line("mActivities.size = " + entries.size)
+                    for (entry in entries) {
+                        if (entry == null) continue
+                        val rec = entry.javaClass.getMethod("getValue")
+                            .invoke(entry) ?: continue
+                        val act = fieldOf(rec.javaClass, "activity").get(rec) ?: continue
+                        val ai = try {
+                            fieldOf(Class.forName("android.app.Activity"),
+                                "mInstrumentation").get(act)
+                        } catch (e: Throwable) {
+                            null
+                        }
+                        line("  activity " + act.javaClass.name +
+                            " mInstrumentation = " + (ai?.javaClass?.name ?: "null"))
+                    }
+                }
+            } catch (e: Throwable) {
+                line("mActivities: <" + e.javaClass.simpleName + ">")
+            }
+        } catch (e: Throwable) {
+            line("sample failed: <" + e.javaClass.simpleName + "> " + e.message)
+        }
+        try {
+            out.appendText(sb.toString())
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unwrapHijackProxy(out: java.io.File, label: String) {
+        val sb = StringBuilder()
+        fun line(s: String) {
+            sb.append(s).append('\n')
+            Timber.tag("HijackTrace").i("%s unwrap: %s", label, s)
+        }
+        try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            val at = atCls.getMethod("currentActivityThread").invoke(null)
+            if (at == null) {
+                line("skip, ActivityThread null")
+                out.appendText(sb.toString())
+                return
+            }
+            val instrF = fieldOf(atCls, "mInstrumentation")
+            val cur = instrF.get(at)
+            if (cur == null ||
+                cur.javaClass.name != "com.sdk.hijack.base.ProxyInstrumentation"
+            ) {
+                line("skip, AT.mInstrumentation = " + (cur?.javaClass?.name ?: "null"))
+                out.appendText(sb.toString())
+                return
+            }
+            val ori = fieldOf(cur.javaClass, "oriInstrumentation").get(cur)
+            if (ori == null) {
+                line("abort, oriInstrumentation is null")
+                out.appendText(sb.toString())
+                return
+            }
+            instrF.set(at, ori)
+            line("AT.mInstrumentation ProxyInstrumentation -> " + ori.javaClass.name)
+            try {
+                val actsAny = fieldOf(atCls, "mActivities").get(at)
+                val entries = actsAny.javaClass.getMethod("entrySet")
+                    .invoke(actsAny) as java.util.Set<*>
+                val aiF = fieldOf(Class.forName("android.app.Activity"),
+                    "mInstrumentation")
+                for (entry in entries) {
+                    if (entry == null) continue
+                    val rec = entry.javaClass.getMethod("getValue")
+                        .invoke(entry) ?: continue
+                    val act = fieldOf(rec.javaClass, "activity").get(rec) ?: continue
+                    val ai = aiF.get(act)
+                    if (ai != null && ai.javaClass.name ==
+                        "com.sdk.hijack.base.ProxyInstrumentation"
+                    ) {
+                        aiF.set(act, ori)
+                        line("activity " + act.javaClass.name +
+                            " mInstrumentation -> ori")
+                    }
+                }
+            } catch (e: Throwable) {
+                line("activities swap: <" + e.javaClass.simpleName + ">")
+            }
+        } catch (e: Throwable) {
+            line("unwrap failed: <" + e.javaClass.simpleName + "> " + e.message)
+        }
+        try {
+            out.appendText(sb.toString())
+        } catch (_: Throwable) {
         }
     }
 

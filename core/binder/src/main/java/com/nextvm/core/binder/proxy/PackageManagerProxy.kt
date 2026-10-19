@@ -38,6 +38,18 @@ class PackageManagerProxy(
     companion object {
         private const val TAG = "PMProxy"
         private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
+
+        // PmTrace (v31): record-only tracing of every PM call a guest
+        // process makes — method, key arg, flags, and a result summary.
+        // Exists to find the synchronous PM query whose answer in the
+        // sandbox stalls the guest's init pipeline (splash hang).
+        private const val TRACE_MAX = 400
+        private val traceCount = java.util.concurrent.atomic.AtomicInteger(0)
+        private val WV_PACKAGES = setOf(
+            "com.google.android.webview",
+            "com.android.webview",
+            "com.google.android.gms"
+        )
     }
 
     // Virtual app registry
@@ -90,6 +102,25 @@ class PackageManagerProxy(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+        // PmTrace (v31): wrap the real dispatch; record-only, never
+        // alters arguments, results, or exception behavior.
+        val traced = try {
+            callerResolver.isGuestProcess()
+        } catch (_: Exception) {
+            false
+        }
+        if (traced) tracePmCall(method.name, args, null, -1, null)
+        return try {
+            val result = invokeDispatch(proxy, method, args)
+            if (traced) tracePmCall(method.name, args, result, 0, null)
+            result
+        } catch (e: Exception) {
+            if (traced) tracePmCall(method.name, args, null, 0, e)
+            throw e
+        }
+    }
+
+    private fun invokeDispatch(proxy: Any, method: Method, args: Array<out Any>?): Any? {
         val methodName = method.name
 
         return try {
@@ -681,6 +712,90 @@ class PackageManagerProxy(
                 Timber.tag(TAG).w("Failed to parse metaData from APK: ${app.apkPath}")
                 this.metaData = android.os.Bundle().apply {
                     putInt("com.google.android.gms.version", 243431006)
+                }
+            }
+        }
+    }
+
+    // ==================== PmTrace (v31) ====================
+
+    private fun tracePmCall(
+        methodName: String,
+        args: Array<out Any>?,
+        result: Any?,
+        phase: Int,
+        error: Exception?
+    ) {
+        try {
+            val n = traceCount.incrementAndGet()
+            if (n > TRACE_MAX) return
+            val sb = StringBuilder()
+            // WV> marks queries about WebView/GMS packages — the prime
+            // suspects for a silently-missing init dependency.
+            val pkgArg = args?.firstOrNull { it is String } as? String
+                ?: (args?.firstOrNull { it is ComponentName } as? ComponentName)?.packageName
+            if (pkgArg != null && pkgArg in WV_PACKAGES || methodName.contains("WebView")) {
+                sb.append("WV> ")
+            }
+            sb.append(if (phase < 0) ">> " else "<< ").append(methodName)
+            if (args != null) {
+                for (a in args) {
+                    when (a) {
+                        is String -> sb.append(" str=").append(a)
+                        is ComponentName -> sb.append(" cmp=")
+                            .append(a.flattenToShortString())
+                        is Intent -> sb.append(" intent{cmp=")
+                            .append(a.component?.flattenToShortString())
+                            .append(" act=").append(a.action)
+                            .append(" pkg=").append(a.`package`).append('}')
+                        else -> { /* binder/other objects: skip */ }
+                    }
+                }
+                if (phase < 0) {
+                    val flags = extractFlags(args, 1)
+                    if (flags != 0) sb.append(" flags=0x").append(flags.toString(16))
+                }
+            }
+            if (phase >= 0) {
+                sb.append(" -> ")
+                if (error != null) {
+                    sb.append('!').append(error.javaClass.simpleName)
+                        .append(": ").append(error.message)
+                } else {
+                    sb.append(summarizePmResult(result))
+                }
+            }
+            Timber.tag("PmTrace").i(sb.toString())
+        } catch (_: Exception) {
+            // Tracing must never break the proxied call.
+        }
+    }
+
+    private fun summarizePmResult(result: Any?): String {
+        return when (result) {
+            null -> "null"
+            is Int -> "int=$result"
+            is Long -> "long=$result"
+            is Boolean -> "bool=$result"
+            is String -> "str(len=${result.length})"
+            is ComponentName -> "cmp=" + result.flattenToShortString()
+            is PackageInfo -> "PackageInfo(${result.packageName})"
+            is ApplicationInfo -> "ApplicationInfo(${result.packageName})"
+            is ActivityInfo -> "ActivityInfo(${result.packageName}/${result.name})"
+            is List<*> -> "List[${result.size}]"
+            is Array<*> -> "Array[${result.size}]"
+            else -> {
+                if (result.javaClass.name == "android.content.pm.ParceledListSlice") {
+                    try {
+                        val list = result.javaClass
+                            .getMethod("getList")
+                            .invoke(result) as? List<*>
+                        "ParceledListSlice[${list?.size}]"
+                    } catch (_: Exception) {
+                        result.javaClass.simpleName
+                    }
+                } else {
+                    result.javaClass.simpleName
                 }
             }
         }

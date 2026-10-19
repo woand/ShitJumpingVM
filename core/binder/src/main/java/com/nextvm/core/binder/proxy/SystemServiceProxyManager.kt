@@ -1271,9 +1271,16 @@ internal class TelephonyManagerProxyHandler(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+        // SvcTrace (v31): record-only wrapper; see svcTrace above.
         val callingPid = android.os.Process.myPid()
         val isVirtual = manager.isVirtualCallOrArgs(callingPid, args)
+        if (isVirtual) svcTrace("telephony", method.name, true, null, args, null, -1, null)
+        val result = invokeDispatch(proxy, method, args, isVirtual)
+        if (isVirtual) svcTrace("telephony", method.name, true, null, args, result, 0, null)
+        return result
+    }
 
+    private fun invokeDispatch(proxy: Any, method: Method, args: Array<out Any>?, isVirtual: Boolean): Any? {
         return try {
             when (method.name) {
                 "getDeviceId",
@@ -1441,9 +1448,24 @@ internal class ConnectivityManagerProxyHandler(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+        // SvcTrace (v31): record-only wrapper; the instance's network
+        // policy rides along because an OFFLINE misjudgment makes the
+        // dispatched handlers below return null / swallow callbacks —
+        // a prime suspect for the guest's never-satisfied init gate.
         val callingPid = android.os.Process.myPid()
         val isVirtual = manager.isVirtualCallOrArgs(callingPid, args)
+        val policy = if (isVirtual) {
+            manager.getNetworkPolicyForPid(callingPid)?.toString()
+        } else {
+            null
+        }
+        if (isVirtual) svcTrace("connectivity", method.name, true, policy, args, null, -1, null)
+        val result = invokeDispatch(proxy, method, args, isVirtual)
+        if (isVirtual) svcTrace("connectivity", method.name, true, policy, args, result, 0, null)
+        return result
+    }
 
+    private fun invokeDispatch(proxy: Any, method: Method, args: Array<out Any>?, isVirtual: Boolean): Any? {
         return try {
             when (method.name) {
                 "getActiveNetworkInfo" -> handleGetActiveNetworkInfo(method, args, isVirtual)
@@ -2247,23 +2269,34 @@ internal class JobSchedulerProxyHandler(
                 override fun handleMethod(method: Method, args: Array<out Any>?, isVirtual: Boolean): Any? {
                     if (!isVirtual) return invokeOriginal(method, args)
 
-                    when (method.name) {
-                        "getConnectionInfo" -> {
-                            // Spoof MAC address if device profile has one
-                            val instanceId = manager.getInstanceForPid(android.os.Process.myPid())
-                            val profile = if (instanceId != null) manager.getDeviceProfile(instanceId) else null
-                            val result = invokeOriginal(method, args)
-                            if (profile != null && result != null) {
-                                try {
-                                    val macField = com.nextvm.core.common.findField(result::class.java, "mMacAddress")
-                                    macField?.isAccessible = true
-                                    macField?.set(result, profile.macAddress)
-                                } catch (_: Exception) { /* best effort */ }
+                    // SvcTrace (v31, W1 narrow): record-only tracing at
+                    // this handler's single entry point; dispatch below
+                    // is the pre-v31 logic, unchanged.
+                    svcTrace("wifi", method.name, true, null, args, null, -1, null)
+                    val result = try {
+                        when (method.name) {
+                            "getConnectionInfo" -> {
+                                // Spoof MAC address if device profile has one
+                                val instanceId = manager.getInstanceForPid(android.os.Process.myPid())
+                                val profile = if (instanceId != null) manager.getDeviceProfile(instanceId) else null
+                                val connInfo = invokeOriginal(method, args)
+                                if (profile != null && connInfo != null) {
+                                    try {
+                                        val macField = com.nextvm.core.common.findField(connInfo::class.java, "mMacAddress")
+                                        macField?.isAccessible = true
+                                        macField?.set(connInfo, profile.macAddress)
+                                    } catch (_: Exception) { /* best effort */ }
+                                }
+                                connInfo
                             }
-                            return result
+                            else -> invokeOriginal(method, args)
                         }
+                    } catch (e: Exception) {
+                        svcTrace("wifi", method.name, true, null, args, null, 0, e)
+                        throw e
                     }
-                    return invokeOriginal(method, args)
+                    svcTrace("wifi", method.name, true, null, args, result, 0, null)
+                    return result
                 }
             }
         }
@@ -3091,5 +3124,74 @@ internal class JobSchedulerProxyHandler(
         }
 
         override fun getInterfaceDescriptor(): String = descriptor
+    }
+}
+
+// ==================== SvcTrace (v31) ====================
+// Record-only tracing for the highest-suspicion service handlers
+// (connectivity / telephony / wifi). Exists to find the synchronous
+// system-service query whose sandbox answer stalls a guest's init
+// pipeline (splash hang): e.g. connectivity returning null because the
+// instance's NetworkPolicy was judged OFFLINE. Never alters results.
+// NOTE: this must stay at file top level — the handler classes above
+// are nested inside SystemServiceProxyManager despite their column-0
+// declarations, so a helper placed between them lands in the class
+// body where a top-level const/fun is illegal (v31 first build broke
+// exactly here).
+private const val SVC_TRACE_MAX = 400
+private val svcTraceCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+internal fun svcTrace(
+    service: String,
+    methodName: String,
+    isVirtual: Boolean,
+    policy: String?,
+    args: Array<out Any>?,
+    result: Any?,
+    phase: Int,
+    error: Throwable?
+) {
+    try {
+        val n = svcTraceCount.incrementAndGet()
+        if (n > SVC_TRACE_MAX) return
+        val sb = StringBuilder()
+        sb.append(if (phase < 0) ">> " else "<< ")
+            .append(service).append('.').append(methodName)
+            .append(" virt=").append(isVirtual)
+        if (policy != null) sb.append(" policy=").append(policy)
+        if (phase < 0 && args != null) {
+            for (a in args) {
+                when (a) {
+                    is String -> sb.append(" str=").append(a)
+                    is Int -> sb.append(" int=").append(a)
+                    is android.content.ComponentName -> sb.append(" cmp=")
+                        .append(a.flattenToShortString())
+                    else -> { /* binder/callback objects: skip */ }
+                }
+            }
+        }
+        if (phase >= 0) {
+            sb.append(" -> ")
+            if (error != null) {
+                sb.append('!').append(error.javaClass.simpleName)
+                    .append(": ").append(error.message)
+            } else {
+                sb.append(
+                    when (result) {
+                        null -> "null"
+                        is Int -> "int=$result"
+                        is Long -> "long=$result"
+                        is Boolean -> "bool=$result"
+                        is String -> "str(len=${result.length})"
+                        is List<*> -> "List[${result.size}]"
+                        is Array<*> -> "Array[${result.size}]"
+                        else -> result.javaClass.simpleName
+                    }
+                )
+            }
+        }
+        Timber.tag("SvcTrace").i(sb.toString())
+    } catch (_: Exception) {
+        // Tracing must never break the proxied call.
     }
 }
