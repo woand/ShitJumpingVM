@@ -360,6 +360,15 @@ class ActivityManagerProxy(
     }
 
     /**
+     * v45 witness for ActivityBinderWrap traces: which virtual
+     * packages this process's registry currently holds, so a
+     * "not rewritten" line can distinguish "proxy missing" from
+     * "package not registered in this process".
+     */
+    fun debugVirtualAppKeys(): String =
+        virtualApps.keys.joinToString(",")
+
+    /**
      * Handle startService — swap virtual service with stub.
      */
     private fun handleStartService(method: Method, args: Array<out Any>?): Any? {

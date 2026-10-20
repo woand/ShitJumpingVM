@@ -8,69 +8,82 @@ import android.os.IInterface
 import android.os.Parcel
 import android.os.UserHandle
 import com.nextvm.core.model.VirtualConstants
+import com.nextvm.core.model.VirtualIntentExtras
 import timber.log.Timber
 import java.io.File
+import java.lang.reflect.Field
 import java.io.FileDescriptor
 
 /**
- * v44: raw-binder interception for the "activity" service.
+ * v44/v45: raw-binder interception for activity-start services.
  *
- * launch61 (witness counters in ActivityManagerProxy) proved that
- * guest code in a guest process makes ZERO AMS calls through
- * ActivityManager.getService() — the singleton the engine replaces —
- * while its startActivity calls still reach the real AMS with raw
- * component names and die on Permission Denial. The guest (via its
- * shell / anti-hijack layer) resolves AMS through the raw binder:
- * ServiceManager.getService("activity") -> IActivityManager.Stub
- * .asInterface(binder), with the binder captured from
- * ServiceManager's cache.
+ * History: v44 wrapped only ServiceManager's "activity" entry.
+ * launch63 proved no guest start ever flows over that binder (and
+ * IActivityManager$Stub may not even carry startActivity codes
+ * since the Android 10 split): the system records the guest's
+ * GuideActivity starts under ActivityTaskManager. Guest startActivity
+ * goes through IActivityTaskManager — ServiceManager name
+ * "activity_task" — the standard framework path since Android 10
+ * (Instrumentation.execStartActivity -> ActivityTaskManager
+ * .getService()).
  *
- * This wrapper replaces the "activity" entry in ServiceManager
- * .sCache with a delegating IBinder. Every call is forwarded
- * untouched except startActivity / startActivityAsUser, whose
- * parcels are parsed; when the intent targets a registered virtual
- * app (decided by ActivityManagerProxy.rewriteGuestStartIntent,
- * the same logic as the singleton proxy's handleStartActivity),
- * the parcel is rebuilt with the stub intent and the host package
- * as callingPackage, then forwarded — the system AMS launches the
- * stub activity and the engine's normal stub machinery takes over.
+ * v45 parameterises the wrapper per service and installs it for
+ * BOTH "activity" and "activity_task":
+ *  - descriptor and transaction codes come from the wrapped binder
+ *    / the service's own Stub class, resolved eagerly at install
+ *    and logged (a -1 code is visible, never silent);
+ *  - the AIDL field order for startActivity/startActivityAsUser
+ *    is identical for the two interfaces (split verbatim in
+ *    Android 10), and the trace prints the parsed component, so a
+ *    mis-parse would be visible on first contact;
+ *  - ActivityTaskManager's singleton is inspected after wrapping:
+ *    if it already cached a proxy over the raw binder, its
+ *    mInstance is refilled with a proxy over the wrapped binder.
+ *
+ * Interception semantics are unchanged from v44: every call is
+ * forwarded untouched except startActivity/startActivityAsUser,
+ * whose parcels are parsed; when the intent targets a registered
+ * virtual app (decided by ActivityManagerProxy
+ * .rewriteGuestStartIntent), the parcel is rebuilt with the stub
+ * intent and the host package as callingPackage, then forwarded.
+ * Any failure degrades to forwarding the original parcel.
  *
  * Installed from NextVmApplication.onCreate (via VirtualEngine
  * .installActivityBinderWrapEarly) so it is in place before any
- * guest code can capture the binder. Any failure degrades to
- * forwarding the original parcel untouched.
+ * guest code can capture the binder.
  */
 class ActivityBinderWrap private constructor(
     private val real: IBinder,
-    private val context: Context
+    private val context: Context,
+    private val serviceName: String,
+    private val stubClassName: String
 ) : IBinder {
 
     companion object {
         private const val TAG = "BinderWrap"
-        private const val DESCRIPTOR = "android.app.IActivityManager"
-        private const val SERVICE = "activity"
 
-        @Volatile
-        private var installed = false
+        private data class ServiceSpec(
+            val name: String,
+            val stubClassName: String
+        )
+
+        private val SPECS = listOf(
+            ServiceSpec("activity", "android.app.IActivityManager\$Stub"),
+            ServiceSpec(
+                "activity_task",
+                "android.app.IActivityTaskManager\$Stub"
+            )
+        )
+
+        private val installedServices = mutableSetOf<String>()
 
         fun install(context: Context) {
-            if (installed) return
             synchronized(this) {
-                if (installed) return
                 try {
                     val smClass = Class.forName("android.os.ServiceManager")
                     val getService = smClass.getMethod(
                         "getService", String::class.java
                     )
-                    val raw = getService.invoke(null, SERVICE) as? IBinder
-                    if (raw == null) {
-                        Timber.tag(TAG).w("getService(activity) returned null")
-                        return
-                    }
-                    if (raw is ActivityBinderWrap) {
-                        installed = true
-                        return
-                    }
                     val cacheField = smClass.getDeclaredField("sCache")
                     cacheField.isAccessible = true
                     @Suppress("UNCHECKED_CAST")
@@ -80,17 +93,159 @@ class ActivityBinderWrap private constructor(
                         Timber.tag(TAG).w("ServiceManager.sCache unavailable")
                         return
                     }
-                    cache[SERVICE] = ActivityBinderWrap(
-                        raw, context.applicationContext
-                    )
-                    installed = true
-                    Timber.tag(TAG).i("activity binder wrap installed")
+                    val appCtx = context.applicationContext
+                    for (spec in SPECS) {
+                        if (spec.name in installedServices) continue
+                        try {
+                            val raw = getService.invoke(null, spec.name)
+                                as? IBinder
+                            if (raw == null) {
+                                Timber.tag(TAG).w(
+                                    "getService(%s) returned null", spec.name
+                                )
+                                continue
+                            }
+                            if (raw is ActivityBinderWrap &&
+                                raw.serviceName == spec.name
+                            ) {
+                                installedServices += spec.name
+                                continue
+                            }
+                            val wrap = ActivityBinderWrap(
+                                raw, appCtx, spec.name, spec.stubClassName
+                            )
+                            cache[spec.name] = wrap
+                            installedServices += spec.name
+                            // Force lazy code resolution NOW so the
+                            // install line witnesses the actual codes.
+                            Timber.tag(TAG).i(
+                                "[%s] binder wrap installed: codes %s prev=%s",
+                                spec.name, wrap.codesSummary(),
+                                raw.javaClass.simpleName
+                            )
+                            if (spec.name == "activity_task") {
+                                fixupAtmSingleton(wrap)
+                            }
+                        } catch (t: Throwable) {
+                            Timber.tag(TAG).e(
+                                t, "[%s] binder wrap install failed",
+                                spec.name
+                            )
+                        }
+                    }
                 } catch (t: Throwable) {
-                    Timber.tag(TAG).e(t, "activity binder wrap install failed")
+                    Timber.tag(TAG).e(t, "binder wrap install failed")
                 }
             }
         }
+
+        /**
+         * ActivityTaskManager.getService() caches its proxy in a
+         * static Singleton (mInstance). If that singleton was
+         * already filled with a proxy over the RAW binder before
+         * our wrap went in, refill it with a proxy over the
+         * wrapped binder; log every outcome as witness.
+         */
+        private fun fixupAtmSingleton(wrap: ActivityBinderWrap) {
+            try {
+                val atmClass = Class.forName("android.app.ActivityTaskManager")
+                val singletonField =
+                    atmClass.getDeclaredField("IActivityTaskManagerSingleton")
+                singletonField.isAccessible = true
+                val singleton = singletonField.get(null)
+                if (singleton == null) {
+                    Timber.tag(TAG).i("[activity_task] atm singleton: absent")
+                    return
+                }
+                // mInstance is declared in the android.util.Singleton
+                // superclass, not in the anonymous IActivityTaskManager
+                // Singleton subclass: getDeclaredField alone misses it
+                // (v45 launch64 witness: NoSuchFieldException in
+                // ActivityTaskManager$2). Walk the hierarchy.
+                val mInstanceField = findFieldInHierarchy(
+                    singleton.javaClass, "mInstance"
+                ) ?: throw NoSuchFieldException(
+                    "mInstance not found in hierarchy of " +
+                        singleton.javaClass.name
+                )
+                mInstanceField.isAccessible = true
+                val existing = mInstanceField.get(singleton)
+                if (existing == null) {
+                    Timber.tag(TAG).i(
+                        "[activity_task] atm singleton: unfilled " +
+                            "(first getService will see the wrap)"
+                    )
+                    return
+                }
+                val remote = findRemoteBinder(existing)
+                if (remote === wrap) {
+                    Timber.tag(TAG).i(
+                        "[activity_task] atm singleton: already wrapped"
+                    )
+                    return
+                }
+                val stubClass =
+                    Class.forName("android.app.IActivityTaskManager\$Stub")
+                val asInterface = stubClass.getMethod(
+                    "asInterface", IBinder::class.java
+                )
+                val replacement = asInterface.invoke(null, wrap)
+                if (replacement == null) {
+                    Timber.tag(TAG).w(
+                        "[activity_task] atm singleton: asInterface(wrap) null"
+                    )
+                    return
+                }
+                mInstanceField.set(singleton, replacement)
+                Timber.tag(TAG).i(
+                    "[activity_task] atm singleton: REFILLED " +
+                        "(was proxy over %s)",
+                    remote?.javaClass?.simpleName ?: "unknown"
+                )
+            } catch (t: Throwable) {
+                Timber.tag(TAG).w(
+                    t, "[activity_task] atm singleton fixup failed"
+                )
+            }
+        }
+
+        /** getDeclaredField does not search superclasses; walk. */
+        private fun findFieldInHierarchy(
+            cls: Class<*>, name: String
+        ): Field? {
+            var c: Class<*>? = cls
+            while (c != null) {
+                try {
+                    return c.getDeclaredField(name)
+                } catch (e: NoSuchFieldException) {
+                    c = c.superclass
+                }
+            }
+            return null
+        }
+
+        private fun findRemoteBinder(proxy: Any): IBinder? {
+            var cls: Class<*>? = proxy.javaClass
+            while (cls != null) {
+                try {
+                    val f = cls.getDeclaredField("mRemote")
+                    f.isAccessible = true
+                    return f.get(proxy) as? IBinder
+                } catch (e: NoSuchFieldException) {
+                    cls = cls.superclass
+                }
+            }
+            return null
+        }
     }
+
+    private val descriptor: String
+        get() = real.interfaceDescriptor
+            ?: if (serviceName == "activity_task") {
+                "android.app.IActivityTaskManager"
+            } else {
+                "android.app.IActivityManager"
+            }
 
     private val codeStartActivity: Int by lazy {
         transactionCode("TRANSACTION_startActivity")
@@ -99,9 +254,12 @@ class ActivityBinderWrap private constructor(
         transactionCode("TRANSACTION_startActivityAsUser")
     }
 
+    fun codesSummary(): String =
+        "start=" + codeStartActivity +
+            " asUser=" + codeStartActivityAsUser
+
     private fun transactionCode(field: String): Int = try {
-        val f = Class.forName("android.app.IActivityManager\$Stub")
-            .getDeclaredField(field)
+        val f = Class.forName(stubClassName).getDeclaredField(field)
         f.isAccessible = true
         f.getInt(null)
     } catch (t: Throwable) {
@@ -157,16 +315,20 @@ class ActivityBinderWrap private constructor(
         reply: Parcel?,
         flags: Int
     ): Boolean {
-        val isStart = code == codeStartActivity ||
-            code == codeStartActivityAsUser
+        val isStart = (codeStartActivity >= 0 &&
+            code == codeStartActivity) ||
+            (codeStartActivityAsUser >= 0 &&
+                code == codeStartActivityAsUser)
         if (!isStart || reply == null ||
             (flags and IBinder.FLAG_ONEWAY) != 0
         ) {
             return real.transact(code, data, reply, flags)
         }
         return try {
-            handleStart(code, data, reply, flags,
-                code == codeStartActivityAsUser)
+            handleStart(
+                code, data, reply, flags,
+                code == codeStartActivityAsUser
+            )
         } catch (t: Throwable) {
             trace("intercept failed <" + t.javaClass.simpleName + "> " +
                 t.message + " — forwarding original")
@@ -176,12 +338,13 @@ class ActivityBinderWrap private constructor(
     }
 
     /**
-     * Parse a startActivity parcel (AIDL write order, stable since
-     * Android 10): interface token, caller binder, callingPackage,
-     * callingFeatureId, intent, resolvedType, resultTo, resultWho,
-     * requestCode, flags, profilerInfo, options [, userHandle].
-     * Rebuilds and forwards only when the intent is rewritten to a
-     * stub; otherwise forwards the original parcel untouched.
+     * Parse a startActivity parcel (AIDL write order, identical
+     * for IActivityManager and IActivityTaskManager): interface
+     * token, caller binder, callingPackage, callingFeatureId,
+     * intent, resolvedType, resultTo, resultWho, requestCode,
+     * flags, profilerInfo, options [, userHandle]. Rebuilds and
+     * forwards only when the intent is rewritten to a stub;
+     * otherwise forwards the original parcel untouched.
      */
     private fun handleStart(
         code: Int,
@@ -191,7 +354,7 @@ class ActivityBinderWrap private constructor(
         asUser: Boolean
     ): Boolean {
         data.setDataPosition(0)
-        data.enforceInterface(DESCRIPTOR)
+        data.enforceInterface(descriptor)
         val caller = data.readStrongBinder()
         val callingPackage = data.readString()
         val callingFeatureId = data.readString()
@@ -218,16 +381,26 @@ class ActivityBinderWrap private constructor(
         val proxy = ActivityManagerProxy.activeInstance
         val rewritten = proxy?.rewriteGuestStartIntent(intent)
         if (rewritten == null) {
-            trace("start seen, not rewritten: cmp=" + intent.component +
-                " proxyPresent=" + (proxy != null))
+            trace(
+                "start seen, not rewritten: cmp=" + intent.component +
+                    " proxyPresent=" + (proxy != null) +
+                    " apps=[" + (proxy?.debugVirtualAppKeys() ?: "-") + "]"
+            )
             data.setDataPosition(0)
             return real.transact(code, data, reply, flags)
         }
-        trace("start REWRITTEN: " + intent.component + " -> " +
-            rewritten.component + " callingPkg=" + callingPackage)
+        trace(
+            "start REWRITTEN: " + intent.component + " -> " +
+                rewritten.component + " callingPkg=" + callingPackage +
+                " instance=" + rewritten.getStringExtra(
+                    VirtualIntentExtras.INSTANCE_ID
+                ) + " slot=" + rewritten.getIntExtra(
+                    VirtualIntentExtras.PROCESS_SLOT, -1
+                )
+        )
         val out = Parcel.obtain()
         try {
-            out.writeInterfaceToken(DESCRIPTOR)
+            out.writeInterfaceToken(descriptor)
             out.writeStrongBinder(caller)
             out.writeString(VirtualConstants.HOST_PACKAGE)
             out.writeString(callingFeatureId)
@@ -249,7 +422,7 @@ class ActivityBinderWrap private constructor(
     private val traceLock = Any()
 
     private fun trace(msg: String) {
-        Timber.tag(TAG).i(msg)
+        Timber.tag(TAG).i("[%s] %s", serviceName, msg)
         try {
             val f = File(
                 context.filesDir,
@@ -257,7 +430,9 @@ class ActivityBinderWrap private constructor(
                     android.os.Process.myPid() + ".log"
             )
             synchronized(traceLock) {
-                f.appendText("binderwrap: " + msg + "\n")
+                f.appendText(
+                    "binderwrap[" + serviceName + "]: " + msg + "\n"
+                )
             }
         } catch (t: Throwable) {
             // Witness is best-effort; never break a transact over it.

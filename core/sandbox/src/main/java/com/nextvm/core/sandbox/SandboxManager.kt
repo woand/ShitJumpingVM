@@ -68,8 +68,39 @@ class SandboxManager @Inject constructor(
 
     private val dataRoot = File(virtualRoot, VirtualConstants.VIRTUAL_DATA_DIR)
 
+    /**
+     * v51: directories already ensured to exist in this process.
+     *
+     * Every dir getter used to call mkdirs() unconditionally, so hot
+     * paths that resolve sandbox dirs per call — above all
+     * VirtualContext.getApplicationInfo(), which layout measurement
+     * consults constantly — paid several supervised access()/mkdir
+     * syscalls per call and could saturate a guest's main thread
+     * into an input-dispatch ANR (launch69: three DropBox ANRs with
+     * the main thread inside File.mkdirs under getApplicationInfo).
+     * Dirs are created on first use in the process and only removed
+     * by deleteAppData/clearCache, which purge the cache below.
+     */
+    private val ensuredDirs =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun ensureDir(file: File): File {
+        if (ensuredDirs.add(file.absolutePath)) {
+            file.mkdirs()
+        }
+        return file
+    }
+
+    private fun forgetEnsuredUnder(dir: File) {
+        val prefix = dir.absolutePath
+        ensuredDirs.removeIf {
+            it == prefix || it.startsWith(prefix + File.separator)
+        }
+    }
+
     init {
         dataRoot.mkdirs()
+        ensuredDirs.add(dataRoot.absolutePath)
     }
 
     /**
@@ -100,42 +131,42 @@ class SandboxManager @Inject constructor(
      * Get the root data directory for an app instance.
      */
     fun getAppDir(instanceId: String): File {
-        return File(dataRoot, instanceId).also { it.mkdirs() }
+        return ensureDir(File(dataRoot, instanceId))
     }
 
     /**
      * Get the files directory for an app instance.
      */
     fun getFilesDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "files").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "files"))
     }
 
     /**
      * Get the cache directory for an app instance.
      */
     fun getCacheDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "cache").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "cache"))
     }
 
     /**
      * Get the shared_prefs directory for an app instance.
      */
     fun getSharedPrefsDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "shared_prefs").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "shared_prefs"))
     }
 
     /**
      * Get the databases directory for an app instance.
      */
     fun getDatabasesDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "databases").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "databases"))
     }
 
     /**
      * Get the native lib directory for an app instance.
      */
     fun getLibDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "lib").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "lib"))
     }
 
     /**
@@ -151,14 +182,14 @@ class SandboxManager @Inject constructor(
      * Get the code_cache directory for an app instance.
      */
     fun getCodeCacheDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "code_cache").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "code_cache"))
     }
 
     /**
      * Get the external files directory for an app instance.
      */
     fun getExternalFilesDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "external_files").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "external_files"))
     }
 
     /**
@@ -167,6 +198,7 @@ class SandboxManager @Inject constructor(
     fun deleteAppData(instanceId: String): Boolean {
         val appDir = getAppDir(instanceId)
         val result = appDir.deleteRecursively()
+        forgetEnsuredUnder(appDir)
         Timber.tag(TAG).i("Deleted data for $instanceId: $result")
         return result
     }
@@ -177,6 +209,7 @@ class SandboxManager @Inject constructor(
     fun clearCache(instanceId: String): Boolean {
         val cacheDir = getCacheDir(instanceId)
         val result = cacheDir.deleteRecursively()
+        forgetEnsuredUnder(cacheDir)
         cacheDir.mkdirs() // Recreate empty dir
         Timber.tag(TAG).d("Cleared cache for $instanceId")
         return result
@@ -225,7 +258,7 @@ class SandboxManager @Inject constructor(
      * OBB files are large expansion files downloaded alongside an app.
      */
     fun getObbDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "obb").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "obb"))
     }
 
     /**
@@ -249,7 +282,7 @@ class SandboxManager @Inject constructor(
      *       └── media/{pkg}/
      */
     fun getExternalStorageDir(instanceId: String): File {
-        return File(getAppDir(instanceId), "sdcard").also { it.mkdirs() }
+        return ensureDir(File(getAppDir(instanceId), "sdcard"))
     }
 
     /**
@@ -259,7 +292,7 @@ class SandboxManager @Inject constructor(
      * @param type One of Environment.DIRECTORY_* constants (e.g., "DCIM", "Download", "Pictures")
      */
     fun getExternalStoragePublicDir(instanceId: String, type: String): File {
-        return File(getExternalStorageDir(instanceId), type).also { it.mkdirs() }
+        return ensureDir(File(getExternalStorageDir(instanceId), type))
     }
 
     /**
@@ -267,9 +300,8 @@ class SandboxManager @Inject constructor(
      * Equivalent to /storage/emulated/0/Android/data/{pkg}/files/{type}
      */
     fun getExternalAppFilesDir(instanceId: String, packageName: String, type: String?): File {
-        val base = File(getExternalStorageDir(instanceId), "Android/data/$packageName/files")
-        base.mkdirs()
-        return if (type != null) File(base, type).also { it.mkdirs() } else base
+        val base = ensureDir(File(getExternalStorageDir(instanceId), "Android/data/$packageName/files"))
+        return if (type != null) ensureDir(File(base, type)) else base
     }
 
     /**
@@ -277,7 +309,7 @@ class SandboxManager @Inject constructor(
      * Equivalent to /storage/emulated/0/Android/data/{pkg}/cache
      */
     fun getExternalAppCacheDir(instanceId: String, packageName: String): File {
-        return File(getExternalStorageDir(instanceId), "Android/data/$packageName/cache").also { it.mkdirs() }
+        return ensureDir(File(getExternalStorageDir(instanceId), "Android/data/$packageName/cache"))
     }
 
     /**
@@ -285,7 +317,7 @@ class SandboxManager @Inject constructor(
      * Equivalent to /storage/emulated/0/Android/media/{pkg}
      */
     fun getExternalMediaDir(instanceId: String, packageName: String): File {
-        return File(getExternalStorageDir(instanceId), "Android/media/$packageName").also { it.mkdirs() }
+        return ensureDir(File(getExternalStorageDir(instanceId), "Android/media/$packageName"))
     }
 
     /**
@@ -293,7 +325,7 @@ class SandboxManager @Inject constructor(
      * Equivalent to /storage/emulated/0/Android/obb/{pkg}
      */
     fun getExternalObbDir(instanceId: String, packageName: String): File {
-        return File(getExternalStorageDir(instanceId), "Android/obb/$packageName").also { it.mkdirs() }
+        return ensureDir(File(getExternalStorageDir(instanceId), "Android/obb/$packageName"))
     }
 
     /**

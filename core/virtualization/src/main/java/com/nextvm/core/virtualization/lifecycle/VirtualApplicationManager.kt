@@ -132,6 +132,12 @@ class VirtualApplicationManager @Inject constructor() {
             (applicationClassName ?: "android.app.Application") +
             " providers=" + providerNames.size +
             " frameworkLoadedApk=" + (frameworkLoadedApk != null))
+        // v47: start the WebView witness HERE, at bind entry — v46
+        // started it at bind complete and missed the guest startup
+        // band where the early WebView touch lives (fork+1.3s).
+        // virtualContext.filesDir is the guest files dir. The
+        // bind-complete schedule() calls below become no-ops.
+        WebViewWatch.schedule(packageName, virtualContext.filesDir)
 
         var legacyPrevInstr: Instrumentation? = null
         try {
@@ -157,6 +163,8 @@ class VirtualApplicationManager @Inject constructor() {
                     scheduleHijackTrace(packageName)
                     DexMemDump.schedule(packageName, fwApp.filesDir)
                     StateProbe.schedule(packageName, fwApp.filesDir)
+                    WebViewWatch.schedule(packageName, fwApp.filesDir)
+                    WebViewWarmup.schedule(packageName, fwApp.filesDir)
                     return fwApp
                 }
                 GuestBreadcrumb.log("framework path returned null, falling back to legacy bind")
@@ -241,6 +249,8 @@ class VirtualApplicationManager @Inject constructor() {
             scheduleHijackTrace(packageName)
             DexMemDump.schedule(packageName, application.filesDir)
             StateProbe.schedule(packageName, application.filesDir)
+            WebViewWatch.schedule(packageName, application.filesDir)
+            WebViewWarmup.schedule(packageName, application.filesDir)
             return application
 
         } catch (e: Exception) {
