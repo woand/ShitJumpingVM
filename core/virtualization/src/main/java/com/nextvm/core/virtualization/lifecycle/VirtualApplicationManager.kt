@@ -8,6 +8,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.ProviderInfo
 import android.content.res.Configuration
 import android.os.Build
+import android.os.Bundle
 import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
 import com.nextvm.core.common.findMethod
@@ -113,6 +114,7 @@ class VirtualApplicationManager @Inject constructor() {
         virtualContext: Context,
         providerNames: List<String> = emptyList(),
         providerAuthorities: Map<String, String> = emptyMap(),
+        providerMetaData: Map<String, Bundle> = emptyMap(),
         frameworkLoadedApk: Any? = null
     ): Application? {
         // Check if already bound
@@ -125,7 +127,13 @@ class VirtualApplicationManager @Inject constructor() {
         Timber.tag(TAG).i("bindApplication: $packageName ($instanceId)")
         Timber.tag(TAG).d("  applicationClass: ${applicationClassName ?: "android.app.Application"}")
         Timber.tag(TAG).d("  providers: ${providerNames.size}")
+        GuestBreadcrumb.begin(packageName)
+        GuestBreadcrumb.log("bind start instance=$instanceId appClass=" +
+            (applicationClassName ?: "android.app.Application") +
+            " providers=" + providerNames.size +
+            " frameworkLoadedApk=" + (frameworkLoadedApk != null))
 
+        var legacyPrevInstr: Instrumentation? = null
         try {
             // B2: framework-native bind — when a framework LoadedApk is
             // available for this guest, the Application is created and
@@ -138,13 +146,20 @@ class VirtualApplicationManager @Inject constructor() {
                     loadedApk = frameworkLoadedApk,
                     virtualContext = virtualContext,
                     providerNames = providerNames,
-                    providerAuthorities = providerAuthorities
+                    providerAuthorities = providerAuthorities,
+                    providerMetaData = providerMetaData
                 )
                 if (fwApp != null) {
+                    GuestBreadcrumb.attachFile(fwApp.filesDir)
+                    registerBreadcrumbCallbacks(fwApp)
+                    GuestBreadcrumb.log("bind complete (framework path)")
                     scheduleGuestStackDumps()
                     scheduleHijackTrace(packageName)
+                    DexMemDump.schedule(packageName, fwApp.filesDir)
+                    StateProbe.schedule(packageName, fwApp.filesDir)
                     return fwApp
                 }
+                GuestBreadcrumb.log("framework path returned null, falling back to legacy bind")
                 // fall through to the legacy bind path
             }
 
@@ -180,7 +195,12 @@ class VirtualApplicationManager @Inject constructor() {
             }
 
             // Step 4: Attach base context
+            // v35: same stock-init cover as the framework path —
+            // hijack's initailise runs inside this attach.
+            legacyPrevInstr = swapInStockInstrumentation(packageName)
+            GuestBreadcrumb.log("legacy attachBaseContext enter")
             attachBaseContext(application, virtualContext)
+            GuestBreadcrumb.log("legacy attachBaseContext exit")
             record.state = ApplicationState.ATTACHED
             Timber.tag(TAG).d("Application.attachBaseContext() complete")
 
@@ -201,7 +221,8 @@ class VirtualApplicationManager @Inject constructor() {
                     authorities = providerAuthorities,
                     classLoader = classLoader,
                     virtualContext = virtualContext,
-                    application = application
+                    application = application,
+                    providerMetaData = providerMetaData
                 )
                 record.state = ApplicationState.PROVIDERS_INSTALLED
                 Timber.tag(TAG).d("ContentProviders installed: ${providerNames.size}")
@@ -211,15 +232,61 @@ class VirtualApplicationManager @Inject constructor() {
             callApplicationOnCreate(application)
             record.state = ApplicationState.RUNNING
             Timber.tag(TAG).i("Application.onCreate() complete for $packageName")
+            restoreInstrumentation(legacyPrevInstr)
 
+            GuestBreadcrumb.attachFile(application.filesDir)
+            registerBreadcrumbCallbacks(application)
+            GuestBreadcrumb.log("bind complete (legacy path)")
             scheduleGuestStackDumps()
             scheduleHijackTrace(packageName)
+            DexMemDump.schedule(packageName, application.filesDir)
+            StateProbe.schedule(packageName, application.filesDir)
             return application
 
         } catch (e: Exception) {
+            restoreInstrumentation(legacyPrevInstr)
+            GuestBreadcrumb.logThrowable("bind FAILED (legacy/framework outer catch)", e)
             Timber.tag(TAG).e(e, "Failed to bind application for $packageName ($instanceId)")
             applications.remove(instanceId)
             return null
+        }
+    }
+
+    /**
+     * v36 step 3: engine-side ActivityLifecycleCallbacks on the guest
+     * Application — an activity breadcrumb independent of the
+     * instrumentation chain (created/started/resumed/... per activity).
+     */
+    private fun registerBreadcrumbCallbacks(app: Application) {
+        try {
+            app.registerActivityLifecycleCallbacks(
+                object : Application.ActivityLifecycleCallbacks {
+                    override fun onActivityCreated(
+                        a: android.app.Activity, b: android.os.Bundle?
+                    ) = GuestBreadcrumb.log("cb onActivityCreated " + a.javaClass.name)
+
+                    override fun onActivityStarted(a: android.app.Activity) =
+                        GuestBreadcrumb.log("cb onActivityStarted " + a.javaClass.name)
+
+                    override fun onActivityResumed(a: android.app.Activity) =
+                        GuestBreadcrumb.log("cb onActivityResumed " + a.javaClass.name)
+
+                    override fun onActivityPaused(a: android.app.Activity) =
+                        GuestBreadcrumb.log("cb onActivityPaused " + a.javaClass.name)
+
+                    override fun onActivityStopped(a: android.app.Activity) =
+                        GuestBreadcrumb.log("cb onActivityStopped " + a.javaClass.name)
+
+                    override fun onActivitySaveInstanceState(
+                        a: android.app.Activity, b: android.os.Bundle
+                    ) = GuestBreadcrumb.log("cb onActivitySaveInstanceState " + a.javaClass.name)
+
+                    override fun onActivityDestroyed(a: android.app.Activity) =
+                        GuestBreadcrumb.log("cb onActivityDestroyed " + a.javaClass.name)
+                })
+            GuestBreadcrumb.log("engine breadcrumb callbacks registered on " + app.javaClass.name)
+        } catch (e: Throwable) {
+            GuestBreadcrumb.logThrowable("register breadcrumb callbacks FAILED", e)
         }
     }
 
@@ -307,7 +374,16 @@ class VirtualApplicationManager @Inject constructor() {
         } catch (e: Throwable) {
             sb.append("main looper queue: <").append(e.javaClass.simpleName).append(">\n")
         }
-        val traces = Thread.getAllStackTraces()
+        // v42: serialize the suspension on DiagSuspendGate.
+        // getAllStackTraces() suspends every thread; in launch58
+        // this dump (+8s) and StateProbe's census (+7s) suspended
+        // concurrently and ART's suspend watchdog aborted the guest
+        // (SuspendThreadByPeer timeout). StateProbe no longer
+        // suspends at all; this gate keeps any future diagnostic
+        // suspender from overlapping this one.
+        val traces = synchronized(DiagSuspendGate.lock) {
+            Thread.getAllStackTraces()
+        }
         // Main thread first, then the rest (Rx/pool/player threads are
         // the interesting waiters).
         val ordered = traces.keys.sortedWith(
@@ -353,6 +429,85 @@ class VirtualApplicationManager @Inject constructor() {
     // hijacktrace-<pid>.log next to the stackdumps.
 
     @Volatile private var hijackTraceScheduled = false
+
+    // ==================== v35: stock-init experiment ====================
+    // v34 only removed the hijack proxy AFTER bind; it never changed
+    // what the proxy wrapped. On a real device ActivityThread's
+    // instrumentation is a stock android.app.Instrumentation, so
+    // hijack's ProxyInstrumentation classifies its ori as type 1
+    // ("not hijacked"). In the sandbox it wraps the engine's
+    // NextVmInstrumentation (type 0) and any verdict latched at
+    // ProxyInstrumentation.<init> / register time — during
+    // App.attachBaseContext, long before any post-bind unwrap — is
+    // already fixed. v35 therefore swaps a stock Instrumentation into
+    // ActivityThread.mInstrumentation for the whole guest early-init
+    // window (attachBaseContext -> ContentProviders ->
+    // Application.onCreate) and restores the previous instance
+    // afterwards: NextVmInstrumentation is load-bearing for activity
+    // creation (newActivity classloader resolution, pre-create
+    // injection), so it cannot stay replaced — but the classification
+    // moment and everything guest init reads from ActivityThread see
+    // the faithful real-device configuration. Validity check built
+    // in: at restore time AT is expected to hold hijack's
+    // ProxyInstrumentation (registerContext wrapped the stock
+    // instance); the sampler then reads oriInstrumentation /
+    // oriClassType from ProxyInstrumentation.instance — expect
+    // android.app.Instrumentation / 1 (v33/v34 read
+    // NextVmInstrumentation / 0). Unicom only.
+
+    @Volatile private var stockInitExperiment = false
+    @Volatile private var stockInitNote = "not-run"
+
+    // v36: both discriminating mutations are concluded experiments
+    // (v34 unwrap: falsified launch50; v35 stock-init: falsified
+    // launch52). v36 is observe-only — a clean baseline plus the
+    // breadcrumb — so both default OFF. Flip the const to re-run one.
+    private val STOCK_INIT_ENABLED = false
+    private val UNWRAP_ENABLED = false
+
+    private fun swapInStockInstrumentation(packageName: String): Instrumentation? {
+        if (!STOCK_INIT_ENABLED) {
+            stockInitNote = "disabled (v36 observe-only baseline)"
+            return null
+        }
+        if (packageName != "com.sinovatech.unicom.ui") return null
+        return try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            val at = atCls.getMethod("currentActivityThread").invoke(null)
+                ?: return null
+            val f = fieldOf(atCls, "mInstrumentation")
+            val prev = f.get(at) as? Instrumentation
+            f.set(at, Instrumentation())
+            stockInitExperiment = true
+            stockInitNote = "swapped prev=" + (prev?.javaClass?.name ?: "null") +
+                " -> android.app.Instrumentation (stock)"
+            Timber.tag("HijackTrace").i("v35 stock-init: %s", stockInitNote)
+            prev
+        } catch (e: Throwable) {
+            stockInitNote = "swap FAILED <" + e.javaClass.simpleName + "> " + e.message
+            Timber.tag("HijackTrace").w("v35 stock-init: %s", stockInitNote)
+            null
+        }
+    }
+
+    private fun restoreInstrumentation(prev: Instrumentation?) {
+        if (prev == null) return
+        try {
+            val atCls = Class.forName("android.app.ActivityThread")
+            val at = atCls.getMethod("currentActivityThread").invoke(null)
+                ?: return
+            val f = fieldOf(atCls, "mInstrumentation")
+            val during = f.get(at)
+            f.set(at, prev)
+            stockInitNote += "; at restore AT was " +
+                (during?.javaClass?.name ?: "null") + ", prev restored"
+            Timber.tag("HijackTrace").i(
+                "v35 stock-init restore: AT during init=%s",
+                during?.javaClass?.name)
+        } catch (e: Throwable) {
+            stockInitNote += "; restore FAILED <" + e.javaClass.simpleName + ">"
+        }
+    }
 
     private fun scheduleHijackTrace(packageName: String) {
         if (packageName != "com.sinovatech.unicom.ui") return
@@ -414,6 +569,7 @@ class VirtualApplicationManager @Inject constructor() {
             // (b) live ActivityThread instrumentation
             val atInstr = fieldOf(atCls, "mInstrumentation").get(at)
             line("ActivityThread.mInstrumentation = " + (atInstr?.javaClass?.name ?: "null"))
+            line("v35 stock-init: " + stockInitNote)
             // guest Application + its classloader (loads the SDK classes)
             val app = atCls.getMethod("getApplication").invoke(at)
                 as? android.app.Application
@@ -491,6 +647,45 @@ class VirtualApplicationManager @Inject constructor() {
             } catch (e: Throwable) {
                 line("mActivities: <" + e.javaClass.simpleName + ">")
             }
+            // v36 anchor A: framework provider map — did the framework
+            // install any providers itself (the engine installs the
+            // guest's manually; anything here came via the framework)?
+            try {
+                val pmAny = fieldOf(atCls, "mProviderMap").get(at)
+                if (pmAny == null) {
+                    line("mProviderMap = null")
+                } else {
+                    val entries = pmAny.javaClass.getMethod("entrySet")
+                        .invoke(pmAny) as java.util.Set<*>
+                    line("mProviderMap.size = " + entries.size)
+                    for (entry in entries) {
+                        if (entry == null) continue
+                        val rec = entry.javaClass.getMethod("getValue")
+                            .invoke(entry) ?: continue
+                        val local = try {
+                            fieldOf(rec.javaClass, "mLocalProvider").get(rec)
+                        } catch (e: Throwable) {
+                            null
+                        }
+                        line("  provider local=" +
+                            (local?.javaClass?.name ?: "null"))
+                    }
+                }
+            } catch (e: Throwable) {
+                line("mProviderMap: <" + e.javaClass.simpleName + ">")
+            }
+            // v36 anchor B: is the FPSDK native lib even loaded in
+            // this process? fetchDeviceId cannot have run otherwise.
+            // (libDexHelper as a positive control — it always loads.)
+            try {
+                val maps = java.io.File("/proc/self/maps").readText()
+                line("maps libUnicomFPSDK.so loaded = " +
+                    maps.contains("libUnicomFPSDK"))
+                line("maps libDexHelper.so loaded = " +
+                    maps.contains("libDexHelper"))
+            } catch (e: Throwable) {
+                line("maps: <" + e.javaClass.simpleName + ">")
+            }
         } catch (e: Throwable) {
             line("sample failed: <" + e.javaClass.simpleName + "> " + e.message)
         }
@@ -505,6 +700,16 @@ class VirtualApplicationManager @Inject constructor() {
         fun line(s: String) {
             sb.append(s).append('\n')
             Timber.tag("HijackTrace").i("%s unwrap: %s", label, s)
+        }
+        if (stockInitExperiment) {
+            line("skipped, v35 stock-init experiment active")
+            try { out.appendText(sb.toString()) } catch (_: Throwable) { }
+            return
+        }
+        if (!UNWRAP_ENABLED) {
+            line("unwrap disabled (v36 observe-only baseline)")
+            try { out.appendText(sb.toString()) } catch (_: Throwable) { }
+            return
         }
         try {
             val atCls = Class.forName("android.app.ActivityThread")
@@ -587,8 +792,10 @@ class VirtualApplicationManager @Inject constructor() {
         loadedApk: Any,
         virtualContext: Context,
         providerNames: List<String>,
-        providerAuthorities: Map<String, String>
+        providerAuthorities: Map<String, String>,
+        providerMetaData: Map<String, Bundle> = emptyMap()
     ): Application? {
+        var prevInstr: Instrumentation? = null
         return try {
             val atClass = Class.forName("android.app.ActivityThread")
             val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
@@ -643,6 +850,15 @@ class VirtualApplicationManager @Inject constructor() {
             // Same CheckJNI guard as the legacy attach path.
             disableCheckJniForGuest()
 
+            // v35: cover the guest early-init window with a stock
+            // Instrumentation (see swapInStockInstrumentation). The
+            // window runs from here (makeApplication triggers
+            // App.attachBaseContext, where hijack's initailise reads
+            // AT.mInstrumentation) through initContentProviders and
+            // callApplicationOnCreate below; restored after that.
+            prevInstr = swapInStockInstrumentation(packageName)
+
+            GuestBreadcrumb.log("framework makeApplication enter")
             val application = try {
                 loadedApkClass.getMethod(
                     "makeApplication",
@@ -656,7 +872,14 @@ class VirtualApplicationManager @Inject constructor() {
                     Instrumentation::class.java,
                     Boolean::class.javaPrimitiveType
                 ).invoke(loadedApk, false, null, false) as? Application
-            } ?: return null
+            }
+            if (application == null) {
+                GuestBreadcrumb.log("framework makeApplication returned null")
+                restoreInstrumentation(prevInstr)
+                return null
+            }
+            GuestBreadcrumb.log("framework makeApplication exit app=" +
+                application.javaClass.name)
 
             val record = ApplicationRecord(
                 instanceId = instanceId,
@@ -679,7 +902,8 @@ class VirtualApplicationManager @Inject constructor() {
                     authorities = providerAuthorities,
                     classLoader = guestClassLoader,
                     virtualContext = appContext,
-                    application = application
+                    application = application,
+                    providerMetaData = providerMetaData
                 )
                 record.state = ApplicationState.PROVIDERS_INSTALLED
             }
@@ -690,8 +914,11 @@ class VirtualApplicationManager @Inject constructor() {
                 "Framework LoadedApk bind complete for $packageName " +
                     "(app=${application.javaClass.name}, base=${application.baseContext?.javaClass?.simpleName})"
             )
+            restoreInstrumentation(prevInstr)
             application
         } catch (e: Exception) {
+            restoreInstrumentation(prevInstr)
+            GuestBreadcrumb.logThrowable("framework bind FAILED", e)
             Timber.tag(TAG).w(e, "Framework LoadedApk bind failed for $packageName, falling back to legacy bind")
             applications.remove(instanceId)
             null
@@ -1133,9 +1360,12 @@ class VirtualApplicationManager @Inject constructor() {
         authorities: Map<String, String>,
         classLoader: ClassLoader,
         virtualContext: Context,
-        application: Application
+        application: Application,
+        providerMetaData: Map<String, Bundle> = emptyMap()
     ) {
         Timber.tag(TAG).d("Installing ${providers.size} ContentProviders for $instanceId")
+        GuestBreadcrumb.log("providers begin n=" + providers.size +
+            " list=" + providers.joinToString(","))
 
         val record = applications[instanceId]
 
@@ -1152,6 +1382,7 @@ class VirtualApplicationManager @Inject constructor() {
                 continue
             }
 
+            GuestBreadcrumb.log("provider attachInfo enter $providerClassName")
             try {
                 val providerClass = classLoader.loadClass(providerClassName)
                 val provider = providerClass.getDeclaredConstructor().let { ctor ->
@@ -1169,22 +1400,41 @@ class VirtualApplicationManager @Inject constructor() {
                     exported = false
                     enabled = true
                     grantUriPermissions = true
+                    // v39: manifest meta-data parsed from the guest APK.
+                    // Providers reading their meta-data in attachInfo /
+                    // onCreate must find it here, as on a real install.
+                    metaData = providerMetaData[providerClassName]
                 }
 
                 // Call ContentProvider.attachInfo(context, info)
                 // This calls both attachInfo internally and then onCreate()
-                provider.attachInfo(virtualContext, providerInfo)
+                // v39: pass the guest Application, as AOSP's
+                // installContentProviders does — NOT a bare ContextImpl.
+                // Providers that cast getContext() to Application (e.g.
+                // SoulPermission's InitProvider, which registers the
+                // activity-lifecycle tracker behind getTopActivity())
+                // died on the cast, silently disabling themselves.
+                provider.attachInfo(application, providerInfo)
 
                 record?.contentProviders?.add(provider)
                 Timber.tag(TAG).d("  Provider installed: $providerClassName")
+                GuestBreadcrumb.log("provider ok $providerClassName")
 
             } catch (e: ClassNotFoundException) {
+                GuestBreadcrumb.logThrowable(
+                    "provider NOT FOUND, skipped: $providerClassName", e)
                 Timber.tag(TAG).w("ContentProvider class not found: $providerClassName (skipping)")
             } catch (e: SecurityException) {
+                GuestBreadcrumb.logThrowable(
+                    "provider SecurityException SWALLOWED, skipped: $providerClassName", e)
                 Timber.tag(TAG).w("SecurityException skipping provider $providerClassName: ${e.message}")
             } catch (e: IllegalStateException) {
+                GuestBreadcrumb.logThrowable(
+                    "provider IllegalStateException SWALLOWED, skipped: $providerClassName", e)
                 Timber.tag(TAG).w("IllegalStateException skipping provider $providerClassName: ${e.message}")
             } catch (e: Exception) {
+                GuestBreadcrumb.logThrowable(
+                    "provider FAILED (bind continues): $providerClassName", e)
                 Timber.tag(TAG).e(e, "Failed to install ContentProvider: $providerClassName")
                 // Don't fail the whole app — some providers are optional
             }
@@ -1198,11 +1448,13 @@ class VirtualApplicationManager @Inject constructor() {
      *   Instrumentation.callApplicationOnCreate(app) in ActivityThread.handleBindApplication()
      */
     private fun callApplicationOnCreate(application: Application) {
+        GuestBreadcrumb.log("Application.onCreate enter " + application.javaClass.name)
         try {
             // Use Instrumentation if available (more accurate mirroring)
             val instrumentation = Instrumentation()
             instrumentation.callApplicationOnCreate(application)
             Timber.tag(TAG).d("Application.onCreate() called via Instrumentation")
+            GuestBreadcrumb.log("Application.onCreate exit ok")
         } catch (e: RuntimeException) {
             // Check if this is a ShizukuProvider SecurityException — swallow it.
             // ZArchiver calls ShizukuProvider.a() in onCreate() which triggers
@@ -1215,6 +1467,8 @@ class VirtualApplicationManager @Inject constructor() {
                  cause.message?.contains("INTERACT_ACROSS_USERS", ignoreCase = true) == true ||
                  cause.message?.contains("shizuku", ignoreCase = true) == true)
             ) {
+                GuestBreadcrumb.logThrowable(
+                    "Application.onCreate SecurityException SWALLOWED (shizuku rule)", e)
                 Timber.tag(TAG).w("Shizuku SecurityException in onCreate swallowed — continuing without Shizuku")
                 return
             }
@@ -1229,6 +1483,8 @@ class VirtualApplicationManager @Inject constructor() {
                      cause2.message?.contains("INTERACT_ACROSS_USERS", ignoreCase = true) == true ||
                      cause2.message?.contains("shizuku", ignoreCase = true) == true)
                 ) {
+                    GuestBreadcrumb.logThrowable(
+                        "Application.onCreate (direct) SecurityException SWALLOWED (shizuku rule)", e2)
                     Timber.tag(TAG).w("Shizuku SecurityException in direct onCreate swallowed")
                     return
                 }
@@ -1239,10 +1495,14 @@ class VirtualApplicationManager @Inject constructor() {
                 throw e2
             }
         } catch (e: Exception) {
+            GuestBreadcrumb.logThrowable(
+                "Application.onCreate via Instrumentation FAILED, calling directly", e)
             Timber.tag(TAG).w(e, "Instrumentation.callApplicationOnCreate() failed, calling directly")
             try {
                 application.onCreate()
+                GuestBreadcrumb.log("Application.onCreate exit ok (direct)")
             } catch (e2: Exception) {
+                GuestBreadcrumb.logThrowable("Application.onCreate direct call FAILED", e2)
                 Timber.tag(TAG).e(e2, "Application.onCreate() direct call also failed")
                 throw e2
             }

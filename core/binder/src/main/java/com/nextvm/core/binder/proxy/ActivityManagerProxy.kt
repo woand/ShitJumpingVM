@@ -38,6 +38,10 @@ class ActivityManagerProxy(
     private val context: Context
 ) : InvocationHandler {
 
+    init {
+        activeInstance = this
+    }
+
     companion object {
         private const val TAG = "AMProxy"
 
@@ -51,6 +55,19 @@ class ActivityManagerProxy(
         )
         private const val TRACE_MAX = 400
         private val traceCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // v43: process-wide witness of ALL invoke() traffic through
+        // this handler. StateProbe reads these from inside a guest
+        // process to tell whether guest code actually reaches AMS
+        // through this proxy there. Per-process by construction
+        // (each process loads its own copy of the class).
+        val invokeCount = java.util.concurrent.atomic.AtomicInteger(0)
+        @Volatile var lastInvokeMethod: String? = null
+
+        // v44: the proxy instance live in this process, consulted by
+        // ActivityBinderWrap (raw-binder interception) for the same
+        // virtualApps registry this handler uses.
+        @Volatile var activeInstance: ActivityManagerProxy? = null
 
         // GMS / Play Store packages that need routing through the GMS bridge
         private val GMS_PACKAGES = setOf(
@@ -111,6 +128,8 @@ class ActivityManagerProxy(
     }
 
     override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+        invokeCount.incrementAndGet()
+        lastInvokeMethod = method.name
         // BootTrace: targeted tracing of the calls a guest's init
         // pipeline depends on (service starts/binds, provider
         // acquisition, broadcasts, receiver registration). Exists to
@@ -118,10 +137,51 @@ class ActivityManagerProxy(
         // the sandbox: the request and its immediate result are
         // logged under tag "BootTrace" for the first TRACE_MAX calls.
         val traced = method.name in TRACE_METHODS
-        if (traced) traceAmsCall(method.name, args, null, -1)
+        // v41: startActivity additionally goes to a per-process file.
+        // The Timber/BootTrace copy kept getting rolled out of the
+        // 256KB logcat buffer before it could be read (launch57/58),
+        // and Instrumentation.execStartActivity cannot be overridden
+        // (absent from the SDK 35 stub), so this proxy — the one
+        // in-process chokepoint every guest start passes — is the
+        // durable witness: did the GuideActivity start arrive here,
+        // and what did handleStartActivity/AMS return for it?
+        val isStart = method.name == "startActivity" ||
+            method.name == "startActivityAsUser"
+        if (traced) {
+            val line = traceAmsCall(method.name, args, null, -1)
+            // v42: the start witness must not die with the TRACE_MAX
+            // cap (traceAmsCall returns null past 400 traced calls,
+            // and guest init burns through those in seconds). If the
+            // capped formatter bows out, write an uncapped line.
+            if (isStart) {
+                appendStartTrace(line ?: fallbackStartLine(method.name, args, null, -1))
+            }
+        }
         val result = invokeDispatch(proxy, method, args)
-        if (traced) traceAmsCall(method.name, args, result, 0)
+        if (traced) {
+            val line = traceAmsCall(method.name, args, result, 0)
+            if (isStart) {
+                appendStartTrace(line ?: fallbackStartLine(method.name, args, result, 0))
+            }
+        }
         return result
+    }
+
+    private val startTraceFile: java.io.File by lazy {
+        java.io.File(
+            context.filesDir,
+            "startactivity-trace-" + android.os.Process.myPid() + ".log"
+        )
+    }
+
+    private fun appendStartTrace(line: String) {
+        try {
+            synchronized(startTraceFile) {
+                startTraceFile.appendText(line + "\n")
+            }
+        } catch (_: Throwable) {
+            // tracing must never disturb the guest
+        }
     }
 
     private fun invokeDispatch(proxy: Any, method: Method, args: Array<out Any>?): Any? {
@@ -270,6 +330,33 @@ class ActivityManagerProxy(
         }
 
         return method.invoke(original, *newArgs)
+    }
+
+    /**
+     * v44: the virtual-target branch of handleStartActivity,
+     * exposed for ActivityBinderWrap (raw-binder interception).
+     * Returns a rewritten stub intent when [intent] targets a
+     * registered virtual app; null when the start is not ours to
+     * rewrite — including intents already carrying NEXTVM stub
+     * extras (our own stub launches passing through).
+     */
+    fun rewriteGuestStartIntent(intent: Intent): Intent? {
+        if (intent.hasExtra(VirtualIntentExtras.TARGET_PACKAGE)) {
+            return null
+        }
+        val pkg = intent.component?.packageName ?: intent.`package`
+            ?: return null
+        val app = virtualApps[pkg] ?: return null
+        val targetClass = intent.component?.className ?: app.mainActivity
+            ?: return null
+        return Intent(intent).apply {
+            setClassName(hostPackage, getStubForApp(app))
+            putExtra(VirtualIntentExtras.TARGET_PACKAGE, pkg)
+            putExtra(VirtualIntentExtras.TARGET_ACTIVITY, targetClass)
+            putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
+            putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
+            putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
+        }
     }
 
     /**
@@ -728,9 +815,9 @@ class ActivityManagerProxy(
         args: Array<out Any>?,
         result: Any?,
         phase: Int
-    ) {
+    ): String? {
         val n = traceCount.incrementAndGet()
-        if (n > TRACE_MAX) return
+        if (n > TRACE_MAX) return null
         val sb = StringBuilder()
         sb.append(if (phase < 0) ">> " else "<< ").append(methodName)
         if (args != null) {
@@ -764,6 +851,45 @@ class ActivityManagerProxy(
             )
         }
         Timber.tag("BootTrace").i(sb.toString())
+        return sb.toString()
+    }
+
+    /**
+     * v42: uncapped sibling of [traceAmsCall] for the startActivity
+     * file witness. Only used when traceAmsCall has hit TRACE_MAX,
+     * so the durable file record of a guest start cannot be lost to
+     * the counter the logcat copy shares with every traced method.
+     */
+    private fun fallbackStartLine(
+        methodName: String,
+        args: Array<out Any>?,
+        result: Any?,
+        phase: Int
+    ): String {
+        val sb = StringBuilder()
+        sb.append(if (phase < 0) ">> " else "<< ").append(methodName)
+        if (args != null) {
+            for (a in args) {
+                if (a is Intent) {
+                    sb.append(" intent{cmp=")
+                        .append(a.component?.flattenToShortString())
+                        .append(" act=").append(a.action)
+                        .append(" pkg=").append(a.`package`).append('}')
+                }
+            }
+        }
+        if (phase >= 0) {
+            sb.append(" -> ").append(
+                when (result) {
+                    null -> "null"
+                    is Int -> "int=$result"
+                    is Boolean -> "bool=$result"
+                    else -> result.javaClass.simpleName
+                }
+            )
+        }
+        sb.append(" (trace cap reached)")
+        return sb.toString()
     }
 
     /**

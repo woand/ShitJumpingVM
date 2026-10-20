@@ -35,6 +35,17 @@ class NextVmApplication : Application() {
         //    after Application.onCreate() returns, so ATHook must be ready by then.
         engine.installActivityThreadHookEarly(this)
 
+        // 2.5 (v44): Wrap the raw "activity" binder in ServiceManager's
+        //     cache SYNCHRONOUSLY. launch61 proved guest code reaches
+        //     AMS through this raw binder (never through the replaced
+        //     singleton), so the wrap must be in place before any
+        //     guest code can capture the binder from the cache.
+        try {
+            engine.installActivityBinderWrapEarly(this)
+        } catch (t: Throwable) {
+            Timber.e(t, "ActivityBinderWrap install failed")
+        }
+
         // 3. Initialize the rest of the Virtual Engine on a background thread
         //    (remaining steps are heavy — don't block main thread)
         appScope.launch {

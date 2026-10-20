@@ -157,7 +157,10 @@ class ActivityThreadHook(
                         if (root is SecurityException &&
                             (root.message?.contains("Unknown calling package name") == true ||
                              root.message?.contains("does not belong to") == true)) {
-                            Timber.tag(TAG).w("Suppressed GMS SecurityException in main looper: ${root.message}")
+                            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                                .logThrowable(
+                                    "main-looper guard SUPPRESSED exception (message consumed)", e)
+                            Timber.tag(TAG).w(e, "Suppressed GMS SecurityException in main looper: ${root.message}")
                             // Continue looping — the crashed message is consumed
                         } else {
                             // Re-throw non-GMS exceptions to preserve normal crash behavior
@@ -1343,14 +1346,20 @@ class NextVmInstrumentation(
     }
 
     override fun callActivityOnCreate(activity: android.app.Activity, icicle: android.os.Bundle?) {
+        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+            .log("instr callActivityOnCreate enter " + activity.javaClass.name)
         // Inject resources, theme, context BEFORE onCreate
         try {
             hook.onActivityPreCreate(activity)
         } catch (e: Exception) {
+            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                .logThrowable("onActivityPreCreate FAILED (logged, continuing)", e)
             Timber.tag(TAG).e(e, "Error in pre-create injection for ${activity::class.java.name}")
         }
         try {
             super.callActivityOnCreate(activity, icicle)
+            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                .log("instr callActivityOnCreate exit ok " + activity.javaClass.name)
         } catch (e: RuntimeException) {
             // Unwrap UndeclaredThrowableException from Binder proxy invoke
             val cause = e.cause?.cause ?: e.cause ?: e
@@ -1359,6 +1368,10 @@ class NextVmInstrumentation(
                 cause.message?.contains("does not own package") == true ||
                 cause.message?.contains("Calling uid") == true
             )) {
+                com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                    .logThrowable(
+                        "instr onCreate SecurityException SWALLOWED mid-onCreate for " +
+                            activity.javaClass.name, e)
                 Timber.tag(TAG).w("Package ownership SecurityException swallowed in onCreate: ${cause.message}")
                 return
             }
@@ -1371,16 +1384,26 @@ class NextVmInstrumentation(
         icicle: android.os.Bundle?,
         persistentState: android.os.PersistableBundle?
     ) {
+        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+            .log("instr callActivityOnCreate(persistable) enter " + activity.javaClass.name)
         try {
             hook.onActivityPreCreate(activity)
         } catch (e: Exception) {
+            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                .logThrowable("onActivityPreCreate FAILED (logged, continuing)", e)
             Timber.tag(TAG).e(e, "Error in pre-create injection for ${activity::class.java.name}")
         }
         try {
             super.callActivityOnCreate(activity, icicle, persistentState)
+            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                .log("instr callActivityOnCreate(persistable) exit ok " + activity.javaClass.name)
         } catch (e: RuntimeException) {
             val cause = e.cause?.cause ?: e.cause ?: e
             if (cause is SecurityException) {
+                com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                    .logThrowable(
+                        "instr onCreate(persistable) SecurityException SWALLOWED mid-onCreate for " +
+                            activity.javaClass.name, e)
                 Timber.tag(TAG).w("SecurityException in onCreate (PersistableBundle) swallowed: ${cause.message}")
                 return
             }
@@ -1390,6 +1413,8 @@ class NextVmInstrumentation(
 
     // Delegate all other Instrumentation methods to base
     override fun newActivity(cl: ClassLoader?, className: String?, intent: Intent?): android.app.Activity {
+        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+            .log("instr newActivity " + className)
         // CRITICAL FIX: The ClassLoader 'cl' passed by performLaunchActivity() may be the
         // host app's ClassLoader. We use the GuestClassLoaderRegistry to find the right one.
         //
@@ -1501,6 +1526,8 @@ class NextVmInstrumentation(
     }
 
     override fun newApplication(cl: ClassLoader?, className: String?, context: Context?): android.app.Application {
+        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+            .log("instr newApplication " + className)
         return base.newApplication(cl, className, context)
     }
 
@@ -1517,6 +1544,8 @@ class NextVmInstrumentation(
     override fun callActivityOnDestroy(activity: android.app.Activity) {
         val isGuest = GuestClassLoaderRegistry.isGuestClassLoader(activity::class.java.classLoader)
         if (isGuest) {
+            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                .log("instr callActivityOnDestroy " + activity.javaClass.name)
             Timber.tag(TAG).d("callActivityOnDestroy for guest: ${activity::class.java.name}")
             // Install Process.killProcess guard before guest onDestroy
             val guard = ProcessKillGuard.install()

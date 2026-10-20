@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import com.nextvm.core.apk.VirtualClassLoader
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Bundle
 import com.nextvm.core.binder.BinderProxyManager
 import com.nextvm.core.binder.VirtualCallerResolver
+import com.nextvm.core.binder.proxy.ActivityBinderWrap
 import com.nextvm.core.binder.proxy.ContentResolverProxy
 import com.nextvm.core.binder.proxy.SystemServiceProxyManager
 import com.nextvm.core.common.AndroidCompat
@@ -135,6 +138,18 @@ class VirtualEngine @Inject constructor(
      * 2. StubRegistry initialization (needed for stub→real class mapping)
      * 3. ATHook installation (hooks ActivityThread.mH.mCallback)
      */
+    /**
+     * v44: wrap the raw "activity" binder in ServiceManager's cache.
+     * Must run synchronously from Application.onCreate — before any
+     * guest code can capture the binder — because launch61 proved
+     * guest AMS traffic uses that raw channel, not the replaced
+     * ActivityManager singleton. Hidden-API bypass runs first inside
+     * installActivityThreadHookEarly; this is called right after it.
+     */
+    fun installActivityBinderWrapEarly(context: Context) {
+        ActivityBinderWrap.install(context)
+    }
+
     fun installActivityThreadHookEarly(context: Context) {
         try {
             // 1. Hidden API bypass (fast, ~10ms)
@@ -1394,6 +1409,30 @@ class VirtualEngine @Inject constructor(
                 }
             }
 
+            // v39: also recover each provider's manifest meta-data. The
+            // records VPMS keeps for disk-loaded apps carry bare
+            // ProviderInfo objects (name only), so parse the APK itself —
+            // the same getPackageArchiveInfo route ApkParser uses at
+            // install time. Providers reading their meta-data during
+            // attachInfo/onCreate need it present on the ProviderInfo.
+            val providerMetaData = mutableMapOf<String, Bundle>()
+            try {
+                val archiveInfo = context.packageManager.getPackageArchiveInfo(
+                    apkPath,
+                    PackageManager.GET_PROVIDERS or PackageManager.GET_META_DATA
+                )
+                archiveInfo?.providers?.forEach { parsed ->
+                    parsed.metaData?.let { providerMetaData[parsed.name] = it }
+                    if (providerAuthorities[parsed.name] == null &&
+                        !parsed.authority.isNullOrEmpty()
+                    ) {
+                        providerAuthorities[parsed.name] = parsed.authority
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).w(e, "Provider meta-data parse failed for $packageName")
+            }
+
             // Arm native /proc/self spoofing (cmdline/maps/comm) for this
             // guest BEFORE its Application runs. Packer shells read /proc
             // inside attachBaseContext — i.e. during bindApplication below —
@@ -1467,6 +1506,7 @@ class VirtualEngine @Inject constructor(
                 virtualContext = virtualContext,
                 providerNames = providerNames,
                 providerAuthorities = providerAuthorities,
+                providerMetaData = providerMetaData,
                 frameworkLoadedApk = frameworkLoadedApks[instanceId]
             )
 
