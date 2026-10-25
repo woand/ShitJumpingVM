@@ -116,6 +116,35 @@ static bool g_v87_probe_all = false;
 static std::atomic<bool> g_v87_window_open{false};
 static std::atomic<int> g_v87_mmap_logged{0};
 
+// v89 (diagnostic only, launch115): own window flag. CM path mirrors v87
+// (DexHelper/dexjni link-map entry); probe-all (noise) path opens on the
+// first link-map callback so a non-CM guest can prove liveness. The NOTIF
+// handler and hooked_mprotect both gate on this flag AND g_v89_syscall
+// (flag file files/sc-mmap-syscall, read in sc_arm), so without the flag
+// v89 code exists in the binary but never executes.
+static std::atomic<bool> g_v89_window_open{false};
+
+// v89 arm switch (global so both the hook scope and the seccomp scope
+// see it): true iff files/sc-mmap-syscall existed at sc_arm time.
+bool g_v89_syscall = false;
+
+// v90 (diagnostic only, launch116): BSS probe arm switch, same shape
+// as g_v89_syscall: true iff files/sc-bss-probe existed at sc_arm
+// time. The callback gates on this flag at use time, so without the
+// flag the v90 code exists in the binary but never executes.
+bool g_v90_bss_probe = false;
+
+// v91 (diagnostic only, launch117): NOTIF pread existence probe +
+// supervisor maps snapshot, same shape as g_v89_syscall/g_v90_bss_probe:
+// true iff files/sc-v91-probe existed at sc_arm time. The NOTIF
+// handler gates on this flag at use time, so without the flag the
+// v91 code exists in the binary but never executes. g_sc_maps_fd is
+// /proc/self/maps opened in sc_arm BEFORE the filter is installed
+// (the supervisor thread's own openat would trap once the filter is
+// live); snapshots lseek+read it (read is not in the trap set).
+bool g_v91_probe = false;
+int g_sc_maps_fd = -1;
+
 // v57: while true, /proc/self spoofing is suspended and hooked readers
 // get the real content. Opened around the CM guest's bind: the SecNeo
 // mini-linker stub (libDexHelper.so) parses the real /proc/self/maps
@@ -1039,6 +1068,13 @@ static orig_opendir_t real_opendir = nullptr;
 typedef void* (*orig_mmap_t)(void*, size_t, int, int, int, off_t);
 static orig_mmap_t real_mmap = nullptr;
 
+// v89 (diagnostic only): control witness for mprotect. Same window/guest
+// gate shape as hooked_mmap, plus the g_v89_syscall flag gate, so it is
+// silent unless the v89 probe is armed. Cap 4096, then one CAP line.
+typedef int (*orig_mprotect_t)(void*, size_t, int);
+static orig_mprotect_t real_mprotect = nullptr;
+static std::atomic<long> g_v89g_mprotect_logged{0};
+
 static void diag_caller(void* ret_addr, char* buf, size_t len) {
     Dl_info info;
     if (ret_addr != nullptr && dladdr(ret_addr, &info) && info.dli_fname != nullptr) {
@@ -1241,6 +1277,32 @@ static void* hooked_mmap(void* addr, size_t length, int prot, int flags,
     return nullptr;
 }
 
+/**
+ * v89 (diagnostic only): GOT mprotect control witness. Records every
+ * mprotect in the v89 window (no prot filter here — the BPF pre-filter
+ * lives only on the seccomp path). The SecNeo stub's PLT mprotect calls
+ * are visible only because the stub exception below patches mprotect
+ * alongside mmap; raw-svc mprotect from any module is invisible here
+ * and is the seccomp witness's job. Forbidden zone mirrors hooked_mmap:
+ * integer compares, one atomic counter, LOGI, real_mprotect only.
+ */
+static int hooked_mprotect(void* addr, size_t length, int prot) {
+    if (g_v89_syscall &&
+        g_v89_window_open.load(std::memory_order_relaxed) &&
+        (g_v87_probe_all ||
+         g_spoofed_package_name ==
+             "com.greenpoint.android.mc10086.activity")) {
+        long n = g_v89g_mprotect_logged.fetch_add(1, std::memory_order_relaxed);
+        if (n < 4096) {
+            LOGI("V89G MPROTECT addr=%p len=%zu prot=0x%x", addr, length, prot);
+        } else if (n == 4096) {
+            LOGI("V89G CAP");
+        }
+    }
+    if (real_mprotect) return real_mprotect(addr, length, prot);
+    return -1;
+}
+
 // ==================== GOT/PLT Hook Installation ====================
 
 // SIGSEGV-safe memory probe: returns false if the address is not readable
@@ -1309,6 +1371,7 @@ static HookEntry g_hook_entries[] = {
     {"fork",                    (void*)hooked_fork,                 (void**)&real_fork},
     {"opendir",                 (void*)hooked_opendir,              (void**)&real_opendir},
     {"mmap",                    (void*)hooked_mmap,                 (void**)&real_mmap},
+    {"mprotect",                (void*)hooked_mprotect,             (void**)&real_mprotect},
 };
 static constexpr int g_hook_count = sizeof(g_hook_entries) / sizeof(g_hook_entries[0]);
 
@@ -1526,12 +1589,102 @@ static void patch_library_got(uintptr_t base_addr, const char* lib_name,
 static std::unordered_set<uintptr_t> g_patched_bases;
 static std::mutex g_patch_mutex;
 
+// v90 (diagnostic only, launch116): INIT 后 BSS 读取，见
+// nvdbg2/launch116/probe-design-v90-bss.md。FNV-1a 64 位指纹：
+// 只记 keybuf 指纹，不记原始 key 字节。
+static unsigned long long v90b_fnv1a64(const unsigned char* data,
+                                        size_t len) {
+    unsigned long long h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// v90: 读一个壳库 INIT 后的 BSS 槽位并记一行 V90B BSS。
+// 只读不写；读前先过 is_address_readable（patch_got_entry 同款），
+// 不可读只记 SKIP，不解引用。每库上限 8 条 + 一行 CAP。
+// 槽位（Tier 0 已核，两库布局一致）：
+//   DexHelper: BSS 页 = base + 0x15000；dexjni: base + 0x13000。
+//   +0x40 = pread#2 offset, +0x50 = keybuf#1（20 字节）,
+//   +0x7c = pread#1 offset, +0x80 = key 派生值（只记布尔）。
+static void v90b_read_bss(const char* name, uintptr_t base) {
+    if (base == 0) return;
+    const bool is_helper = strstr(name, "libDexHelper.so") != nullptr;
+    const uintptr_t bss = base + (is_helper ? 0x15000 : 0x13000);
+    const char* lib = is_helper ? "DexHelper" : "dexjni";
+    static std::atomic<int> s_helper_count{0};
+    static std::atomic<int> s_dexjni_count{0};
+    static std::atomic<bool> s_helper_capped{false};
+    static std::atomic<bool> s_dexjni_capped{false};
+    std::atomic<int>& count = is_helper ? s_helper_count : s_dexjni_count;
+    std::atomic<bool>& capped = is_helper ? s_helper_capped : s_dexjni_capped;
+    const int seq = count.fetch_add(1, std::memory_order_relaxed);
+    if (seq >= 8) {
+        if (!capped.exchange(true, std::memory_order_relaxed)) {
+            LOGI("V90B BSS CAP lib=%s", lib);
+        }
+        return;
+    }
+    const uintptr_t keybuf = bss + 0x50;
+    if (!is_address_readable(reinterpret_cast<const void*>(keybuf), 20)) {
+        LOGI("V90B BSS SKIP lib=%s seq=%d base=%p unreadable", lib, seq,
+             reinterpret_cast<void*>(base));
+        return;
+    }
+    unsigned int off40 = 0, off7c = 0, slot80 = 0;
+    bool off_ok = true;
+    if (is_address_readable(reinterpret_cast<const void*>(bss + 0x40), 4)) {
+        off40 = *reinterpret_cast<const volatile unsigned int*>(bss + 0x40);
+    } else {
+        off_ok = false;
+    }
+    if (is_address_readable(reinterpret_cast<const void*>(bss + 0x7c), 4)) {
+        off7c = *reinterpret_cast<const volatile unsigned int*>(bss + 0x7c);
+    } else {
+        off_ok = false;
+    }
+    if (is_address_readable(reinterpret_cast<const void*>(bss + 0x80), 4)) {
+        slot80 = *reinterpret_cast<const volatile unsigned int*>(bss + 0x80);
+    } else {
+        off_ok = false;
+    }
+    const unsigned char* kb =
+        reinterpret_cast<const unsigned char*>(keybuf);
+    bool all_zero = true;
+    for (int i = 0; i < 20; i++) {
+        if (kb[i] != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    const unsigned long long fp = v90b_fnv1a64(kb, 20);
+    LOGI("V90B BSS lib=%s seq=%d base=%p keybuf_zero=%d keybuf_fp=%llx "
+         "off40=%x off7c=%x slot80_zero=%d off_ok=%d",
+         lib, seq, reinterpret_cast<void*>(base), all_zero ? 1 : 0, fp,
+         off40, off7c, slot80 == 0 ? 1 : 0, off_ok ? 1 : 0);
+}
+
 /**
  * dl_iterate_phdr callback — called for each loaded shared object.
  * We find the PT_DYNAMIC segment and use it to locate GOT entries.
  */
 static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, void* /*data*/) {
     if (info->dlpi_name == nullptr) return 0;
+
+    // v90: INIT 后 BSS 读取。位置注意：必须放在 g_patched_bases
+    // early-return 之前——窗口块在 early-return 之后、只跑首见，
+    // 而 BSS 读要每 pass 都跑（时间线），故放此处。CM 门控用
+    // g_spoofed_package_name（回调里 v57 块的同款门控；第二匿名
+    // 命名空间的 g_sc_guest_pkg 在此位置不可见）。
+    if (g_v90_bss_probe &&
+        g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity" &&
+        (strstr(info->dlpi_name, "libDexHelper.so") != nullptr ||
+         strstr(info->dlpi_name, "libdexjni.so") != nullptr)) {
+        v90b_read_bss(info->dlpi_name, info->dlpi_addr);
+    }
 
     // Already processed by an earlier pass — nothing to do.
     if (info->dlpi_addr != 0 && g_patched_bases.count(info->dlpi_addr)) return 0;
@@ -1550,6 +1703,22 @@ static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, vo
         g_v87_window_open.store(true, std::memory_order_relaxed);
     }
 
+    // v89: own window flag, same position (before every early return).
+    // CM path mirrors v87; probe-all (noise) path opens on the first
+    // callback for any library, so a non-CM guest can prove liveness.
+    // The flag gate (g_v89_syscall) is checked at use time, not here,
+    // so opening the flag itself is harmless without the flag file.
+    if (strstr(name, "libDexHelper.so") != nullptr ||
+        strstr(name, "libdexjni.so") != nullptr) {
+        if (!g_v89_window_open.exchange(true, std::memory_order_relaxed)) {
+            LOGI("V89 WINDOW opened by=%s", name);
+        }
+    } else if (g_v87_probe_all) {
+        if (!g_v89_window_open.exchange(true, std::memory_order_relaxed)) {
+            LOGI("V89 WINDOW opened (probe-all) by=%s", name);
+        }
+    }
+
     // Skip the linker itself
     if (strstr(name, "linker") != nullptr) return 0;
 
@@ -1563,11 +1732,13 @@ static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, vo
     // guest so other guests' libDexHelper.so (e.g. Unicom's) is
     // unaffected. v87 exception: patch ONLY the mmap entry, so the
     // Tier 1 probe can see the loader's own mappings; every other
-    // symbol stays exempt.
+    // symbol stays exempt. v89 extends the exception to mprotect so
+    // the GOT control witness can see the stub's PLT mprotect calls;
+    // raw-svc calls from the stub stay invisible to GOT hooks by nature.
     if (strstr(name, "libDexHelper.so") != nullptr &&
         g_spoofed_package_name ==
             "com.greenpoint.android.mc10086.activity") {
-        LOGI("install_hooks: libDexHelper.so mmap-only patch "
+        LOGI("install_hooks: libDexHelper.so mmap+mprotect-only patch "
              "(SecNeo stub exempt from file-I/O hooks, pkg=%s)",
              g_spoofed_package_name.c_str());
         const ElfW(Dyn)* dynamic = nullptr;
@@ -1580,6 +1751,7 @@ static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, vo
         }
         if (dynamic != nullptr) {
             patch_library_got(info->dlpi_addr, name, dynamic, "mmap");
+            patch_library_got(info->dlpi_addr, name, dynamic, "mprotect");
         }
         if (info->dlpi_addr != 0) g_patched_bases.insert(info->dlpi_addr);
         return 0;
@@ -1650,6 +1822,8 @@ static bool install_plt_hooks() {
         real_opendir = (orig_opendir_t)dlsym(RTLD_DEFAULT, "opendir");
     if (!real_mmap)
         real_mmap = (orig_mmap_t)dlsym(RTLD_DEFAULT, "mmap");
+    if (!real_mprotect)
+        real_mprotect = (orig_mprotect_t)dlsym(RTLD_DEFAULT, "mprotect");
 
     if (!real_open || !real_openat || !real_access || !real_stat) {
         LOGE("Failed to resolve one or more libc functions via dlsym");
@@ -2950,7 +3124,293 @@ long sc_install_filter_ex(bool notif, bool with_signals = true,
 #endif
 }
 
-// Pure-C mirror of rewrite_virtual_path for fd symlink targets,
+// v89 (diagnostic only, launch115): USER_NOTIF filter variant that also
+// traps mmap/mprotect/memfd_create. Same dispatch skeleton as
+// sc_install_filter_ex, extended and re-laid-out; the old builder is
+// untouched, so without the files/sc-mmap-syscall flag the installed
+// filter is byte-identical to v88. Only ever installed in NOTIF mode
+// (sc_arm never calls this for the TRAP fallback — v18: SIGSYS on hot
+// syscalls can force-kill threads).
+//
+// Layout (39 insns):
+//   0..1   arch check (non-aarch64 -> ALLOW)
+//   2      load nr
+//   3..20  nr dispatch, 18 numbers, every match lands at 22
+//   21     JA -> ALLOW (no nr matched)
+//   22..26 trampoline-IP check: trampoline range -> ALLOW (38),
+//          anything else -> second dispatch (27)
+//   27..29 second dispatch: mmap -> arg check (31), mprotect -> arg
+//          check (34), anything else (incl. memfd_create) -> OUTCOME (30)
+//   31..33 mmap arg check: args[2] prot & PROT_EXEC ? OUTCOME (37) : ALLOW
+//   34..36 mprotect arg check: same
+//   37     RET OUTCOME
+//   38     RET ALLOW
+// Jump targets were recomputed by hand and verified by a Python BPF
+// simulation over the full decision matrix (see launch115 notes).
+// The program can only return NOTIF or ALLOW, never KILL, so a
+// miscounted offset degrades to mis-notification, not process death.
+long sc_install_filter_ex_v89(bool notif, bool with_signals = true,
+                              bool tsync = true) {
+#if !defined(__aarch64__)
+    (void)notif;
+    (void)with_signals;
+    (void)tsync;
+    return -1;
+#else
+    const unsigned s_kill = with_signals ? 129 : 0x3FFFFF10u;
+    const unsigned s_tkill = with_signals ? 130 : 0x3FFFFF11u;
+    const unsigned s_tgkill = with_signals ? 131 : 0x3FFFFF12u;
+    const unsigned s_sigaction = with_signals ? 134 : 0x3FFFFF13u;
+    const unsigned s_sigprocmask = with_signals ? 135 : 0x3FFFFF14u;
+    const unsigned s_tgsigqueue = with_signals ? 297 : 0x3FFFFF15u;
+    const unsigned s_pidfd = with_signals ? 424 : 0x3FFFFF16u;
+    // v69: rt_sigreturn joins the dispatch in NOTIF mode only (in
+    // TRAP mode trapping it would break the handler's own return).
+    const unsigned s_sigreturn = (notif && with_signals)
+        ? 139 : 0x3FFFFF17u;
+    const unsigned t_openat = (g_sc_trap_mask & 0x01) ? __NR_openat : 0x3FFFFF00u;
+    const unsigned t_openat2 = (g_sc_trap_mask & 0x02) ? __NR_openat2 : 0x3FFFFF01u;
+    const unsigned t_readlinkat = (g_sc_trap_mask & 0x04) ? __NR_readlinkat : 0x3FFFFF02u;
+    const unsigned t_faccessat = (g_sc_trap_mask & 0x08) ? __NR_faccessat : 0x3FFFFF03u;
+    const unsigned t_faccessat2 = (g_sc_trap_mask & 0x10) ? __NR_faccessat2 : 0x3FFFFF04u;
+    const unsigned t_newfstatat = (g_sc_trap_mask & 0x20) ? __NR_newfstatat : 0x3FFFFF05u;
+    const unsigned t_unlinkat = (g_sc_trap_mask & 0x40) ? __NR_unlinkat : 0x3FFFFF06u;
+    // v89: not mask-gated — this builder is only called when the
+    // files/sc-mmap-syscall flag exists. aarch64 numbers from the
+    // kernel headers: mmap 222, mprotect 226 (NOT 134 — that is
+    // rt_sigaction), memfd_create 279. Use the macros, never literals.
+    const unsigned t_mmap = __NR_mmap;
+    const unsigned t_mprotect = __NR_mprotect;
+    const unsigned t_memfd_create = __NR_memfd_create;
+    uintptr_t svc = reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point);
+    uint32_t lo = static_cast<uint32_t>(svc & 0xffffffffu);
+    uint32_t hi = static_cast<uint32_t>(svc >> 32);
+    const unsigned kOutcome = notif ? SECCOMP_RET_USER_NOTIF
+                                    : SECCOMP_RET_TRAP;
+    const unsigned kProtExec = 0x4;  // PROT_EXEC
+    const unsigned kArgsProt =
+        offsetof(struct seccomp_data, args) + 2 * sizeof(__u64);
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 36),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 18, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 17, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 16, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 15, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 14, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 13, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_unlinkat, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigreturn, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mmap, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mprotect, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_memfd_create, 1, 0),
+        BPF_STMT(BPF_JMP | BPF_JA, 16),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo, 0, 3),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo + 8, 2, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi, 11, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mmap, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mprotect, 4, 0),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsProt),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, kProtExec),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsProt),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, kProtExec),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog;
+    prog.len = static_cast<unsigned short>(sizeof(f) / sizeof(f[0]));
+    prog.filter = f;
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (notif) {
+        unsigned flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        if (tsync) flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        long fd = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                          flags, &prog);
+        if (fd >= 0) {
+            LOGI("seccomp-diag: USER_NOTIF filter installed (v89), listener=%ld flags=0x%x",
+                 fd, flags);
+            return fd;
+        }
+        LOGE("seccomp-diag: USER_NOTIF install FAILED (v89) (errno=%d flags=0x%x)",
+             errno, flags);
+        return -1;
+    }
+    long rc = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                      SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v89, TSYNC)");
+        return 0;
+    }
+    int e1 = errno;
+    rc = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v89, prctl, single thread + inheritors)");
+        return 0;
+    }
+    LOGE("seccomp-diag: filter install FAILED (v89) (seccomp errno=%d, prctl errno=%d)",
+         e1, errno);
+    return -1;
+#endif
+}
+// v91 (diagnostic only, launch117): USER_NOTIF filter variant that
+// traps the base mask set plus pread64 with a BPF count pre-filter
+// (count 20 or 64 only: pread is hot, an unfiltered trap would
+// stall the guest). Same dispatch skeleton as sc_install_filter_ex,
+// re-laid-out; the old builders are untouched, so without the
+// files/sc-v91-probe flag the installed filter is byte-identical to
+// v88/v89. When both sc-v91-probe and sc-mmap-syscall exist, v91
+// wins and the v89 mmap set is NOT installed: the v89 window gate
+// (DexHelper patch pass) is blind to the DexHelper INIT window
+// anyway, so merging would add jump math and noise for no new
+// answer; the v91 snapshot replaces it. Only ever installed in
+// NOTIF mode (same reason as v89: SIGSYS on hot syscalls can
+// force-kill threads).
+//
+// Layout (33 insns):
+//   0..1   arch check (non-aarch64 -> ALLOW)
+//   2      load nr
+//   3..18  nr dispatch, 16 numbers, every match lands at 20
+//   19     JA -> ALLOW (no nr matched)
+//   20..24 trampoline-IP check: trampoline range -> ALLOW (32),
+//          anything else -> second dispatch (25)
+//   25..26 second dispatch: pread64 -> count check (28),
+//          anything else -> OUTCOME (27)
+//   28..30 count check: args[2] == 0x14 -> OUTCOME (31),
+//          == 0x40 -> OUTCOME (31), else ALLOW (32)
+//   31     RET OUTCOME
+//   32     RET ALLOW
+// Jump targets were recomputed by hand and verified by a Python BPF
+// simulation over the full decision matrix (see launch117 notes).
+// The program can only return NOTIF or ALLOW, never KILL, so a
+// miscounted offset degrades to mis-notification, not process death.
+long sc_install_filter_ex_v91(bool notif, bool with_signals = true,
+                              bool tsync = true) {
+#if !defined(__aarch64__)
+    (void)notif;
+    (void)with_signals;
+    (void)tsync;
+    return -1;
+#else
+    const unsigned s_kill = with_signals ? 129 : 0x3FFFFF10u;
+    const unsigned s_tkill = with_signals ? 130 : 0x3FFFFF11u;
+    const unsigned s_tgkill = with_signals ? 131 : 0x3FFFFF12u;
+    const unsigned s_sigaction = with_signals ? 134 : 0x3FFFFF13u;
+    const unsigned s_sigprocmask = with_signals ? 135 : 0x3FFFFF14u;
+    const unsigned s_tgsigqueue = with_signals ? 297 : 0x3FFFFF15u;
+    const unsigned s_pidfd = with_signals ? 424 : 0x3FFFFF16u;
+    // v69: rt_sigreturn joins the dispatch in NOTIF mode only (in
+    // TRAP mode trapping it would break the handler's own return).
+    const unsigned s_sigreturn = (notif && with_signals)
+        ? 139 : 0x3FFFFF17u;
+    const unsigned t_openat = (g_sc_trap_mask & 0x01) ? __NR_openat : 0x3FFFFF00u;
+    const unsigned t_openat2 = (g_sc_trap_mask & 0x02) ? __NR_openat2 : 0x3FFFFF01u;
+    const unsigned t_readlinkat = (g_sc_trap_mask & 0x04) ? __NR_readlinkat : 0x3FFFFF02u;
+    const unsigned t_faccessat = (g_sc_trap_mask & 0x08) ? __NR_faccessat : 0x3FFFFF03u;
+    const unsigned t_faccessat2 = (g_sc_trap_mask & 0x10) ? __NR_faccessat2 : 0x3FFFFF04u;
+    const unsigned t_newfstatat = (g_sc_trap_mask & 0x20) ? __NR_newfstatat : 0x3FFFFF05u;
+    const unsigned t_unlinkat = (g_sc_trap_mask & 0x40) ? __NR_unlinkat : 0x3FFFFF06u;
+    // v91: not mask-gated — this builder is only called when the
+    // files/sc-v91-probe flag exists. aarch64 number from the
+    // kernel headers: pread64 67. Use the macro, never literals.
+    const unsigned t_pread64 = __NR_pread64;
+    uintptr_t svc = reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point);
+    uint32_t lo = static_cast<uint32_t>(svc & 0xffffffffu);
+    uint32_t hi = static_cast<uint32_t>(svc >> 32);
+    const unsigned kOutcome = notif ? SECCOMP_RET_USER_NOTIF
+                                    : SECCOMP_RET_TRAP;
+    // pread count is args[2], same offset as the v89 prot check.
+    const unsigned kArgsCount =
+        offsetof(struct seccomp_data, args) + 2 * sizeof(__u64);
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 30),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 16, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 15, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 14, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 13, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_unlinkat, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigreturn, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_pread64, 1, 0),
+        BPF_STMT(BPF_JMP | BPF_JA, 12),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo, 0, 3),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo + 8, 2, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi, 7, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_pread64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsCount),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x14, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x40, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog;
+    prog.len = static_cast<unsigned short>(sizeof(f) / sizeof(f[0]));
+    prog.filter = f;
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (notif) {
+        unsigned flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        if (tsync) flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        long fd = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                          flags, &prog);
+        if (fd >= 0) {
+            LOGI("seccomp-diag: USER_NOTIF filter installed (v91), listener=%ld flags=0x%x",
+                 fd, flags);
+            return fd;
+        }
+        LOGE("seccomp-diag: USER_NOTIF install FAILED (v91) (errno=%d flags=0x%x)",
+             errno, flags);
+        return -1;
+    }
+    long rc = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                      SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v91, TSYNC)");
+        return 0;
+    }
+    int e1 = errno;
+    rc = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v91, prctl, single thread + inheritors)");
+        return 0;
+    }
+    LOGE("seccomp-diag: filter install FAILED (v91) (seccomp errno=%d, prctl errno=%d)",
+         e1, errno);
+    return -1;
+#endif
+}
 // used inside the SIGSYS handler (no allocation, no libc calls).
 // Returns the rewritten length, or -1 when no rewrite applies.
 #if defined(__aarch64__)
@@ -3449,6 +3909,163 @@ static void sc_sigreturn_guard(unsigned tid) {
     }
 }
 
+// ------------------------------------------------------------------
+// v91 (diagnostic only, launch117): fd -> loader-lib set + maps
+// snapshot, used by sc_serve_notif. The set is recorded at NREDIR
+// (key opens) and consulted at pread NOTIF; slots are single atomic
+// words (fd in the low 32 bits, lib tag in bits 40..41). No count
+// is needed: readers scan all 8 slots and an unwritten slot reads
+// as 0, which never matches a real key fd (its tag decodes to 0 =
+// no match). A single 64-bit atomic store is indivisible, so a
+// reader either sees the whole record or nothing. Records precede
+// lookups in guest time (a pread can only follow its own open's
+// response), so no reader can observe a half-published record.
+// Lib tags: 1 = DexHelper, 2 = dexjni.
+static std::atomic<long long> g_v91_fd_slots[8];
+static std::atomic<int> g_v91_fd_next{0};
+
+static void sc_v91_record_fd(long fd, int lib) {
+    int n = g_v91_fd_next.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 8) return;
+    long long v = (static_cast<long long>(lib) << 40) |
+                  (static_cast<unsigned>(fd) & 0xffffffffu);
+    g_v91_fd_slots[n].store(v, std::memory_order_release);
+}
+
+static int sc_v91_lookup_fd(long fd) {
+    for (int i = 0; i < 8; i++) {
+        long long v = g_v91_fd_slots[i].load(std::memory_order_acquire);
+        if ((v & 0xffffffffLL) == (fd & 0xffffffffLL)) {
+            return static_cast<int>((v >> 40) & 0x3);
+        }
+    }
+    return 0;
+}
+
+// v91: lib tag from a stock lib path, by substring (no libc, so the
+// handler can call it). 0 = not a key lib.
+static bool sc_v91_contains(const char* p, const char* needle) {
+    if (p == nullptr || needle == nullptr) return false;
+    int nlen = 0;
+    while (needle[nlen]) nlen++;
+    if (nlen == 0) return false;
+    for (int i = 0; p[i]; i++) {
+        int j = 0;
+        while (j < nlen && p[i + j] && p[i + j] == needle[j]) j++;
+        if (j == nlen) return true;
+    }
+    return false;
+}
+
+static int sc_v91_lib_tag(const char* p) {
+    if (sc_v91_contains(p, "libDexHelper.so")) return 1;
+    if (sc_v91_contains(p, "libdexjni.so")) return 2;
+    return 0;
+}
+
+// v91: maps snapshot, called from the NOTIF handler at each key
+// NREDIR. Reads the pre-opened /proc/self/maps fd (lseek+read;
+// neither is trapped), emits one SNAP line per anonymous PROT_EXEC
+// region (plus any dexvmp-named region), then SNAP-DONE. The
+// supervisor pool has 4 workers sharing one fd, so the whole
+// snapshot is mutex-guarded. Record-only: never denies or rewrites.
+// A maps line is "start-end perms offset dev inode [pathname]";
+// the parse below is hand-rolled (no sscanf, no allocation).
+static pthread_mutex_t g_v91_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void sc_v91_snapshot(const char* lib) {
+    if (g_sc_maps_fd < 0) {
+        sc_slogf("SNAP-UNAVAIL lib=%s\n", lib);
+        return;
+    }
+    pthread_mutex_lock(&g_v91_snap_mu);
+    if (lseek(g_sc_maps_fd, 0, SEEK_SET) < 0) {
+        pthread_mutex_unlock(&g_v91_snap_mu);
+        sc_slogf("SNAP-UNAVAIL lib=%s\n", lib);
+        return;
+    }
+    char chunk[8192];
+    char line[512];
+    int llen = 0;
+    int regions = 0;
+    bool capped = false;
+    ssize_t r;
+    while ((r = read(g_sc_maps_fd, chunk, sizeof(chunk))) > 0) {
+        for (ssize_t i = 0; i < r; i++) {
+            char c = chunk[i];
+            if (c == '\n') {
+                line[llen] = 0;
+                llen = 0;
+                // Parse start, end, perms.
+                unsigned long start = 0, end = 0;
+                int k = 0;
+                while (line[k] && line[k] != '-') {
+                    char ch = line[k++];
+                    unsigned d = (ch >= '0' && ch <= '9')
+                        ? static_cast<unsigned>(ch - '0')
+                        : (ch >= 'a' && ch <= 'f')
+                        ? static_cast<unsigned>(ch - 'a' + 10)
+                        : (ch >= 'A' && ch <= 'F')
+                        ? static_cast<unsigned>(ch - 'A' + 10)
+                        : 99u;
+                    if (d > 15) break;
+                    start = (start << 4) | d;
+                }
+                if (line[k] == '-') {
+                    k++;
+                    while (line[k] && line[k] != ' ') {
+                        char ch = line[k++];
+                        unsigned d = (ch >= '0' && ch <= '9')
+                            ? static_cast<unsigned>(ch - '0')
+                            : (ch >= 'a' && ch <= 'f')
+                            ? static_cast<unsigned>(ch - 'a' + 10)
+                            : (ch >= 'A' && ch <= 'F')
+                            ? static_cast<unsigned>(ch - 'A' + 10)
+                            : 99u;
+                        if (d > 15) break;
+                        end = (end << 4) | d;
+                    }
+                }
+                if (line[k] == ' ') k++;
+                char perms[5];
+                int pi = 0;
+                while (pi < 4 && line[k] && line[k] != ' ') {
+                    perms[pi++] = line[k++];
+                }
+                perms[pi] = 0;
+                if (pi == 4 && perms[2] == 'x' && end > start) {
+                    // Skip offset, dev, inode; the rest is pathname.
+                    int fields = 0;
+                    while (line[k] && fields < 3) {
+                        while (line[k] == ' ') k++;
+                        while (line[k] && line[k] != ' ') k++;
+                        fields++;
+                    }
+                    while (line[k] == ' ') k++;
+                    const char* pn = line + k;
+                    bool is_anon = (pn[0] == 0 || pn[0] == '[');
+                    bool is_dexvmp = sc_v91_contains(pn, "dexvmp");
+                    if (is_anon || is_dexvmp) {
+                        if (regions < 64) {
+                            sc_slogf("SNAP 0x%lx-0x%lx %s %lu %s\n",
+                                     start, end, perms, end - start,
+                                     is_dexvmp ? "dexvmp" : "anon");
+                        } else {
+                            capped = true;
+                        }
+                        regions++;
+                    }
+                }
+            } else if (llen < static_cast<int>(sizeof(line)) - 1) {
+                line[llen++] = c;
+            }
+        }
+    }
+    if (capped) sc_slogf("SNAP-CAP lib=%s\n", lib);
+    sc_slogf("SNAP-DONE lib=%s regions=%d\n", lib, regions);
+    pthread_mutex_unlock(&g_v91_snap_mu);
+}
+
 // Serves one notification. Returns true when the notification was
 // fully consumed by SECCOMP_IOCTL_NOTIF_ADDFD (no SEND needed).
 bool sc_serve_notif(struct seccomp_notif* req,
@@ -3667,6 +4284,80 @@ bool sc_serve_notif(struct seccomp_notif* req,
         return false;
     }
 
+    // v89 (launch115): syscall-level mapping witness, record-only.
+    // The BPF pre-filter already limited mmap/mprotect to PROT_EXEC
+    // transitions; memfd_create is unfiltered (rare). Never deny,
+    // never rewrite: log and CONTINUE, exactly like the V82 pass path.
+    // Gate mirrors hooked_mmap: v89 window AND (probe-all OR CM guest).
+    // by= is the supervisor's module resolution (same as V82 lines);
+    // ip= is the raw syscall instruction address for offline attribution
+    // against the run-as maps snapshot (v85 lesson: never resolve the
+    // module inside the hot path beyond what sc_find already gives).
+    if (g_v89_syscall &&
+        g_v89_window_open.load(std::memory_order_relaxed) &&
+        (g_v87_probe_all ||
+         sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity"))) {
+        if (nr == __NR_mmap || nr == __NR_mprotect ||
+            nr == __NR_memfd_create) {
+            static std::atomic<long> v89_logged{0};
+            long n = v89_logged.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4096) {
+                if (nr == __NR_mmap) {
+                    sc_slogf("V89 MMAP tid=%u by=%s ip=0x%lx len=%lu "
+                             "prot=0x%lx flags=0x%lx fd=%ld\n",
+                             req->pid, modname, (unsigned long)ip, a1, a2,
+                             a3, (long)req->data.args[4]);
+                } else if (nr == __NR_mprotect) {
+                    sc_slogf("V89 MPROTECT tid=%u by=%s ip=0x%lx "
+                             "addr=0x%lx len=%lu prot=0x%lx\n",
+                             req->pid, modname, (unsigned long)ip, a0, a1,
+                             a2);
+                } else {
+                    sc_slogf("V89 MEMFD tid=%u by=%s ip=0x%lx flags=%lu\n",
+                             req->pid, modname, (unsigned long)ip, a1);
+                }
+            } else if (n == 4096) {
+                sc_slogf("V89 CAP\n");
+            }
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            return false;
+        }
+    }
+
+    // v91 (diagnostic only, launch117): NOTIF pread existence probe.
+    // BPF already pre-filtered to count 20/64; here the fd set
+    // attributes the call to a loader lib. No CM gate, no window
+    // gate: the fd set itself restricts attribution to key fds,
+    // and the TRAP-ALIVE line is meant for noise rounds too.
+    // Record-only CONTINUE.
+    if (g_v91_probe && nr == __NR_pread64) {
+        static std::atomic<long> v91_logged{0};
+        static std::atomic<int> v91_alive{0};
+        int lib = sc_v91_lookup_fd(static_cast<long>(a0));
+        if (lib != 0) {
+            long n = v91_logged.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64) {
+                sc_slogf("V91 PREAD lib=%s fd=%ld count=%lu "
+                         "offset=0x%lx tid=%u seq=%ld\n",
+                         lib == 1 ? "DexHelper" : "dexjni",
+                         static_cast<long>(a0),
+                         static_cast<unsigned long>(a2),
+                         static_cast<unsigned long>(a3),
+                         req->pid, n);
+            } else if (n == 64) {
+                sc_slogf("V91 CAP\n");
+            }
+        } else if (v91_alive.fetch_add(1, std::memory_order_relaxed) == 0) {
+            sc_slogf("V91 TRAP-ALIVE fd=%ld count=%lu tid=%u\n",
+                     static_cast<long>(a0),
+                     static_cast<unsigned long>(a2),
+                     req->pid);
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+
     if (nr == __NR_openat || nr == __NR_openat2 ||
         nr == __NR_readlinkat || nr == __NR_faccessat ||
         nr == __NR_faccessat2 || nr == __NR_newfstatat) {
@@ -3866,6 +4557,14 @@ bool sc_serve_notif(struct seccomp_notif* req,
                             sc_slogf("NREDIR tid=%u fd=%ld "
                                      "(direct)\n",
                                      req->pid, rfd);
+                            if (g_v91_probe) {
+                                int lib = sc_v91_lib_tag(path);
+                                if (lib != 0) {
+                                    sc_v91_record_fd(rfd, lib);
+                                    sc_v91_snapshot(lib == 1 ? "DexHelper"
+                                                             : "dexjni");
+                                }
+                            }
                             return false;
                         }
                         struct seccomp_notif_addfd ad;
@@ -3880,6 +4579,14 @@ bool sc_serve_notif(struct seccomp_notif* req,
                         if (nfd >= 0) {
                             sc_slogf("NREDIRX tid=%u fd=%ld\n",
                                      req->pid, nfd);
+                            if (g_v91_probe) {
+                                int lib = sc_v91_lib_tag(path);
+                                if (lib != 0) {
+                                    sc_v91_record_fd(nfd, lib);
+                                    sc_v91_snapshot(lib == 1 ? "DexHelper"
+                                                             : "dexjni");
+                                }
+                            }
                             return true;
                         }
                         sc_slogf("NREDIRXFAIL tid=%u errno=%d\n",
@@ -4765,6 +5472,35 @@ int sc_arm(const char* log_path) {
             }
         }
         if (g_sc_empty_filter) g_sc_trap_mask = 0;
+        // v89: arm the syscall-level mapping probe when the flag file
+        // exists. Read here (before the MODE note and the filter
+        // install below) so both see the same value.
+        int yfd = open(sibling("/sc-mmap-syscall"), O_RDONLY);
+        if (yfd >= 0) {
+            close(yfd);
+            g_v89_syscall = true;
+        }
+        // v90: arm the INIT 后 BSS probe when the flag file exists.
+        // Same position as v89, so the MODE note below sees it.
+        int bfd = open(sibling("/sc-bss-probe"), O_RDONLY);
+        if (bfd >= 0) {
+            close(bfd);
+            g_v90_bss_probe = true;
+        }
+        // v91: arm the NOTIF pread + maps snapshot probe when the
+        // flag file exists. Same position as v89/v90, so the MODE
+        // note below sees it. The maps fd is opened HERE (before
+        // the filter install below) because the supervisor thread's
+        // own openat would trap once the filter is live. If the
+        // open fails, the pread half still works; snapshots report
+        // SNAP-UNAVAIL.
+        int pfd = open(sibling("/sc-v91-probe"), O_RDONLY);
+        if (pfd >= 0) {
+            close(pfd);
+            g_v91_probe = true;
+            int mfd = open("/proc/self/maps", O_RDONLY);
+            if (mfd >= 0) g_sc_maps_fd = mfd;
+        }
         if (g_sc_log_fd >= 0) {
             char note[96];
             int nl = 0;
@@ -4775,6 +5511,12 @@ int sc_arm(const char* log_path) {
             sc_app_hex(note, nl, ncap, g_sc_trap_mask);
             sc_app(note, nl, ncap, " maps_real=");
             sc_app_dec(note, nl, ncap, g_sc_maps_real ? 1 : 0);
+            sc_app(note, nl, ncap, " v89=");
+            sc_app_dec(note, nl, ncap, g_v89_syscall ? 1 : 0);
+            sc_app(note, nl, ncap, " v90b=");
+            sc_app_dec(note, nl, ncap, g_v90_bss_probe ? 1 : 0);
+            sc_app(note, nl, ncap, " v91=");
+            sc_app_dec(note, nl, ncap, g_v91_probe ? 1 : 0);
             sc_app(note, nl, ncap, "\n");
             note[nl] = 0;
             ssize_t u = write(g_sc_log_fd, note, nl);
@@ -4800,11 +5542,16 @@ int sc_arm(const char* log_path) {
             pthread_detach(th);
         }
     }
-    long lfd = sc_install_filter_ex(true);
+    long lfd = g_v91_probe ? sc_install_filter_ex_v91(true)
+                           : g_v89_syscall ? sc_install_filter_ex_v89(true)
+                                           : sc_install_filter_ex(true);
     if (lfd < 0) {
         // Retry without TSYNC (covers the calling thread and all
         // threads created afterwards, which includes the guest's).
-        lfd = sc_install_filter_ex(true, true, false);
+        lfd = g_v91_probe ? sc_install_filter_ex_v91(true, true, false)
+                          : g_v89_syscall
+                          ? sc_install_filter_ex_v89(true, true, false)
+                          : sc_install_filter_ex(true, true, false);
     }
     if (lfd >= 0) {
         g_sc_listener_fd = static_cast<int>(lfd);
@@ -4812,11 +5559,19 @@ int sc_arm(const char* log_path) {
         g_sc_mode = 1;
         LOGI("seccomp-diag: armed (USER_NOTIF), log=%s modules=%d",
              log_path, g_sc_module_count);
+        if (g_v89_syscall) {
+            LOGI("seccomp-diag: v89 syscall probe armed");
+        }
+        if (g_v91_probe) {
+            LOGI("seccomp-diag: v91 pread+snap probe armed");
+        }
         return 0;
     }
     // Fallback: RET_TRAP + SIGSYS handler, WITHOUT the signal
     // numbers (trapping rt_sigprocmask kills newborn threads whose
     // start path restores the signal mask while SIGSYS is blocked).
+    // v89 never arms in TRAP mode: the v89 builder is NOTIF-only by
+    // design (v18: SIGSYS on hot syscalls can force-kill threads).
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sc_handle;
