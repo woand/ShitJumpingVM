@@ -10,7 +10,8 @@
  *   - stat/lstat      → stat sandbox path instead
  *   - readlink        → return sandbox path
  *   - fopen           → redirect file paths to sandbox
- *   - __system_property_get → spoof device properties
+ *   - mmap (v87 diagnostic only) → record anonymous PROT_EXEC maps
+ *     in dexvmp size range (Tier 1 probe, CM-gated)
  *
  * Architecture:
  *   Java (NativeHookBridge.kt)
@@ -51,6 +52,7 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include <cerrno>
 #include <signal.h>
 #include <pthread.h>
@@ -96,6 +98,31 @@ static std::unordered_set<std::string> g_hidden_paths;
 // /proc/self spoofing
 static int g_spoofed_pid = -1;
 static std::string g_spoofed_package_name;
+// v86 (diagnostic only, launch112): set in nativeSpoofProcSelf when the
+// sc-maps-real flag file exists and the guest is CM. When true,
+// build_spoofed_maps() returns the REAL maps instead of the rewritten
+// view. The flag file is removed after the round; default false.
+static bool g_v86_maps_real = false;
+
+// v87 (diagnostic only, Tier 1 mmap probe): g_v87_probe_all is set in
+// nativeSpoofProcSelf when the sc-mmap-probe flag file exists (any
+// guest; used for the Unicom noise run). g_v87_window_open is set by
+// install_hooks_callback when a shell loader lib (libDexHelper.so or
+// libdexjni.so) first appears in the link map, and stays open until
+// process death. The mmap gate is: window open AND (CM guest OR probe
+// flag) AND anonymous (fd == -1, MAP_ANONYMOUS) AND PROT_EXEC AND
+// length in [512KB, 1MB].
+static bool g_v87_probe_all = false;
+static std::atomic<bool> g_v87_window_open{false};
+static std::atomic<int> g_v87_mmap_logged{0};
+
+// v57: while true, /proc/self spoofing is suspended and hooked readers
+// get the real content. Opened around the CM guest's bind: the SecNeo
+// mini-linker stub (libDexHelper.so) parses the real /proc/self/maps
+// in its constructor to resolve libc symbols (sscanf) and locate its
+// own image; the spoofed maps silently abort its registration chain,
+// leaving every H.* native unregistered.
+static std::atomic<bool> g_proc_spoof_suspended{false};
 
 // Host package data dir prefix
 static std::string g_host_data_prefix;
@@ -333,6 +360,27 @@ static bool transform_maps_line(const char* line, std::string& out) {
 }
 
 static std::string build_spoofed_maps() {
+    // v86: CM guest + flag file -> REAL maps, untransformed (control
+    // experiment, launch112). Covers both guest-side readers (open
+    // path and fopen path); the supervisor memfd path already honors
+    // the same flag via g_sc_maps_real.
+    if (g_v86_maps_real &&
+        g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity") {
+        std::string real;
+        int rfd = real_open != nullptr
+                      ? real_open("/proc/self/maps", O_RDONLY)
+                      : -1;
+        if (rfd >= 0) {
+            char buf[4096];
+            ssize_t n;
+            while ((n = read(rfd, buf, sizeof(buf))) > 0) {
+                real.append(buf, static_cast<size_t>(n));
+            }
+            close(rfd);
+        }
+        return real;
+    }
     std::string result;
     int fd = real_open != nullptr ? real_open("/proc/self/maps", O_RDONLY) : -1;
     if (fd < 0) return result;
@@ -419,6 +467,9 @@ static std::string build_spoofed_stat(const char* src_path = nullptr) {
  * Java side never armed spoofing via nativeSpoofProcSelf).
  */
 static ProcSpoofKind match_proc_spoof(const char* path) {
+    if (g_proc_spoof_suspended.load(std::memory_order_relaxed)) {
+        return PROC_SPOOF_NONE;
+    }
     if (path == nullptr || g_spoofed_package_name.empty()) return PROC_SPOOF_NONE;
 
     const char* base = nullptr;
@@ -985,6 +1036,9 @@ static orig_syscall_t real_syscall = nullptr;
 static orig_fork_t real_fork = nullptr;
 static orig_opendir_t real_opendir = nullptr;
 
+typedef void* (*orig_mmap_t)(void*, size_t, int, int, int, off_t);
+static orig_mmap_t real_mmap = nullptr;
+
 static void diag_caller(void* ret_addr, char* buf, size_t len) {
     Dl_info info;
     if (ret_addr != nullptr && dladdr(ret_addr, &info) && info.dli_fname != nullptr) {
@@ -1029,6 +1083,67 @@ static long hooked_ptrace(int request, ...) {
     return -1;
 }
 
+// v72: reentrancy guards must never touch TLS/emutls or malloc.
+// fix-draft-hooked-syscall-emutls-reentrancy.md (proven at launch44,
+// photographed again at launch94 with a 512-frame tombstone): a
+// `__thread` flag's first touch on a thread goes through
+// __emutls_get_address → malloc; scudo's slow path calls libc
+// syscall(), which is GOT-hooked back into hooked_syscall before
+// the emutls block exists → unbounded recursion → stack overflow.
+// Per-thread state therefore lives in BSS slots indexed by tid.
+// (v74 correction: libc gettid() is NOT safe here — its cold-TLS
+// slow path calls the hooked `syscall` symbol; the tid is fetched
+// through the exempt svc trampoline instead, see nv_tid_acquire.)
+// A slot collision (tid & 255 shared with a live thread) only ever
+// skips logging, never forwarding.
+struct NvTidSlot {
+    volatile pid_t tid;
+    volatile int depth;
+};
+// One table per guarded entry point (the two guards were separate
+// flags before v72 and stay independent: being inside one must not
+// suppress the other's logging).
+static NvTidSlot g_tid_slots[256];
+static NvTidSlot g_sc_tid_slots[256];
+
+// Defined further below (exempt svc trampoline: a bare svc whose
+// instruction address the seccomp filter lets through). Declared
+// here because nv_tid_acquire must use it — see its comment.
+extern "C" long nv_seccomp_svc(long nr, long a0, long a1, long a2,
+                               long a3);
+
+static NvTidSlot* nv_tid_acquire(NvTidSlot* table) {
+    // v74: do NOT call libc gettid() here. On Android 17 bionic,
+    // gettid()'s slow path (taken whenever the calling thread's
+    // TLS tid cache is cold — e.g. payload code running on a
+    // hand-rolled stack/TLS) is `mov w0, #__NR_gettid; bl
+    // syscall@plt`, and the syscall symbol is GOT-hooked to
+    // hooked_syscall: acquire -> gettid -> syscall -> hooked_syscall
+    // -> acquire ... recursed until the stack guard page
+    // (launches 95/96: main thread wedged before StartPage,
+    // fault x0=0xb2 at hooked_syscall+0x20). The exempt trampoline
+    // issues the svc directly: no PLT, no libc, no recursion.
+    // (The trampoline exists only on aarch64; the 32-bit build
+    // keeps the libc call — the supervisor path is arm64-only.)
+#if defined(__aarch64__)
+    pid_t t = static_cast<pid_t>(
+        nv_seccomp_svc(__NR_gettid, 0, 0, 0, 0));
+#else
+    pid_t t = gettid();
+#endif
+    NvTidSlot& s = table[t & 255];
+    if (s.tid != t) {
+        if (s.tid != 0) return nullptr;  // slot owned by a live tid
+        s.tid = t;
+    }
+    if (s.depth > 0) return nullptr;    // re-entry: skip, no leak
+    s.depth = 1;
+    return &s;
+}
+static void nv_tid_release(NvTidSlot* s) {
+    if (s) s->depth = 0;
+}
+
 static long hooked_syscall(long number, ...) {
     va_list ap;
     va_start(ap, number);
@@ -1040,9 +1155,8 @@ static long hooked_syscall(long number, ...) {
     long a6 = va_arg(ap, long);
     va_end(ap);
 
-    static __thread bool in_hook = false;
-    if (!in_hook) {
-        in_hook = true;
+    NvTidSlot* guard = nv_tid_acquire(g_tid_slots);
+    if (guard) {
         // aarch64 numbers of interest: faccessat=48, openat=56, close=57,
         // getdents64=61, read=63, pread64=67, readlinkat=78,
         // newfstatat=79, ptrace=117, kill=129, tgkill=131, clone=220
@@ -1063,7 +1177,7 @@ static long hooked_syscall(long number, ...) {
                      number, a1, a2, a3, who);
             }
         }
-        in_hook = false;
+        nv_tid_release(guard);
     }
     if (real_syscall) return real_syscall(number, a1, a2, a3, a4, a5, a6);
     errno = ENOSYS;
@@ -1095,6 +1209,35 @@ static DIR* hooked_opendir(const char* path) {
         }
     }
     if (real_opendir) return real_opendir(path);
+    return nullptr;
+}
+
+/**
+ * v87 (diagnostic only): hooked mmap() — record-only Tier 1 probe.
+ * Records only calls passing ALL filters: loader window open, CM guest
+ * (or sc-mmap-probe flag for the Unicom noise run), anonymous
+ * (fd == -1, MAP_ANONYMOUS), PROT_EXEC, length in dexvmp magnitude
+ * [512KB, 1MB]. Otherwise forwards silently. Cap 512 records.
+ * Forbidden zone: body uses only integer compares, the package string
+ * compare, an atomic counter, LOGI and real_mmap — no libc call that
+ * could route through a patched PLT entry.
+ */
+static void* hooked_mmap(void* addr, size_t length, int prot, int flags,
+                         int fd, off_t offset) {
+    if (g_v87_window_open.load(std::memory_order_relaxed) &&
+        (g_v87_probe_all ||
+         g_spoofed_package_name ==
+             "com.greenpoint.android.mc10086.activity") &&
+        fd == -1 && (flags & MAP_ANONYMOUS) != 0 &&
+        (prot & PROT_EXEC) != 0 &&
+        length >= (size_t)(512 << 10) && length <= (size_t)(1024 << 10)) {
+        int n = g_v87_mmap_logged.fetch_add(1, std::memory_order_relaxed);
+        if (n < 512) {
+            LOGI("V87 MMAP addr=%p len=%zu prot=0x%x flags=0x%x fd=%d",
+                 addr, length, prot, flags, fd);
+        }
+    }
+    if (real_mmap) return real_mmap(addr, length, prot, flags, fd, offset);
     return nullptr;
 }
 
@@ -1165,6 +1308,7 @@ static HookEntry g_hook_entries[] = {
     {"syscall",                 (void*)hooked_syscall,              (void**)&real_syscall},
     {"fork",                    (void*)hooked_fork,                 (void**)&real_fork},
     {"opendir",                 (void*)hooked_opendir,              (void**)&real_opendir},
+    {"mmap",                    (void*)hooked_mmap,                 (void**)&real_mmap},
 };
 static constexpr int g_hook_count = sizeof(g_hook_entries) / sizeof(g_hook_entries[0]);
 
@@ -1222,7 +1366,8 @@ static bool patch_got_entry(void** got_addr, void* new_func, void** old_func) {
  * then patches GOT entries for our target symbols.
  */
 static void patch_library_got(uintptr_t base_addr, const char* lib_name,
-                               const ElfW(Dyn)* dynamic) {
+                               const ElfW(Dyn)* dynamic,
+                               const char* only_symbol = nullptr) {
     if (dynamic == nullptr) return;
 
     // Find required dynamic entries
@@ -1323,6 +1468,9 @@ static void patch_library_got(uintptr_t base_addr, const char* lib_name,
             const char* sym_name = strtab + st_name;
             if (!is_address_readable(sym_name, 1)) continue;
             if (sym_name[0] == '\0') continue;
+            // v87: single-symbol pass (CM libDexHelper.so mmap-only)
+            if (only_symbol != nullptr && strcmp(sym_name, only_symbol) != 0)
+                continue;
 
             // Check if this symbol is one we want to hook
             for (int h = 0; h < g_hook_count; h++) {
@@ -1353,6 +1501,9 @@ static void patch_library_got(uintptr_t base_addr, const char* lib_name,
             const char* sym_name = strtab + st_name;
             if (!is_address_readable(sym_name, 1)) continue;
             if (sym_name[0] == '\0') continue;
+            // v87: single-symbol pass (CM libDexHelper.so mmap-only)
+            if (only_symbol != nullptr && strcmp(sym_name, only_symbol) != 0)
+                continue;
 
             for (int h = 0; h < g_hook_count; h++) {
                 if (strcmp(sym_name, g_hook_entries[h].symbol) == 0) {
@@ -1391,12 +1542,48 @@ static int install_hooks_callback(struct dl_phdr_info* info, size_t /*size*/, vo
     if (name[0] == '\0') return 0;
     if (strstr(name, "libnextvm") != nullptr) return 0;
 
+    // v87: open the mmap-probe window when a shell loader lib first
+    // appears in the link map. Set before every early return below so
+    // even the v57-exempt CM libDexHelper.so opens the window.
+    if (strstr(name, "libDexHelper.so") != nullptr ||
+        strstr(name, "libdexjni.so") != nullptr) {
+        g_v87_window_open.store(true, std::memory_order_relaxed);
+    }
+
     // Skip the linker itself
     if (strstr(name, "linker") != nullptr) return 0;
 
     // Skip vDSO and other kernel-mapped objects (no valid GOT to patch)
     if (strstr(name, "vdso") != nullptr) return 0;
     if (strstr(name, "[vdso]") != nullptr) return 0;
+
+    // v57: never GOT-patch the CM guest's SecNeo mini-linker stub for
+    // file I/O — its post-load file/JNI plumbing must stay pristine
+    // (see the g_proc_spoof_suspended note above). Keyed to the armed
+    // guest so other guests' libDexHelper.so (e.g. Unicom's) is
+    // unaffected. v87 exception: patch ONLY the mmap entry, so the
+    // Tier 1 probe can see the loader's own mappings; every other
+    // symbol stays exempt.
+    if (strstr(name, "libDexHelper.so") != nullptr &&
+        g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity") {
+        LOGI("install_hooks: libDexHelper.so mmap-only patch "
+             "(SecNeo stub exempt from file-I/O hooks, pkg=%s)",
+             g_spoofed_package_name.c_str());
+        const ElfW(Dyn)* dynamic = nullptr;
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+                dynamic = reinterpret_cast<const ElfW(Dyn)*>(
+                    info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+                break;
+            }
+        }
+        if (dynamic != nullptr) {
+            patch_library_got(info->dlpi_addr, name, dynamic, "mmap");
+        }
+        if (info->dlpi_addr != 0) g_patched_bases.insert(info->dlpi_addr);
+        return 0;
+    }
 
     // Skip libraries that commonly have RELRO-protected GOTs causing issues
     if (strstr(name, "libart.so") != nullptr) return 0;
@@ -1461,6 +1648,8 @@ static bool install_plt_hooks() {
         real_fork = (orig_fork_t)dlsym(RTLD_DEFAULT, "fork");
     if (!real_opendir)
         real_opendir = (orig_opendir_t)dlsym(RTLD_DEFAULT, "opendir");
+    if (!real_mmap)
+        real_mmap = (orig_mmap_t)dlsym(RTLD_DEFAULT, "mmap");
 
     if (!real_open || !real_openat || !real_access || !real_stat) {
         LOGE("Failed to resolve one or more libc functions via dlsym");
@@ -1609,9 +1798,100 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeSpoofProcSelf(
         std::lock_guard<std::mutex> lock(g_mutex);
         g_spoofed_pid = pid;
         g_spoofed_package_name = std::string(pkg);
+        // v86: arm the real-maps control experiment for the CM guest
+        // only, when the supervisor flag file is present. Read at
+        // spoof-setup time, before any guest code (incl. the loader)
+        // reads /proc/self/maps.
+        if (g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity") {
+            int f1 = open(
+                "/data/user/0/com.nextvm.app/files/sc-maps-real",
+                O_RDONLY);
+            int f2 = -1;
+            if (f1 < 0) {
+                f2 = open(
+                    "/data/data/com.nextvm.app/files/sc-maps-real",
+                    O_RDONLY);
+            }
+            if (f1 >= 0 || f2 >= 0) g_v86_maps_real = true;
+            if (f1 >= 0) close(f1);
+            if (f2 >= 0) close(f2);
+        }
+        // v87: arm the mmap probe for any guest when the supervisor
+        // flag file is present (Unicom noise run); the CM gate in
+        // hooked_mmap applies when the flag is absent.
+        {
+            int p1 = open(
+                "/data/user/0/com.nextvm.app/files/sc-mmap-probe",
+                O_RDONLY);
+            int p2 = -1;
+            if (p1 < 0) {
+                p2 = open(
+                    "/data/data/com.nextvm.app/files/sc-mmap-probe",
+                    O_RDONLY);
+            }
+            if (p1 >= 0 || p2 >= 0) g_v87_probe_all = true;
+            if (p1 >= 0) close(p1);
+            if (p2 >= 0) close(p2);
+        }
         LOGI("/proc/self spoof set: pid=%d, pkg=%s", pid, pkg);
         env->ReleaseStringUTFChars(packageName, pkg);
     }
+}
+
+/**
+ * v57: suspend/resume /proc/self spoofing (see g_proc_spoof_suspended).
+ * MUST match Kotlin: nativeSetProcSpoofSuspended(suspended: Boolean)
+ */
+JNIEXPORT void JNICALL
+Java_com_nextvm_core_hook_NativeHookBridge_nativeSetProcSpoofSuspended(
+    JNIEnv* env, jobject thiz, jboolean suspended)
+{
+    (void)env; (void)thiz;
+    g_proc_spoof_suspended.store(suspended == JNI_TRUE,
+                                  std::memory_order_relaxed);
+    LOGI("/proc spoof suspended=%d", suspended == JNI_TRUE ? 1 : 0);
+}
+
+/**
+ * v59: read the REAL /proc/self/maps using raw syscalls only.
+ * This bypasses every read-path interception in the process: the
+ * Java-layer fake file content (NativeHookBridge.fakeFileContent)
+ * and the libc PLT hooks (hooked_open/openat/fopen) both sit above
+ * the syscall layer, so what the kernel hands back here is ground
+ * truth. Used by the SecNeo probe to decide whether the China
+ * Mobile packer payload was ever really mapped/executed — the
+ * question the Java-level maps snapshots (v56) provably cannot
+ * answer. Returns nullptr on failure.
+ * MUST match Kotlin: nativeReadRealMaps(): String?
+ */
+JNIEXPORT jstring JNICALL
+Java_com_nextvm_core_hook_NativeHookBridge_nativeReadRealMaps(
+    JNIEnv* env, jclass clazz)
+{
+    (void)clazz;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                          O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGI("realmaps: raw openat failed errno=%d", errno);
+        return nullptr;
+    }
+    std::string out;
+    char buf[16384];
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOGI("realmaps: raw read failed errno=%d", errno);
+            syscall(SYS_close, fd);
+            return nullptr;
+        }
+        if (n == 0) break;
+        out.append(buf, (size_t)n);
+        if (out.size() > (4u << 20)) break;  // sanity cap: 4 MiB
+    }
+    syscall(SYS_close, fd);
+    return env->NewStringUTF(out.c_str());
 }
 
 /**
@@ -1721,7 +2001,10 @@ volatile int g_sc_module_count = 0;
 volatile int g_sc_log_fd = -1;
 volatile long g_sc_logged = 0;
 struct sigaction g_sc_prev_action;
-__thread volatile int g_sc_in_handler = 0;
+// v72: the SIGSYS handler's reentrancy gate was `__thread volatile
+// int g_sc_in_handler` — same emutls first-touch family as
+// hooked_syscall's in_hook (draft §4). It now uses nv_tid_acquire()
+// (defined above hooked_syscall); no per-thread state here.
 
 int sc_phdr_cb(struct dl_phdr_info* info, size_t, void*) {
     if (g_sc_module_count >= 2048) return 0;
@@ -1835,7 +2118,72 @@ void sc_write_diag(long nr, const ScModule* mod, uintptr_t pc,
 bool sc_is_trapped_nr(long nr) {
     return nr == __NR_openat || nr == __NR_openat2 || nr == __NR_readlinkat ||
            nr == __NR_faccessat || nr == __NR_faccessat2 || nr == __NR_newfstatat ||
+           nr == __NR_unlinkat ||
            nr == 130 || nr == 131 || nr == 134 || nr == 135;
+}
+
+// v82 (B2): does this path name the guest's own apk copy under
+// files/virtual/apks/? CM-gated exactly like F3: the gate lives
+// here so both serving seats (NOTIF and the TRAP fallback) share
+// one definition. launch104/105 established that ZWRisk.setup()
+// unlinks this file inside the agree flow — on a stock install
+// the same unlink targets /data/app and fails with EACCES, which
+// the SDK silently lives with; in the sandbox the copy sits in a
+// same-uid writable directory, so the unlink succeeds and the
+// engine later dies loading resources from the vanished file.
+bool sc_is_own_apk_path(const char* p) {
+    if (p == nullptr) return false;
+    if (!sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity")) {
+        return false;
+    }
+    if (!sc_strstr(p, "/files/virtual/apks/")) return false;
+    if (!sc_strstr(p, "com.greenpoint.android.mc10086.activity")) {
+        return false;
+    }
+    int len = 0;
+    while (p[len]) len++;
+    return len >= 4 && sc_streq(p + len - 4, ".apk");
+}
+
+// v83 (log-only): does this path name a SecNeo loader lib?
+// CM-gated exactly like sc_is_own_apk_path, so both serving seats
+// share one definition. Substring match on purpose: the loader
+// may open the lib by its stock path, by a guest-side path, or
+// by a dirfd-relative bare filename — the basename is the stable
+// part. This predicate only selects lines for logging; it never
+// changes the call's outcome or path.
+bool sc_is_v83_open_path(const char* p) {
+    if (p == nullptr) return false;
+    if (!sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity")) {
+        return false;
+    }
+    return sc_strstr(p, "dexvmp") != nullptr ||
+           sc_strstr(p, "dexjni") != nullptr ||
+           sc_strstr(p, "DexHelper") != nullptr;
+}
+
+// v84 (B2 extension, launch109): does this path name a file inside
+// the CM guest's own lib dir? The guest's main thread bulk-deletes
+// its instance lib dir after agree — on a stock install the same
+// unlink targets /data/app/.../lib and fails with EACCES, which the
+// SDK silently lives with; in the sandbox the instance lib dir is
+// same-uid writable, so the deletion succeeds and later loadLibrary
+// calls die with "not found". Refuse exactly the lib-dir deletions
+// a stock install would refuse: CM-gated, path inside a lib dir
+// under the guest instance data dir or under the stock app path.
+// Everything else (shared_prefs, databases, cache) is untouched —
+// on stock those are writable and the app may delete them.
+bool sc_is_v84_lib_path(const char* p) {
+    if (p == nullptr) return false;
+    if (!sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity")) {
+        return false;
+    }
+    if (sc_strstr(p, "/lib/") == nullptr) return false;
+    return sc_strstr(p, "/files/virtual/") != nullptr ||
+           sc_strstr(p, "/data/app/") != nullptr;
 }
 
 // ---- Phase 1b: serve rewritten /proc maps from the handler ----
@@ -1964,6 +2312,98 @@ long sc_serve_maps(long oflags) {
     return mfd;
 }
 
+// F3 (launch82): reverse the maps rewrite for exactly one file —
+// the guest's own SecNeo shell library. v88 extends the same
+// mechanism to libdexjni.so (its stock open is the key read that
+// ENOENTs per decrypt-finding). The CM stub extracts the
+// synthetic stock path from the served maps and open()s it; no
+// real file answers there (its own open of the guest copy would
+// succeed — v61 control), so S2 fails and the loader's key read
+// lands nothing (bss key slots all zero). When an openat targets
+// that exact synthetic path, resolve it to the guest's real lib
+// file: scan the real maps for the /lib/ line whose forward
+// rewrite (sc_rewrite_fd_target) equals the requested path, and
+// hand back its true pathname. CM-gated; any miss means "not
+// ours" and callers keep the unchanged behavior.
+bool sc_redirect_shell_lib(const char* path, char* out, int cap) {
+    if (path == nullptr || cap < 2) return false;
+    if (!sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity")) {
+        return false;
+    }
+    // Cheap shape check before paying for a maps scan: the
+    // synthetic lib path this guest's maps lines rewrite to.
+    if (!sc_strstr(path, "/data/app/~~VmK8x2==/") ||
+        (!sc_strstr(path, "/lib/arm64/libDexHelper.so") &&
+         !sc_strstr(path, "/lib/arm64/libdexjni.so"))) {
+        return false;
+    }
+    while (__sync_lock_test_and_set(&g_sc_maps_lock, 1)) {
+    }
+    static const char kSelfMaps[] = "/proc/self/maps";
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(kSelfMaps), 0, 0);
+    if (fd < 0) {
+        __sync_lock_release(&g_sc_maps_lock);
+        return false;
+    }
+    long total = 0;
+    while (total < kScMapsCap) {
+        long n = nv_seccomp_svc(__NR_read, fd,
+                                reinterpret_cast<long>(
+                                    g_sc_maps_raw + total),
+                                kScMapsCap - total, 0);
+        if (n < 0) { total = -1; break; }
+        if (n == 0) break;
+        total += n;
+    }
+    nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+    bool hit = false;
+    if (total > 0 && total < kScMapsCap) {
+        long pos = 0;
+        while (pos < total && !hit) {
+            long eol = pos;
+            while (eol < total && g_sc_maps_raw[eol] != '\n') eol++;
+            if (eol < total) eol++;
+            long ps = -1;
+            for (long i = pos; i < eol; i++) {
+                if (g_sc_maps_raw[i] == '/') { ps = i; break; }
+            }
+            if (ps >= 0) {
+                long path_len = eol - ps;
+                if (path_len > 0 &&
+                    g_sc_maps_raw[eol - 1] == '\n') path_len--;
+                if (path_len > 0 && path_len < 500) {
+                    char pbuf[512];
+                    for (long i = 0; i < path_len; i++) {
+                        pbuf[i] = g_sc_maps_raw[ps + i];
+                    }
+                    pbuf[path_len] = 0;
+                    if (sc_strstr(pbuf, "/files/virtual/data/") &&
+                        (sc_strstr(pbuf, "/lib/libDexHelper.so") ||
+                         sc_strstr(pbuf, "/lib/libdexjni.so"))) {
+                        char rw[512];
+                        int rlen = sc_rewrite_fd_target(pbuf, rw,
+                                                         500);
+                        if (rlen > 0 && sc_streq(rw, path)) {
+                            long n = path_len;
+                            if (n >= cap) n = cap - 1;
+                            for (long i = 0; i < n; i++) {
+                                out[i] = pbuf[i];
+                            }
+                            out[n] = 0;
+                            hit = true;
+                        }
+                    }
+                }
+            }
+            pos = eol;
+        }
+    }
+    __sync_lock_release(&g_sc_maps_lock);
+    return hit;
+}
+
 // Lean mode (flag files/sc-lean): the handler is a pure passthrough
 // — emulate via the trampoline and resume, with NO logging, NO
 // serving, NO rewriting. Bisection tool for the trap path.
@@ -2086,6 +2526,15 @@ void sc_handle(int sig, siginfo_t* info, void* uctx) {
                 unsigned long m =
                     *reinterpret_cast<unsigned long*>(a1) &
                     ~(1UL << 30);
+                // v65 mask guard (CM guest): also strip the
+                // synchronous-fault signal bits (SEGV/BUS/ILL) from
+                // the local copy, same rationale as the NOTIF path:
+                // a fault under a blocked mask is force-killed
+                // with no handler run and no tombstone.
+                if (sc_streq(g_sc_guest_pkg,
+                             "com.greenpoint.android.mc10086.activity")) {
+                    m &= ~((1UL << 10) | (1UL << 6) | (1UL << 3));
+                }
                 ret = nv_seccomp_svc(nr, a0,
                                      reinterpret_cast<long>(&m), a2, a3);
             } else {
@@ -2125,8 +2574,8 @@ void sc_handle(int sig, siginfo_t* info, void* uctx) {
     char sc_path[168];
     sc_path[0] = 0;
     bool sc_have_path = false;
-    if (!g_sc_in_handler) {
-        g_sc_in_handler = 1;
+    NvTidSlot* sc_guard = nv_tid_acquire(g_sc_tid_slots);
+    if (sc_guard) {
         // All trapped numbers carry the path pointer in arg1.
         char path[168];
         int plen = 0;
@@ -2155,7 +2604,79 @@ void sc_handle(int sig, siginfo_t* info, void* uctx) {
             g_sc_logged++;
             sc_write_diag(nr, mod, pc, path, a0);
         }
-        g_sc_in_handler = 0;
+        // v83 (log-only, TRAP seat, same rule as the NOTIF seat):
+        // signal-handler safe — sc_app + svc write only, no libc.
+        // No behaviour change; the call is emulated below as usual.
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            sc_is_v83_open_path(path) && g_sc_log_fd >= 0) {
+            static volatile long v83_trap_logged = 0;
+            if (v83_trap_logged < 512) {
+                v83_trap_logged++;
+                char vb[512];
+                int vl = 0;
+                const int vcap = static_cast<int>(sizeof(vb));
+                sc_app(vb, vl, vcap, "V83 OPEN nr=");
+                sc_app_dec(vb, vl, vcap, nr);
+                sc_app(vb, vl, vcap, " tid=");
+                sc_app_dec(vb, vl, vcap,
+                           nv_seccomp_svc(__NR_gettid, 0, 0, 0, 0));
+                sc_app(vb, vl, vcap, " by=");
+                if (mod) {
+                    sc_app(vb, vl, vcap, mod->name);
+                    sc_app(vb, vl, vcap, "+0x");
+                    sc_app_hex(vb, vl, vcap, pc - mod->lo);
+                } else {
+                    sc_app(vb, vl, vcap, "?@0x");
+                    sc_app_hex(vb, vl, vcap, pc);
+                }
+                sc_app(vb, vl, vcap, " dirfd=");
+                sc_app_dec(vb, vl, vcap, a0);
+                sc_app(vb, vl, vcap, " path=");
+                sc_app(vb, vl, vcap, path);
+                sc_app(vb, vl, vcap, "\n");
+                vb[vl] = 0;
+                nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                               reinterpret_cast<long>(vb), vl, 0);
+            }
+        }
+        // v85 (log-only, TRAP seat, same rule as the NOTIF seat):
+        // every CM open request. See the NOTIF-seat comment for
+        // why the predicate is all-openat, not module==loader.
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity") &&
+            g_sc_log_fd >= 0) {
+            static volatile long v85_trap_logged = 0;
+            if (v85_trap_logged < 16384) {
+                v85_trap_logged++;
+                char vb[512];
+                int vl = 0;
+                const int vcap = static_cast<int>(sizeof(vb));
+                sc_app(vb, vl, vcap, "V85 OPEN nr=");
+                sc_app_dec(vb, vl, vcap, nr);
+                sc_app(vb, vl, vcap, " tid=");
+                sc_app_dec(vb, vl, vcap,
+                           nv_seccomp_svc(__NR_gettid, 0, 0, 0, 0));
+                sc_app(vb, vl, vcap, " by=");
+                if (mod) {
+                    sc_app(vb, vl, vcap, mod->name);
+                    sc_app(vb, vl, vcap, "+0x");
+                    sc_app_hex(vb, vl, vcap, pc - mod->lo);
+                } else {
+                    sc_app(vb, vl, vcap, "?@0x");
+                    sc_app_hex(vb, vl, vcap, pc);
+                }
+                sc_app(vb, vl, vcap, " dirfd=");
+                sc_app_dec(vb, vl, vcap, a0);
+                sc_app(vb, vl, vcap, " path=");
+                sc_app(vb, vl, vcap, path);
+                sc_app(vb, vl, vcap, "\n");
+                vb[vl] = 0;
+                nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                               reinterpret_cast<long>(vb), vl, 0);
+            }
+        }
+        nv_tid_release(sc_guard);
     }
 
     if (g_sc_log_fd >= 0) {
@@ -2193,10 +2714,65 @@ void sc_handle(int sig, siginfo_t* info, void* uctx) {
             }
         }
     }
+    // v82 (B2, TRAP seat): same refusal as the NOTIF branch —
+    // the CM guest's own apk copy may not be unlinked; answer
+    // -EACCES, exactly what a stock install returns.
+    if (nr == __NR_unlinkat && sc_have_path &&
+        sc_is_own_apk_path(sc_path)) {
+        if (g_sc_log_fd >= 0) {
+            char ub[320];
+            int ul = 0;
+            const int ucap = static_cast<int>(sizeof(ub));
+            sc_app(ub, ul, ucap, "V82 BLOCK unlinkat path=");
+            sc_app(ub, ul, ucap, sc_path);
+            sc_app(ub, ul, ucap, " -> -EACCES\n");
+            ub[ul] = 0;
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(ub), ul, 0);
+        }
+        uc->uc_mcontext.regs[0] = -13;  // -EACCES
+        uc->uc_mcontext.pc =
+            reinterpret_cast<uintptr_t>(info->si_call_addr) + 4;
+        return;
+    }
+    // v84 (launch109, TRAP seat): same refusal for the CM guest's
+    // instance lib dir — a stock install cannot unlink /data/app
+    // lib files, so answer -EACCES there too.
+    if (nr == __NR_unlinkat && sc_have_path &&
+        sc_is_v84_lib_path(sc_path)) {
+        if (g_sc_log_fd >= 0) {
+            char ub[320];
+            int ul = 0;
+            const int ucap = static_cast<int>(sizeof(ub));
+            sc_app(ub, ul, ucap, "V84 BLOCK unlinkat path=");
+            sc_app(ub, ul, ucap, sc_path);
+            sc_app(ub, ul, ucap, " -> -EACCES\n");
+            ub[ul] = 0;
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(ub), ul, 0);
+        }
+        uc->uc_mcontext.regs[0] = -13;  // -EACCES
+        uc->uc_mcontext.pc =
+            reinterpret_cast<uintptr_t>(info->si_call_addr) + 4;
+        return;
+    }
     if (!served_maps) {
-        // Emulate the call unchanged through the trampoline and resume
-        // just past the svc instruction.
-        ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+        // F3 (launch82): the CM shell stub open()s the synthetic
+        // stock path it extracted from the served maps; resolve it
+        // back to the guest's real lib file and emulate with the
+        // substituted path (arg1 in both openat and openat2).
+        char rpath[256];
+        if (sc_have_path &&
+            (nr == __NR_openat || nr == __NR_openat2) &&
+            sc_redirect_shell_lib(sc_path, rpath, sizeof(rpath))) {
+            ret = nv_seccomp_svc(nr, a0,
+                                 reinterpret_cast<long>(rpath),
+                                 a2, a3);
+        } else {
+            // Emulate the call unchanged through the trampoline
+            // and resume just past the svc instruction.
+            ret = nv_seccomp_svc(nr, a0, a1, a2, a3);
+        }
     }
     if (g_sc_log_fd >= 0) {
         char rb[8];
@@ -2254,9 +2830,10 @@ bool g_sc_empty_filter = false;
 
 // Per-syscall trap mask (flag files/sc-trapmask, two hex chars):
 // bit0 openat, bit1 openat2, bit2 readlinkat, bit3 faccessat,
-// bit4 faccessat2, bit5 newfstatat. Masked-out numbers are replaced
-// with impossible ones, like the empty-filter control.
-unsigned g_sc_trap_mask = 0x3F;
+// bit4 faccessat2, bit5 newfstatat, bit6 unlinkat (v82). Masked-out
+// numbers are replaced with impossible ones, like the empty-filter
+// control.
+unsigned g_sc_trap_mask = 0x7F;
 
 // Installs the supervision filter. In notif mode the outcome is
 // SECCOMP_RET_USER_NOTIF and the return value is the listener fd
@@ -2284,39 +2861,48 @@ long sc_install_filter_ex(bool notif, bool with_signals = true,
     const unsigned s_sigprocmask = with_signals ? 135 : 0x3FFFFF14u;
     const unsigned s_tgsigqueue = with_signals ? 297 : 0x3FFFFF15u;
     const unsigned s_pidfd = with_signals ? 424 : 0x3FFFFF16u;
+    // v69: rt_sigreturn joins the dispatch in NOTIF mode only (in
+    // TRAP mode trapping it would break the handler's own return).
+    const unsigned s_sigreturn = (notif && with_signals)
+        ? 139 : 0x3FFFFF17u;
     const unsigned t_openat = (g_sc_trap_mask & 0x01) ? __NR_openat : 0x3FFFFF00u;
     const unsigned t_openat2 = (g_sc_trap_mask & 0x02) ? __NR_openat2 : 0x3FFFFF01u;
     const unsigned t_readlinkat = (g_sc_trap_mask & 0x04) ? __NR_readlinkat : 0x3FFFFF02u;
     const unsigned t_faccessat = (g_sc_trap_mask & 0x08) ? __NR_faccessat : 0x3FFFFF03u;
     const unsigned t_faccessat2 = (g_sc_trap_mask & 0x10) ? __NR_faccessat2 : 0x3FFFFF04u;
     const unsigned t_newfstatat = (g_sc_trap_mask & 0x20) ? __NR_newfstatat : 0x3FFFFF05u;
+    const unsigned t_unlinkat = (g_sc_trap_mask & 0x40) ? __NR_unlinkat : 0x3FFFFF06u;
     uintptr_t svc = reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point);
     uint32_t lo = static_cast<uint32_t>(svc & 0xffffffffu);
     uint32_t hi = static_cast<uint32_t>(svc >> 32);
     const unsigned kOutcome = notif ? SECCOMP_RET_USER_NOTIF
                                     : SECCOMP_RET_TRAP;
-    // Layout (24 insns): arch check -> nr dispatch (13 numbers,
-    // indices 3..15) -> trampoline-IP check (17..21) -> OUTCOME
-    // (22) / ALLOW (23). Signal-channel numbers are always in the
+    // Layout (26 insns): arch check -> nr dispatch (15 numbers,
+    // indices 3..17) -> trampoline-IP check (19..23) -> OUTCOME
+    // (24) / ALLOW (25). Signal-channel numbers are always in the
     // dispatch: under NOTIF they can be watched and neutralized
-    // without any signal ever being generated.
+    // without any signal ever being generated. v82: unlinkat joins
+    // the dispatch (index 9) so the supervisor can refuse deletion
+    // of the guest's own apk copy (see V82 branch in sc_serve_notif).
     struct sock_filter f[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 21),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 23),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 13, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 12, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 11, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 10, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 9, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 8, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 7, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 6, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 5, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 4, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 3, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 15, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 14, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 13, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_unlinkat, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigreturn, 1, 0),
         BPF_STMT(BPF_JMP | BPF_JA, 6),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo, 0, 3),
@@ -2755,6 +3341,114 @@ int sc_copy_remote_str(long tid, unsigned long addr, char* out, int cap) {
     return n;
 }
 
+// v70: forward declaration — the witness handler (defined with
+// the SEGVW block below) whose address the nr-134 swallow hands
+// back as the true current disposition.
+static void segvw_handler(int sig, siginfo_t* si, void* uct);
+
+// v69 helper: user SP of a thread frozen inside a syscall, from
+// /proc/self/task/<tid>/syscall ("nr a0..a5 sp pc"; nr decimal,
+// the rest hex). The supervisor reads it through the exempted svc
+// trampoline. Returns 0 when unavailable or not inside nr 139.
+static unsigned long sc_task_syscall_sp(unsigned tid) {
+    char path[48];
+    int n = 0;
+    for (const char* p = "/proc/self/task/"; *p; p++) path[n++] = *p;
+    char tmp[12];
+    int tn = 0;
+    unsigned t = tid;
+    if (t == 0) tmp[tn++] = '0';
+    while (t) { tmp[tn++] = static_cast<char>('0' + (t % 10)); t /= 10; }
+    while (tn) path[n++] = tmp[--tn];
+    for (const char* p = "/syscall"; *p; p++) path[n++] = *p;
+    path[n] = 0;
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(path), 0, 0);
+    if (fd < 0) return 0;
+    char buf[256];
+    long rd = nv_seccomp_svc(__NR_read, fd,
+                              reinterpret_cast<long>(buf),
+                              static_cast<long>(sizeof(buf) - 1), 0);
+    nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+    if (rd <= 0) return 0;
+    buf[rd] = 0;
+    int tok = 0;
+    unsigned long sp = 0;
+    const char* p = buf;
+    while (*p && tok < 8) {
+        while (*p == ' ' || *p == '\n' || *p == '\t') p++;
+        if (!*p) break;
+        const char* s = p;
+        while (*p && *p != ' ' && *p != '\n' && *p != '\t') p++;
+        if (tok == 0) {
+            long v = 0;
+            for (const char* q = s; q < p; q++) {
+                if (*q < '0' || *q > '9') return 0;
+                v = v * 10 + (*q - '0');
+            }
+            if (v != 139) return 0;
+        } else if (tok == 7) {
+            unsigned long v = 0;
+            const char* q = s;
+            if (q + 1 < p && q[0] == '0' &&
+                (q[1] == 'x' || q[1] == 'X')) q += 2;
+            for (; q < p; q++) {
+                v <<= 4;
+                if (*q >= '0' && *q <= '9') v |=
+                    static_cast<unsigned long>(*q - '0');
+                else if (*q >= 'a' && *q <= 'f') v |=
+                    static_cast<unsigned long>(*q - 'a' + 10);
+                else if (*q >= 'A' && *q <= 'F') v |=
+                    static_cast<unsigned long>(*q - 'A' + 10);
+                else return 0;
+            }
+            sp = v;
+        }
+        tok++;
+    }
+    return sp;
+}
+
+// v69: validate the rt_sigframe at the tracee's SP and strip the
+// fault-signal bits from its saved mask (uc_sigmask) in place.
+// arm64 layout: siginfo(128B) then ucontext{flags@0, link@8,
+// stack@16(24B), sigmask@40, reserved to 168, mcontext@168};
+// mcontext.pc sits at frame+128+168+8+31*8+8 = frame+560.
+// A bogus layout shows up as NS139 badframe lines (first 8) with
+// the raw words, and nothing is written in that case.
+static void sc_sigreturn_guard(unsigned tid) {
+    unsigned long sp = sc_task_syscall_sp(tid);
+    if (!sp) return;
+    volatile unsigned long* f0 =
+        reinterpret_cast<volatile unsigned long*>(sp);
+    volatile unsigned long* mp =
+        reinterpret_cast<volatile unsigned long*>(sp + 168);
+    volatile unsigned long* pp =
+        reinterpret_cast<volatile unsigned long*>(sp + 560);
+    unsigned long w0 = *f0;
+    unsigned long signo = w0 & 0xffffffffUL;
+    unsigned long mask = *mp;
+    unsigned long mpc = *pp;
+    bool ok = signo >= 1 && signo <= 64 && mpc != 0 && (mpc & 3) == 0;
+    const unsigned long kFaultBits =
+        (1UL << 10) | (1UL << 6) | (1UL << 3);
+    static volatile int bad_logged = 0;
+    if (!ok) {
+        if (bad_logged < 8) {
+            bad_logged++;
+            sc_slogf("NS139 badframe tid=%u sp=0x%lx w0=0x%lx "
+                     "m168=0x%lx pc560=0x%lx\n",
+                     tid, sp, w0, mask, mpc);
+        }
+        return;
+    }
+    if (mask & kFaultBits) {
+        sc_slogf("NS139 frame strip tid=%u signo=%lu mask=0x%lx\n",
+                 tid, signo, mask);
+        *mp = mask & ~kFaultBits;
+    }
+}
+
 // Serves one notification. Returns true when the notification was
 // fully consumed by SECCOMP_IOCTL_NOTIF_ADDFD (no SEND needed).
 bool sc_serve_notif(struct seccomp_notif* req,
@@ -2788,9 +3482,102 @@ bool sc_serve_notif(struct seccomp_notif* req,
         return false;
     }
     if (nr == 134) {  // rt_sigaction
+        // v70 (CM guest): swallow raw installs for the fault
+        // signals — the kernel seat belongs to the raw-installed
+        // witness (see the v70 note at g_segvw_raw_mode). Report
+        // success without executing the call; a caller asking for
+        // the previous disposition gets the true current one (the
+        // witness) in kernel layout. The engine's own installs go
+        // through the exempt svc trampoline and never land here;
+        // foreign-process threads keep the normal path.
+        if ((a0 == 11 || a0 == 7 || a0 == 4) &&
+            sc_tid_is_own_thread(req->pid) &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity")) {
+            unsigned long reqh = 0;
+            if (a1) {
+                reqh = *reinterpret_cast<unsigned long*>(
+                    static_cast<uintptr_t>(a1));
+            }
+            sc_slogf("NS134 swallow sig=%lu req=0x%lx by=%s "
+                     "tid=%u\n",
+                     a0, reqh, modname, req->pid);
+            if (a2) {
+                unsigned long* o = reinterpret_cast<unsigned long*>(
+                    static_cast<uintptr_t>(a2));
+                o[0] = reinterpret_cast<unsigned long>(
+                    &segvw_handler);
+                o[1] = SA_SIGINFO | SA_ONSTACK;
+                o[2] = 0;
+                o[3] = 0;
+            }
+            resp->val = 0;
+            resp->flags = 0;
+            return false;
+        }
         if (a0 == 31 && a1 != 0) {
             sc_slogf("NS134 set SIGSYS disposition by=%s tid=%u\n",
                      modname, req->pid);
+        }
+        // v65: also log fault-signal disposition changes (CM guest)
+        // with the handler word, to catch a handler installed below
+        // libsigchain via raw syscalls (invisible to the v64
+        // witness's libc-level query). Own threads only for the
+        // deref — the address space is this process's own.
+        if ((a0 == 11 || a0 == 7 || a0 == 4) && a1 != 0 &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity")) {
+            unsigned long h = 0;
+            if (sc_tid_is_own_thread(req->pid)) {
+                h = *reinterpret_cast<unsigned long*>(
+                    static_cast<uintptr_t>(a1));
+            }
+            sc_slogf("NS134 set sig=%lu handler=0x%lx by=%s "
+                     "tid=%u\n",
+                     a0, h, modname, req->pid);
+        }
+        // v69 (CM guest): strip the fault-signal bits from the
+        // handler's sa_mask before the install lands. While ANY
+        // handler runs, the thread's mask is (saved | sa_mask |
+        // signo); a fat sa_mask (sigfillset is common in
+        // collection/anti-debug code) re-blocks SIGSEGV for the
+        // whole handler body AND gets baked into the saved mask
+        // of any nested delivery — both windows turn a hardware
+        // fault into the silent masked kill the v65 procmask
+        // guard cannot see. Kernel sigaction layout (aarch64):
+        // handler@0, flags@8, restorer@16, mask@24 (1 word).
+        if (a1 != 0 && sc_tid_is_own_thread(req->pid) &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity")) {
+            unsigned long* mp = reinterpret_cast<unsigned long*>(
+                static_cast<uintptr_t>(a1) + 24);
+            unsigned long sm = *mp;
+            const unsigned long kFaultBits =
+                (1UL << 10) | (1UL << 6) | (1UL << 3);
+            if (sm & kFaultBits) {
+                sc_slogf("NS134 samask strip sig=%lu m=0x%lx by=%s "
+                         "tid=%u\n",
+                         a0, sm, modname, req->pid);
+                *mp = sm & ~kFaultBits;
+            }
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+    if (nr == 139) {  // rt_sigreturn
+        // v69 (CM guest): the frame-restoration hole — sigreturn
+        // restores the mask saved at delivery time without any
+        // rt_sigprocmask call, so a saved mask that still carries
+        // fault bits (baked in by a nested delivery under a fat
+        // sa_mask, or predating the v65 guard) re-blocks SIGSEGV
+        // invisibly. Read the tracee's SP at syscall entry from
+        // /proc/self/task/<tid>/syscall (it points at the
+        // rt_sigframe), validate the frame, and strip the fault
+        // bits from uc_sigmask in place before CONTINUE.
+        if (sc_tid_is_own_thread(req->pid) &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity")) {
+            sc_sigreturn_guard(req->pid);
         }
         resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
         return false;
@@ -2798,12 +3585,83 @@ bool sc_serve_notif(struct seccomp_notif* req,
     if (nr == 135) {  // rt_sigprocmask
         if (sc_tid_is_own_thread(req->pid) && a1 &&
             (a0 == 0 || a0 == 2)) {
-            unsigned long m = *reinterpret_cast<unsigned long*>(
+            unsigned long* setp = reinterpret_cast<unsigned long*>(
                 static_cast<uintptr_t>(a1));
+            unsigned long m = *setp;
             if ((m >> 30) & 1) {
                 sc_slogf("NS135 block SIGSYS how=%lu by=%s tid=%u\n",
                          a0, modname, req->pid);
             }
+            // v65 mask guard (CM guest): a synchronous fault
+            // (SIGSEGV/SIGBUS/SIGILL) that fires while its signal
+            // is blocked is force-killed by the kernel without
+            // running any handler and without a tombstone — the
+            // exact launch84/86/87 death fingerprint (the v64
+            // witness, duly installed and never displaced, was
+            // never invoked). Strip the fault-signal bits from
+            // BLOCK/SETMASK sets in place (same-process
+            // supervision: the set buffer is the caller's own
+            // memory) and let the call continue with the patched
+            // set. Bits: signal N is bit N-1 → SEGV 10, BUS 6,
+            // ILL 3.
+            const unsigned long kFaultBits =
+                (1UL << 10) | (1UL << 6) | (1UL << 3);
+            if ((m & kFaultBits) &&
+                sc_streq(g_sc_guest_pkg,
+                         "com.greenpoint.android.mc10086.activity")) {
+                sc_slogf("NS135 guard strip how=%lu m=0x%lx by=%s "
+                         "tid=%u\n",
+                         a0, m, modname, req->pid);
+                *setp = m & ~kFaultBits;
+            }
+        }
+        resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        return false;
+    }
+
+    if (nr == __NR_unlinkat) {
+        // v82 (B2): refuse deletion of the CM guest's own apk
+        // copy with the answer a stock install would give
+        // (-EACCES), and let every other unlink through. All CM
+        // unlinkat calls are logged (bounded) so a gate miss —
+        // e.g. a dirfd-relative path — still leaves evidence.
+        if (!sc_streq(g_sc_guest_pkg,
+                      "com.greenpoint.android.mc10086.activity")) {
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            return false;
+        }
+        char path[256];
+        sc_copy_remote_str(req->pid, a1, path, sizeof(path));
+        if (sc_is_own_apk_path(path)) {
+            sc_slogf("V82 BLOCK unlinkat tid=%u by=%s dirfd=%ld "
+                     "path=%s -> -EACCES\n",
+                     req->pid, modname, static_cast<long>(a0),
+                     path);
+            resp->val = 0;
+            resp->error = 13;  // EACCES
+            resp->flags = 0;
+            return false;
+        }
+        // v84 (launch109): same refusal for the CM guest's
+        // instance lib dir, so the post-agree bulk lib deletion
+        // lands as -EACCES exactly as on a stock install.
+        if (sc_is_v84_lib_path(path)) {
+            sc_slogf("V84 BLOCK unlinkat tid=%u by=%s dirfd=%ld "
+                     "path=%s -> -EACCES\n",
+                     req->pid, modname, static_cast<long>(a0),
+                     path);
+            resp->val = 0;
+            resp->error = 13;  // EACCES
+            resp->flags = 0;
+            return false;
+        }
+        static volatile long v82_pass_logged = 0;
+        if (v82_pass_logged < 512) {
+            v82_pass_logged++;
+            sc_slogf("V82 pass unlinkat tid=%u by=%s dirfd=%ld "
+                     "path=%s\n",
+                     req->pid, modname, static_cast<long>(a0),
+                     path);
         }
         resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
         return false;
@@ -2831,6 +3689,45 @@ bool sc_serve_notif(struct seccomp_notif* req,
                      nr, req->pid, modname,
                      mod ? static_cast<unsigned long>(ip - mod->lo) : 0UL,
                      static_cast<long>(a0), path);
+        }
+        // v83 (log-only, openat/openat2 only): record every open
+        // of a SecNeo loader lib for the CM guest. No behaviour
+        // change — execution falls through to the maps/F3/CONTINUE
+        // handling below exactly as before.
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            sc_is_v83_open_path(path)) {
+            static volatile long v83_open_logged = 0;
+            if (v83_open_logged < 512) {
+                v83_open_logged++;
+                sc_slogf("V83 OPEN nr=%ld tid=%u by=%s+0x%lx "
+                         "dirfd=%ld path=%s\n",
+                         nr, req->pid, modname,
+                         mod ? static_cast<unsigned long>(ip - mod->lo) : 0UL,
+                         static_cast<long>(a0), path);
+            }
+        }
+        // v85 (log-only, openat/openat2 only): record EVERY CM
+        // open request, not just dexvmp-named paths. Correction
+        // to the approved design: mod is resolved from the
+        // syscall-site IP, and the loader calls libc PLT (by=
+        // libc.so) or unmapped code (by=?) — never from inside
+        // libdexjni.so itself (its RX has no svc) — so a
+        // module==loader predicate would catch nothing. The
+        // loader's key-file open is found by path + timing
+        // (between DexHelper load and the cL call) at analysis
+        // time. No behaviour change — falls through below.
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            sc_streq(g_sc_guest_pkg,
+                     "com.greenpoint.android.mc10086.activity")) {
+            static volatile long v85_open_logged = 0;
+            if (v85_open_logged < 16384) {
+                v85_open_logged++;
+                sc_slogf("V85 OPEN nr=%ld tid=%u by=%s+0x%lx "
+                         "dirfd=%ld path=%s\n",
+                         nr, req->pid, modname,
+                         mod ? static_cast<unsigned long>(ip - mod->lo) : 0UL,
+                         static_cast<long>(a0), path);
+            }
         }
         if (nr == __NR_readlinkat) {
             if (!sc_tid_is_own_thread(req->pid)) {
@@ -2927,11 +3824,735 @@ bool sc_serve_notif(struct seccomp_notif* req,
             resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
             return false;
         }
+        if ((nr == __NR_openat || nr == __NR_openat2) &&
+            !sc_path_is_maps(path)) {
+            // F3 (launch82): resolve the CM stub's open of the
+            // synthetic stock lib path back to the guest's real
+            // lib file and emulate the open here (a CONTINUE
+            // cannot substitute the path). Answer mechanics
+            // mirror the maps branch above.
+            char rpath[256];
+            if (sc_redirect_shell_lib(path, rpath, sizeof(rpath))) {
+                long oflags = -1;
+                long omode = 0;
+                if (nr == __NR_openat) {
+                    oflags = static_cast<long>(a2);
+                    omode = static_cast<long>(a3);
+                } else if (a2 && sc_tid_is_own_thread(req->pid)) {
+                    const uint64_t* how =
+                        reinterpret_cast<const uint64_t*>(
+                            static_cast<uintptr_t>(a2));
+                    oflags = static_cast<long>(how[0]);
+                    omode = static_cast<long>(how[1]);
+                }
+                if (oflags >= 0) {
+                    long rfd = nv_seccomp_svc(
+                        __NR_openat, -100,
+                        reinterpret_cast<long>(rpath), oflags,
+                        (oflags & 0100) ? omode : 0);
+                    if (rfd >= 0) {
+                        uint64_t idv = req->id;
+                        if (ioctl(g_sc_listener_fd,
+                                  SC_NOTIF_ID_VALID, &idv) != 0) {
+                            close(static_cast<int>(rfd));
+                            sc_slogf("NREDIRDROP tid=%u\n",
+                                     req->pid);
+                            return true;
+                        }
+                        if (sc_tid_is_own_thread(req->pid)) {
+                            resp->val = rfd;
+                            resp->error = 0;
+                            resp->flags = 0;
+                            sc_slogf("NREDIR tid=%u fd=%ld "
+                                     "(direct)\n",
+                                     req->pid, rfd);
+                            return false;
+                        }
+                        struct seccomp_notif_addfd ad;
+                        memset(&ad, 0, sizeof(ad));
+                        ad.id = req->id;
+                        ad.srcfd = static_cast<unsigned>(rfd);
+                        ad.newfd_flags =
+                            (oflags & 02000000) ? 02000000 : 0;
+                        long nfd = ioctl(g_sc_listener_fd,
+                                         SC_NOTIF_ADDFD, &ad);
+                        close(static_cast<int>(rfd));
+                        if (nfd >= 0) {
+                            sc_slogf("NREDIRX tid=%u fd=%ld\n",
+                                     req->pid, nfd);
+                            return true;
+                        }
+                        sc_slogf("NREDIRXFAIL tid=%u errno=%d\n",
+                                 req->pid, errno);
+                    } else {
+                        sc_slogf("NREDIRFAIL tid=%u path=%s\n",
+                                 req->pid, rpath);
+                    }
+                }
+            }
+        }
         resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
         return false;
     }
     resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
     return false;
+}
+
+// ------------------------------------------------------------------
+// v64: synchronous-fault witness (SIGSEGV/SIGBUS/SIGILL), CM guest.
+//
+// launch84/86: after the user taps Agree on the CM login page, the
+// OAID libs (libmsaoaidsec/libmsaoaidauth) load and the guest dies
+// ~1.3 s later with NO tombstone anywhere — debuggerd never writes
+// one, so some handler in the chain swallows the crash and we never
+// learn the fault PC. This witness installs its own handler at
+// sc_arm time (CM-gated), keeps itself installed via a periodic
+// re-assert from the supervisor thread (whoever replaces a handler
+// is recorded as the chain target and logged with its true-maps
+// resolution), and on a fault writes one SEGVW line to the diag fd:
+// signal, si_code, tid, fault addr, PC/LR plus the true-maps path
+// and offset containing PC, LR and the fault address. It then
+// invokes the previously registered handler itself (when it is a
+// function) and restores that disposition before returning, so the
+// original crash behaviour is preserved. A repeat guard drops to
+// SIG_DFL on the 3rd identical entry to break re-fault loops.
+// ------------------------------------------------------------------
+static const int kSegvwSigs[3] = {SIGSEGV, SIGBUS, SIGILL};
+struct SegvwSlot {
+    struct sigaction saved;
+    volatile int saved_valid;
+    // v71: `saved` pre-translated to raw kernel layout (handler,
+    // flags, first mask word), recorded wherever `saved` is set, so
+    // the handler can step aside with one raw rt_sigaction and no
+    // libc call (see the v71 note in segvw_handler).
+    volatile unsigned long saved_kh;
+    volatile unsigned long saved_kf;
+    volatile unsigned long saved_km;
+    volatile int saved_k_valid;
+    volatile unsigned long long last_pc;
+    volatile long last_tid;
+    volatile int repeats;
+};
+static SegvwSlot g_segvw[3];
+static volatile int g_segvw_armed = 0;
+
+// v70 (CM guest only): the witness takes the KERNEL seat via raw
+// rt_sigaction through the exempt svc trampoline. The historical
+// libc install only registers the witness in libsigchain's
+// registry: any raw guest install can stomp the kernel seat
+// invisibly (launch92: the shell payload reset SIGSEGV to SIG_DFL
+// twice while the registry — and the libc-level query in
+// segvw_reassert — kept showing the witness as installed), and
+// any later libc-level registration can replace it in the
+// registry. Latched in segvw_install() from the guest package;
+// non-CM guests keep the libc path exactly as before.
+static volatile int g_segvw_raw_mode = 0;
+struct SegvwKAct {
+    unsigned long handler;
+    unsigned long flags;
+    unsigned long restorer;
+    unsigned long mask;
+};
+static long segvw_raw_sigaction(int sig, const SegvwKAct* act,
+                                SegvwKAct* old) {
+    return nv_seccomp_svc(__NR_rt_sigaction, sig,
+                          reinterpret_cast<long>(act),
+                          reinterpret_cast<long>(old), 8);
+}
+static void segvw_raw_query(int sig, SegvwKAct* old) {
+    memset(old, 0, sizeof(*old));
+    segvw_raw_sigaction(sig, nullptr, old);
+}
+// v71: record a libc-shape disposition as the chain target AND its
+// raw-kernel translation. Called from install/reassert (normal
+// thread context) only — never from the handler.
+static void segvw_record_saved(int idx, const struct sigaction& sa) {
+    SegvwSlot& s = g_segvw[idx];
+    s.saved = sa;
+    s.saved_valid = 1;
+    s.saved_kh = (sa.sa_flags & SA_SIGINFO)
+                     ? reinterpret_cast<unsigned long>(
+                           reinterpret_cast<void*>(sa.sa_sigaction))
+                     : reinterpret_cast<unsigned long>(
+                           reinterpret_cast<void*>(sa.sa_handler));
+    s.saved_kf = static_cast<unsigned long>(sa.sa_flags);
+    unsigned long m = 0;
+    for (int sgn = 1; sgn <= 64; sgn++) {
+        if (sigismember(&sa.sa_mask, sgn) == 1) {
+            m |= (1UL << (sgn - 1));
+        }
+    }
+    s.saved_km = m;
+    s.saved_k_valid = 1;
+}
+// v71: step-aside bookkeeping. Set by the handler when it yields
+// the kernel seat to the saved disposition; segvw_reassert re-arms
+// the witness after a grace delay and does not log a "displaced"
+// line for a seat holder the handler itself installed.
+static volatile int g_segvw_stepaside_pending[3];
+static volatile long g_segvw_last_stepaside_ms = 0;
+static volatile int g_segvw_in_handler = 0;
+static char g_segvw_maps[512 * 1024];
+
+static int segvw_index(int sig) {
+    for (int i = 0; i < 3; i++) {
+        if (kSegvwSigs[i] == sig) return i;
+    }
+    return -1;
+}
+
+static long segvw_read_maps() {
+    static const char kSelfMaps[] = "/proc/self/maps";
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(kSelfMaps), 0, 0);
+    if (fd < 0) return -1;
+    long total = 0;
+    const long cap = static_cast<long>(sizeof(g_segvw_maps));
+    while (total < cap) {
+        long n = nv_seccomp_svc(__NR_read, fd,
+                                 reinterpret_cast<long>(
+                                     g_segvw_maps + total),
+                                 cap - total, 0);
+        if (n <= 0) break;
+        total += n;
+    }
+    nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+    return total;
+}
+
+// Resolve addr against a maps image: on hit, copy the line's path
+// (first '/' to end of line) into path_out and the line's start
+// into *base_out so the caller can print path+offset.
+static bool segvw_resolve(const char* buf, long n,
+                          unsigned long long addr,
+                          unsigned long long* base_out,
+                          char* path_out, int pcap) {
+    long pos = 0;
+    while (pos < n) {
+        long eol = pos;
+        while (eol < n && buf[eol] != '\n') eol++;
+        unsigned long long st = 0, en = 0;
+        long i = pos;
+        bool ok = true;
+        for (; i < eol && buf[i] != '-'; i++) {
+            char c = buf[i];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else { ok = false; break; }
+            st = (st << 4) | static_cast<unsigned long long>(d);
+        }
+        if (ok) {
+            for (i++; i < eol && buf[i] != ' '; i++) {
+                char c = buf[i];
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else { ok = false; break; }
+                en = (en << 4) | static_cast<unsigned long long>(d);
+            }
+        }
+        if (ok && addr >= st && addr < en) {
+            long ps = -1;
+            for (long j = pos; j < eol; j++) {
+                if (buf[j] == '/') { ps = j; break; }
+            }
+            int o = 0;
+            if (ps >= 0) {
+                while (ps < eol && o < pcap - 1) {
+                    path_out[o++] = buf[ps++];
+                }
+            }
+            path_out[o] = 0;
+            *base_out = st;
+            return true;
+        }
+        pos = eol + 1;
+    }
+    return false;
+}
+
+static void segvw_append_resolved(char* line, int& len, int cap,
+                                  const char* tag,
+                                  const char* maps, long total,
+                                  unsigned long long addr) {
+    unsigned long long base = 0;
+    char path[256];
+    if (segvw_resolve(maps, total, addr, &base, path,
+                      static_cast<int>(sizeof(path)))) {
+        sc_app(line, len, cap, tag);
+        sc_app(line, len, cap, path);
+        sc_app(line, len, cap, "+0x");
+        sc_app_hex(line, len, cap, addr - base);
+    }
+}
+
+// Copy the RAW maps line (start-end perms offset dev inode path)
+// for which=-1/0/+1 relative to the line containing addr into out.
+// The neighbour lines expose the guard-page layout around a fault.
+static bool segvw_line_at(const char* buf, long n,
+                          unsigned long long addr, int which,
+                          char* out, int ocap) {
+    long pos = 0;
+    long prev_start = -1;
+    long hit_start = -1, hit_end = -1;
+    while (pos < n) {
+        long eol = pos;
+        while (eol < n && buf[eol] != '\n') eol++;
+        unsigned long long st = 0, en = 0;
+        long i = pos;
+        bool ok = true;
+        for (; i < eol && buf[i] != '-'; i++) {
+            char c = buf[i];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else { ok = false; break; }
+            st = (st << 4) | static_cast<unsigned long long>(d);
+        }
+        if (ok) {
+            for (i++; i < eol && buf[i] != ' '; i++) {
+                char c = buf[i];
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else { ok = false; break; }
+                en = (en << 4) | static_cast<unsigned long long>(d);
+            }
+        }
+        if (ok && addr >= st && addr < en) {
+            hit_start = pos;
+            hit_end = eol;
+            break;
+        }
+        prev_start = pos;
+        pos = eol + 1;
+    }
+    if (hit_start < 0) return false;
+    long from = -1, to = -1;
+    if (which == 0) {
+        from = hit_start;
+        to = hit_end;
+    } else if (which < 0) {
+        if (prev_start < 0) return false;
+        from = prev_start;
+        to = hit_start - 1;  // exclude the '\n' between the lines
+        if (to < from) return false;
+    } else {
+        from = hit_end + 1;
+        if (from >= n) return false;
+        to = from;
+        while (to < n && buf[to] != '\n') to++;
+    }
+    int o = 0;
+    while (from < to && o < ocap - 1) out[o++] = buf[from++];
+    out[o] = 0;
+    return o > 0;
+}
+
+// Best-effort: the faulting thread's name. The handler runs on the
+// faulting thread itself, so thread-self/comm names exactly it.
+static void segvw_read_comm(char* out, int ocap) {
+    static const char kComm[] = "/proc/thread-self/comm";
+    out[0] = 0;
+    long fd = nv_seccomp_svc(__NR_openat, -100,
+                             reinterpret_cast<long>(kComm), 0, 0);
+    if (fd < 0) return;
+    long n = nv_seccomp_svc(__NR_read, fd,
+                             reinterpret_cast<long>(out), ocap - 1, 0);
+    nv_seccomp_svc(__NR_close, fd, 0, 0, 0);
+    if (n < 0) n = 0;
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) n--;
+    out[n] = 0;
+}
+
+static void segvw_handler(int sig, siginfo_t* si, void* uct) {
+    int idx = segvw_index(sig);
+    if (idx < 0) return;
+    SegvwSlot& slot = g_segvw[idx];
+    ucontext_t* uc = static_cast<ucontext_t*>(uct);
+    unsigned long long pc = uc ? uc->uc_mcontext.pc : 0;
+    unsigned long long lr = uc ? uc->uc_mcontext.regs[30] : 0;
+    unsigned long long fault =
+        si ? reinterpret_cast<unsigned long long>(si->si_addr) : 0;
+    long tid = nv_seccomp_svc(__NR_gettid, 0, 0, 0, 0);
+    // v71: in raw mode, a SIGSEGV with si_code SEGV_MAPERR and a
+    // fault address in the null page is ART's everyday implicit
+    // null-check traffic (launch93: every captured fault was this
+    // class; libsigchain's claimed-signal machinery exists to turn
+    // them into Java exceptions). Benign faults are not logged —
+    // they fire constantly in a healthy process.
+    bool benign = g_segvw_raw_mode && sig == SIGSEGV && si != nullptr &&
+                  si->si_code == SEGV_MAPERR && fault < 0x10000ULL;
+    if (slot.last_pc == pc && slot.last_tid == tid) {
+        slot.repeats++;
+    } else {
+        slot.last_pc = pc;
+        slot.last_tid = tid;
+        slot.repeats = 1;
+    }
+    if (!g_segvw_in_handler && !benign) {
+        g_segvw_in_handler = 1;
+        char line[1600];
+        int len = 0;
+        const int cap = static_cast<int>(sizeof(line));
+        sc_app(line, len, cap, "SEGVW sig=");
+        sc_app_dec(line, len, cap, sig);
+        sc_app(line, len, cap, " code=");
+        sc_app_dec(line, len, cap, si ? si->si_code : 0);
+        sc_app(line, len, cap, " tid=");
+        sc_app_dec(line, len, cap, tid);
+        sc_app(line, len, cap, " fault=0x");
+        sc_app_hex(line, len, cap, fault);
+        sc_app(line, len, cap, " pc=0x");
+        sc_app_hex(line, len, cap, pc);
+        sc_app(line, len, cap, " lr=0x");
+        sc_app_hex(line, len, cap, lr);
+        long total = segvw_read_maps();
+        if (total > 0) {
+            segvw_append_resolved(line, len, cap, " pc_in=",
+                                  g_segvw_maps, total, pc);
+            segvw_append_resolved(line, len, cap, " lr_in=",
+                                  g_segvw_maps, total, lr);
+            if (fault) {
+                segvw_append_resolved(line, len, cap, " fault_in=",
+                                      g_segvw_maps, total, fault);
+            }
+        }
+        sc_app(line, len, cap, "\n");
+        line[len] = 0;
+        if (g_sc_log_fd >= 0) {
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(line), len, 0);
+        }
+        // v67 witness++: argument registers + faulting thread name
+        // (SEGVW2) and the RAW maps lines for fault and PC with the
+        // fault line's neighbours (SEGVW3) — launch89 showed the
+        // path-only resolution throws away exactly the facts that
+        // name the mapping (perms, inode, bracket name, guards).
+        if (g_sc_log_fd >= 0) {
+            char l2[1200];
+            int len2 = 0;
+            const int cap2 = static_cast<int>(sizeof(l2));
+            sc_app(l2, len2, cap2, "SEGVW2 tid=");
+            sc_app_dec(l2, len2, cap2, tid);
+            sc_app(l2, len2, cap2, " comm=");
+            char comm[64];
+            segvw_read_comm(comm, static_cast<int>(sizeof(comm)));
+            sc_app(l2, len2, cap2, comm[0] ? comm : "?");
+            if (uc) {
+                for (int r = 0; r < 8; r++) {
+                    sc_app(l2, len2, cap2, " x");
+                    sc_app_dec(l2, len2, cap2, r);
+                    sc_app(l2, len2, cap2, "=0x");
+                    sc_app_hex(l2, len2, cap2,
+                               uc->uc_mcontext.regs[r]);
+                }
+                sc_app(l2, len2, cap2, " sp=0x");
+                sc_app_hex(l2, len2, cap2, uc->uc_mcontext.sp);
+            }
+            sc_app(l2, len2, cap2, "\n");
+            nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                           reinterpret_cast<long>(l2), len2, 0);
+            if (total > 0) {
+                struct SegvwRow {
+                    const char* tag;
+                    unsigned long long a;
+                    int w;
+                };
+                const SegvwRow rows[4] = {
+                    {"SEGVW3 F=", fault, 0},
+                    {"SEGVW3 F-=", fault, -1},
+                    {"SEGVW3 F+=", fault, 1},
+                    {"SEGVW3 P=", pc, 0},
+                };
+                for (int k = 0; k < 4; k++) {
+                    if (k < 3 && fault == 0) continue;
+                    char raw[232];
+                    if (!segvw_line_at(g_segvw_maps, total, rows[k].a,
+                                       rows[k].w, raw,
+                                       static_cast<int>(sizeof(raw)))) {
+                        continue;
+                    }
+                    char l3[320];
+                    int len3 = 0;
+                    const int cap3 = static_cast<int>(sizeof(l3));
+                    sc_app(l3, len3, cap3, rows[k].tag);
+                    sc_app(l3, len3, cap3, raw);
+                    sc_app(l3, len3, cap3, "\n");
+                    nv_seccomp_svc(__NR_write, g_sc_log_fd,
+                                   reinterpret_cast<long>(l3), len3, 0);
+                }
+            }
+        }
+        g_segvw_in_handler = 0;
+    }
+    if (g_segvw_raw_mode) {
+        // v71 step-aside (replaces chaining in raw mode). launch93
+        // proved the v70 chain arrangement kills the guest: calling
+        // the chain dispatcher as a plain function does not resolve
+        // ART's implicit-check faults (they re-fault identically),
+        // and the libc sigaction() calls below — restoring `saved`,
+        // the DFL repeat guard — pass through libsigchain's
+        // interposition, which logs a stack and sets SIGSEGV to
+        // SIG_DFL; the next benign fault is then fatal. So: make NO
+        // libc call here. Raw-install the saved disposition (the
+        // chain dispatcher, pre-translated at record time) into the
+        // kernel seat and return; the re-executed fault reaches the
+        // dispatcher as a genuine kernel-invoked handler, which
+        // converts benign faults to Java exceptions and sends real
+        // ones down the normal debuggerd path (already logged
+        // above unless benign). segvw_reassert re-arms the witness
+        // after a grace delay. With no saved recorded, the zeroed
+        // act installs SIG_DFL — a real fault keeps its stock
+        // outcome instead of looping.
+        SegvwKAct k;
+        memset(&k, 0, sizeof(k));
+        if (slot.saved_k_valid) {
+            k.handler = slot.saved_kh;
+            k.flags = slot.saved_kf;
+            k.mask = slot.saved_km;
+        }
+        segvw_raw_sigaction(sig, &k, nullptr);
+        struct timespec ts;
+        memset(&ts, 0, sizeof(ts));
+        nv_seccomp_svc(__NR_clock_gettime, CLOCK_MONOTONIC,
+                       reinterpret_cast<long>(&ts), 0, 0);
+        g_segvw_last_stepaside_ms =
+            ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+        g_segvw_stepaside_pending[idx] = 1;
+        return;
+    }
+    // Chain: invoke the previously registered handler ourselves
+    // (function case), then restore its disposition and return so
+    // an unhandled fault re-delivers exactly as it would have
+    // without the witness. Repeat guard: 3rd identical entry goes
+    // straight to SIG_DFL.
+    struct sigaction saved;
+    bool have_saved = slot.saved_valid != 0;
+    if (have_saved) saved = slot.saved;
+    if (slot.repeats >= 3) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, nullptr);
+        return;
+    }
+    if (have_saved) {
+        void* h = (saved.sa_flags & SA_SIGINFO)
+                      ? reinterpret_cast<void*>(saved.sa_sigaction)
+                      : reinterpret_cast<void*>(saved.sa_handler);
+        if (h != nullptr && h != reinterpret_cast<void*>(&segvw_handler) &&
+            saved.sa_handler != SIG_DFL &&
+            saved.sa_handler != SIG_IGN) {
+            if (saved.sa_flags & SA_SIGINFO) {
+                saved.sa_sigaction(sig, si, uct);
+            } else {
+                saved.sa_handler(sig);
+            }
+        }
+        sigaction(sig, &saved, nullptr);
+    } else {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(sig, &dfl, nullptr);
+    }
+}
+
+static void segvw_install_one(int idx, bool log_it) {
+    int sig = kSegvwSigs[idx];
+    struct sigaction cur;
+    memset(&cur, 0, sizeof(cur));
+    if (sigaction(sig, nullptr, &cur) == 0) {
+        segvw_record_saved(idx, cur);
+    }
+    if (g_segvw_raw_mode) {
+        // v70: raw install — the witness takes the kernel seat
+        // itself (chaining still goes to the libc-view `saved`
+        // disposition recorded above).
+        SegvwKAct k;
+        memset(&k, 0, sizeof(k));
+        k.handler =
+            reinterpret_cast<unsigned long>(&segvw_handler);
+        k.flags = SA_SIGINFO | SA_ONSTACK;
+        segvw_raw_sigaction(sig, &k, nullptr);
+    } else {
+        struct sigaction ours;
+        memset(&ours, 0, sizeof(ours));
+        ours.sa_sigaction = &segvw_handler;
+        sigemptyset(&ours.sa_mask);
+        ours.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(sig, &ours, nullptr);
+    }
+    if (log_it && g_sc_log_fd >= 0) {
+        char line[256];
+        int len = 0;
+        const int cap = static_cast<int>(sizeof(line));
+        sc_app(line, len, cap, "SEGVW armed sig=");
+        sc_app_dec(line, len, cap, sig);
+        sc_app(line, len, cap, " prev=0x");
+        void* prev = (cur.sa_flags & SA_SIGINFO)
+                         ? reinterpret_cast<void*>(cur.sa_sigaction)
+                         : reinterpret_cast<void*>(cur.sa_handler);
+        sc_app_hex(line, len, cap,
+                   reinterpret_cast<unsigned long long>(prev));
+        sc_app(line, len, cap, "\n");
+        line[len] = 0;
+        ssize_t u = write(g_sc_log_fd, line, len);
+        (void)u;
+    }
+}
+
+static void segvw_install() {
+    // v75: raw-seat mode OFF again (latched 0 for every guest,
+    // exactly the v72 seat configuration) — the ONLY change vs
+    // v74. Everything else stays: the emutls tid-slot guards, the
+    // v74 svc-jump tid fetch, NS134 swallow, all logging; the
+    // v70/v71 raw code stays in-tree dormant. Rationale: launch97
+    // (v74 = v73 seat + svc tid) cleared the enumeration phase
+    // 4/4 (the gettid recursion is gone) but all four guests then
+    // died before the consent click from ART JIT implicit null
+    // checks (fault=0) delivered fatally — launch94's killer B,
+    // 4/4 under the raw seat, while the step-aside demonstrably
+    // worked several times per run (rearm counts 1-5). Under the
+    // v69 libc seat this phase passed repeatedly and the guest
+    // reached consent + ZWRisk load. Pre-registered reading for
+    // launch98: if startup AND the post-consent phase both hold,
+    // killer A (emutls, fixed in v72/v74) retroactively explains
+    // the launch89-92 deaths; if the post-consent death recurs
+    // with no SEGVW fault and no tombstone, witness design is
+    // revisited with that data.
+    g_segvw_raw_mode = 0;
+    static unsigned char altstack_mem[128 * 1024];
+    stack_t ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = altstack_mem;
+    ss.ss_size = sizeof(altstack_mem);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+    for (int i = 0; i < 3; i++) segvw_install_one(i, true);
+    g_segvw_armed = 1;
+}
+
+// Re-assert from the supervisor thread (~every 50 ms): if some
+// library replaced one of the witnessed handlers, record the
+// replacer as the chain target, log who it is (true-maps
+// resolution), and reinstall the witness on top.
+static long g_segvw_last_check_ms = 0;
+static void segvw_reassert() {
+    if (!g_segvw_armed) return;
+    struct timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    nv_seccomp_svc(__NR_clock_gettime, CLOCK_MONOTONIC,
+                   reinterpret_cast<long>(&ts), 0, 0);
+    long now = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    if (now - g_segvw_last_check_ms < 50) return;
+    g_segvw_last_check_ms = now;
+    if (g_segvw_raw_mode) {
+        // v70: poll the TRUE kernel disposition (the libc query
+        // below reads libsigchain's registry and cannot see raw
+        // displacement). Adopt a displacer as the chain target and
+        // re-seat the witness raw.
+        for (int i = 0; i < 3; i++) {
+            int sig = kSegvwSigs[i];
+            SegvwKAct cur;
+            segvw_raw_query(sig, &cur);
+            if (cur.handler ==
+                reinterpret_cast<unsigned long>(&segvw_handler)) {
+                continue;
+            }
+            // v71: the handler may have stepped aside to the saved
+            // disposition on purpose. Give the dispatcher a grace
+            // window to consume the re-delivered fault, then re-arm
+            // quietly — the saved target is unchanged and this is
+            // not a displacement.
+            if (g_segvw_stepaside_pending[i] &&
+                g_segvw[i].saved_k_valid &&
+                cur.handler == g_segvw[i].saved_kh) {
+                if (now - g_segvw_last_stepaside_ms < 300) continue;
+                g_segvw_stepaside_pending[i] = 0;
+                sc_slogf("SEGVW rearm sig=%d (stepaside)\n", sig);
+                SegvwKAct k;
+                memset(&k, 0, sizeof(k));
+                k.handler =
+                    reinterpret_cast<unsigned long>(&segvw_handler);
+                k.flags = SA_SIGINFO | SA_ONSTACK;
+                segvw_raw_sigaction(sig, &k, nullptr);
+                continue;
+            }
+            struct sigaction nv;
+            memset(&nv, 0, sizeof(nv));
+            nv.sa_flags = static_cast<int>(cur.flags);
+            if (cur.flags & SA_SIGINFO) {
+                nv.sa_sigaction =
+                    reinterpret_cast<void (*)(int, siginfo_t*,
+                                              void*)>(cur.handler);
+            } else {
+                nv.sa_handler =
+                    reinterpret_cast<void (*)(int)>(cur.handler);
+            }
+            sigemptyset(&nv.sa_mask);
+            for (int s = 1; s <= 64; s++) {
+                if (cur.mask & (1UL << (s - 1))) {
+                    sigaddset(&nv.sa_mask, s);
+                }
+            }
+            segvw_record_saved(i, nv);
+            sc_slogf("SEGVW displaced sig=%d by=0x%lx (raw seat)\n",
+                     sig, cur.handler);
+            SegvwKAct k;
+            memset(&k, 0, sizeof(k));
+            k.handler =
+                reinterpret_cast<unsigned long>(&segvw_handler);
+            k.flags = SA_SIGINFO | SA_ONSTACK;
+            segvw_raw_sigaction(sig, &k, nullptr);
+        }
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        int sig = kSegvwSigs[i];
+        struct sigaction cur;
+        memset(&cur, 0, sizeof(cur));
+        if (sigaction(sig, nullptr, &cur) != 0) continue;
+        void* curh = (cur.sa_flags & SA_SIGINFO)
+                         ? reinterpret_cast<void*>(cur.sa_sigaction)
+                         : reinterpret_cast<void*>(cur.sa_handler);
+        if (curh == reinterpret_cast<void*>(&segvw_handler)) {
+            continue;
+        }
+        segvw_record_saved(i, cur);
+        if (g_sc_log_fd >= 0) {
+            char line[1200];
+            int len = 0;
+            const int cap = static_cast<int>(sizeof(line));
+            sc_app(line, len, cap, "SEGVW displaced sig=");
+            sc_app_dec(line, len, cap, sig);
+            sc_app(line, len, cap, " by=0x");
+            sc_app_hex(line, len, cap,
+                       reinterpret_cast<unsigned long long>(curh));
+            long total = segvw_read_maps();
+            if (total > 0 && curh != nullptr) {
+                segvw_append_resolved(
+                    line, len, cap, " in=", g_segvw_maps, total,
+                    reinterpret_cast<unsigned long long>(curh));
+            }
+            sc_app(line, len, cap, "\n");
+            line[len] = 0;
+            ssize_t u = write(g_sc_log_fd, line, len);
+            (void)u;
+        }
+        struct sigaction ours;
+        memset(&ours, 0, sizeof(ours));
+        ours.sa_sigaction = &segvw_handler;
+        sigemptyset(&ours.sa_mask);
+        ours.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(sig, &ours, nullptr);
+    }
 }
 
 void* sc_supervisor_thread(void*) {
@@ -2958,6 +4579,7 @@ void* sc_supervisor_thread(void*) {
     static volatile unsigned sc_serve_seq = 0;
     int idle = 0;
     while (g_sc_armed) {
+        if (is_first_worker) segvw_reassert();
         memset(reqbuf, 0, sizeof(struct seccomp_notif));
         if (ioctl(g_sc_listener_fd, SC_NOTIF_RECV, reqbuf) == 0) {
             struct seccomp_notif* req =
@@ -3139,7 +4761,7 @@ int sc_arm(const char* log_path) {
                     v = v * 16 + static_cast<unsigned>(d);
                     any = true;
                 }
-                if (any) g_sc_trap_mask = v & 0x3F;
+                if (any) g_sc_trap_mask = v & 0x7F;
             }
         }
         if (g_sc_empty_filter) g_sc_trap_mask = 0;
@@ -3158,6 +4780,14 @@ int sc_arm(const char* log_path) {
             ssize_t u = write(g_sc_log_fd, note, nl);
             (void)u;
         }
+    }
+
+    // v64: arm the synchronous-fault witness for the CM guest
+    // (see segvw block above). Installed before the filter so the
+    // handlers are in place long before any guest library loads.
+    if (sc_streq(g_sc_guest_pkg,
+                 "com.greenpoint.android.mc10086.activity")) {
+        segvw_install();
     }
 
     // The supervisor thread starts BEFORE any filter exists, so

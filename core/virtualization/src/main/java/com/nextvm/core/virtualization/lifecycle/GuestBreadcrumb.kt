@@ -19,7 +19,7 @@ import java.io.StringWriter
  *      FPSDK collection, ...), invisible without an ordered event log.
  *
  * GuestBreadcrumb is an ordered, timestamped, file-persisted event
- * log for ONE guest bind (unicom only). Events are buffered in memory
+ * log for ONE guest bind (all guests since v52). Events are buffered in memory
  * until the guest files dir is known (attachFile, called right after
  * the guest Application exists), then flushed and appended to
  * breadcrumb-<pid>.log next to the stackdump/hijacktrace files.
@@ -39,16 +39,39 @@ object GuestBreadcrumb {
     private val lock = Any()
     private val buffer = ArrayList<String>()
 
-    /** Begin a breadcrumb session for [packageName] (unicom only). */
+    /**
+     * Begin a breadcrumb session for [packageName].
+     *
+     * v52: the session used to be unicom-only, which left every other
+     * guest's bind completely witness-free (China Mobile's failed bind
+     * produced no file at all). It now covers all guests. The call is
+     * idempotent within a process: the launch hook begins the session
+     * BEFORE its LoadedApk surgery and bindApplication calls begin()
+     * again on entry — the second call must not wipe the buffer or
+     * detach the already-attached file mid-flight.
+     */
     fun begin(packageName: String) {
-        if (packageName != "com.sinovatech.unicom.ui") return
+        var alreadyActive = false
         synchronized(lock) {
-            active = true
-            t0 = System.nanoTime()
-            buffer.clear()
-            file = null
+            if (active) {
+                alreadyActive = true
+            } else {
+                active = true
+                t0 = System.nanoTime()
+                buffer.clear()
+                file = null
+            }
         }
-        log("breadcrumb begin pkg=$packageName pid=" + android.os.Process.myPid())
+        if (alreadyActive) {
+            log("breadcrumb begin (already active, kept) pkg=$packageName")
+        } else {
+            // v76: anchor the relative [+ms] timeline to wall clock so
+            // breadcrumb events can be ordered against logcat and the
+            // startactivity trace (both wall-clock). Breadcrumb lines
+            // themselves keep the relative format.
+            log("breadcrumb begin pkg=$packageName pid=" + android.os.Process.myPid() +
+                " wall=" + System.currentTimeMillis())
+        }
     }
 
     /** Point the log at the guest files dir; flush buffered events. */

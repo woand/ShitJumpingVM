@@ -333,7 +333,9 @@ class ActivityBinderWrap private constructor(
             trace("intercept failed <" + t.javaClass.simpleName + "> " +
                 t.message + " — forwarding original")
             data.setDataPosition(0)
-            real.transact(code, data, reply, flags)
+            val ok = real.transact(code, data, reply, flags)
+            traceStartResult(reply, "fallback-original")
+            ok
         }
     }
 
@@ -376,7 +378,9 @@ class ActivityBinderWrap private constructor(
 
         if (intent == null) {
             data.setDataPosition(0)
-            return real.transact(code, data, reply, flags)
+            val ok = real.transact(code, data, reply, flags)
+            traceStartResult(reply, "null-intent")
+            return ok
         }
         val proxy = ActivityManagerProxy.activeInstance
         val rewritten = proxy?.rewriteGuestStartIntent(intent)
@@ -387,11 +391,42 @@ class ActivityBinderWrap private constructor(
                     " apps=[" + (proxy?.debugVirtualAppKeys() ?: "-") + "]"
             )
             data.setDataPosition(0)
-            return real.transact(code, data, reply, flags)
+            val ok = real.transact(code, data, reply, flags)
+            traceStartResult(reply, "not-rewritten cmp=" + intent.component)
+            return ok
+        }
+        // v78: launch101 measured origFlags=0x10000000 — NEW_TASK
+        // only, no SINGLE_TOP/CLEAR_TOP — yet AMS still returned
+        // START_DELIVERED_TO_TOP. Corrected hypothesis: the fold is
+        // NEW_TASK task-root reuse (re-starting the running task's
+        // root component with NEW_TASK delivers the intent to the
+        // existing root instance instead of stacking a record). When
+        // this start comes from an activity context (resultTo is the
+        // caller's activity token), clearing NEW_TASK on the
+        // rewritten copy makes AMS treat it as an ordinary in-task
+        // start and create the record. Starts with no activity
+        // context (services/receivers) keep NEW_TASK: AMS demands it
+        // there and there is no source task to stack onto anyway.
+        val ntCleared = if (resultTo != null &&
+            (rewritten.flags and Intent.FLAG_ACTIVITY_NEW_TASK) != 0
+        ) {
+            rewritten.flags =
+                rewritten.flags and Intent.FLAG_ACTIVITY_NEW_TASK.inv()
+            true
+        } else {
+            false
         }
         trace(
             "start REWRITTEN: " + intent.component + " -> " +
                 rewritten.component + " callingPkg=" + callingPackage +
+                // v77: record the guest intent's original flags before
+                // the rewrite clears SINGLE_TOP/CLEAR_TOP on the copy
+                // (launch100 inferred those flags from the
+                // DELIVERED_TO_TOP result but never saw them directly).
+                " origFlags=0x" + Integer.toHexString(intent.flags) +
+                // v78: discriminator state for the NEW_TASK clearing.
+                " resultTo=" + (resultTo != null) +
+                " ntCleared=" + ntCleared +
                 " instance=" + rewritten.getStringExtra(
                     VirtualIntentExtras.INSTANCE_ID
                 ) + " slot=" + rewritten.getIntExtra(
@@ -413,9 +448,47 @@ class ActivityBinderWrap private constructor(
             out.writeTypedObject(profilerInfo as? android.os.Parcelable, 0)
             out.writeTypedObject(options, 0)
             if (asUser) out.writeTypedObject(userHandle, 0)
-            return real.transact(code, out, reply, flags)
+            val ok = real.transact(code, out, reply, flags)
+            traceStartResult(reply, "rewritten->" + rewritten.component)
+            return ok
         } finally {
             out.recycle()
+        }
+    }
+
+    /**
+     * v76: read the startActivity result out of the reply parcel
+     * (AIDL order: exception header, then the int result —
+     * ActivityManager.START_SUCCESS=100, START_TASK_TO_FRONT=2,
+     * START_DELIVERED_TO_TOP=3, negative/96..99 are failures).
+     * launch99 left the guest's AppTab start unaccounted for: the
+     * rewrite was witnessed but neither an AMS refusal nor a
+     * delivery ever surfaced. The reply code is the one witness
+     * that separates "AMS rejected it" from "AMS accepted it and
+     * the delivery vanished". Best-effort: the parcel position is
+     * restored and any parse failure is itself traced, never thrown.
+     */
+    private fun traceStartResult(reply: Parcel?, label: String) {
+        if (reply == null) {
+            trace("start RESULT <no reply parcel> " + label)
+            return
+        }
+        val saved = reply.dataPosition()
+        try {
+            reply.setDataPosition(0)
+            reply.readException()
+            val result = reply.readInt()
+            trace("start RESULT code=" + result + " " + label)
+        } catch (t: Throwable) {
+            trace(
+                "start RESULT <unparseable: " +
+                    t.javaClass.simpleName + "> " + label
+            )
+        } finally {
+            try {
+                reply.setDataPosition(saved)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -430,8 +503,13 @@ class ActivityBinderWrap private constructor(
                     android.os.Process.myPid() + ".log"
             )
             synchronized(traceLock) {
+                // v76: wall-clock prefix on every trace line. launch99's
+                // file had no timestamps at all, so the one witnessed
+                // start could not be ordered against the logcat Risk
+                // lines (same wall clock) or the delivery records.
                 f.appendText(
-                    "binderwrap[" + serviceName + "]: " + msg + "\n"
+                    "[t=" + System.currentTimeMillis() + "] " +
+                        "binderwrap[" + serviceName + "]: " + msg + "\n"
                 )
             }
         } catch (t: Throwable) {

@@ -13,6 +13,7 @@ import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
 import com.nextvm.core.common.findMethod
 import com.nextvm.core.common.runSafe
+import com.nextvm.core.hook.NativeHookBridge
 import timber.log.Timber
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -159,7 +160,7 @@ class VirtualApplicationManager @Inject constructor() {
                     GuestBreadcrumb.attachFile(fwApp.filesDir)
                     registerBreadcrumbCallbacks(fwApp)
                     GuestBreadcrumb.log("bind complete (framework path)")
-                    scheduleGuestStackDumps()
+                    scheduleGuestStackDumps(packageName)
                     scheduleHijackTrace(packageName)
                     DexMemDump.schedule(packageName, fwApp.filesDir)
                     StateProbe.schedule(packageName, fwApp.filesDir)
@@ -245,7 +246,7 @@ class VirtualApplicationManager @Inject constructor() {
             GuestBreadcrumb.attachFile(application.filesDir)
             registerBreadcrumbCallbacks(application)
             GuestBreadcrumb.log("bind complete (legacy path)")
-            scheduleGuestStackDumps()
+            scheduleGuestStackDumps(packageName)
             scheduleHijackTrace(packageName)
             DexMemDump.schedule(packageName, application.filesDir)
             StateProbe.schedule(packageName, application.filesDir)
@@ -312,9 +313,14 @@ class VirtualApplicationManager @Inject constructor() {
 
     @Volatile private var stackDumpsScheduled = false
 
-    private fun scheduleGuestStackDumps() {
+    // v68: which guest the scheduled dumps belong to (drives the
+    // late-marks extension inside the dumper thread).
+    @Volatile private var stackDumpPackageName: String? = null
+
+    private fun scheduleGuestStackDumps(packageName: String) {
         if (stackDumpsScheduled) return
         stackDumpsScheduled = true
+        stackDumpPackageName = packageName
         Thread {
             try {
                 val hostApp = Class.forName("android.app.ActivityThread")
@@ -329,7 +335,7 @@ class VirtualApplicationManager @Inject constructor() {
                 // ~+0.45s), so sample densely across bind+0.3..+3s
                 // to catch threads mid-flight at the stall moment;
                 // +8s/+20s remain as steady-state anchors.
-                val marks = listOf(
+                val baseMarks = listOf(
                     300L to "t+0.3s",
                     700L to "t+0.7s",
                     1_200L to "t+1.2s",
@@ -338,6 +344,23 @@ class VirtualApplicationManager @Inject constructor() {
                     8_000L to "t+8s",
                     20_000L to "t+20s"
                 )
+                // v68: China Mobile's post-Agree stall sits INSIDE
+                // ZWRisk.setup's native enumeration (launch90: main
+                // RUNNABLE in Feinnhap.v at both t+8s and t+20s,
+                // hundreds of supervisor-served readlinkat/fstatat
+                // calls). Late marks answer the one open question —
+                // guest-slow-but-finite vs never-returns — and show
+                // what main does if setup ever completes.
+                val marks = if (stackDumpPackageName ==
+                    "com.greenpoint.android.mc10086.activity") {
+                    baseMarks + listOf(
+                        40_000L to "t+40s",
+                        80_000L to "t+80s",
+                        160_000L to "t+160s"
+                    )
+                } else {
+                    baseMarks
+                }
                 var elapsed = 0L
                 for ((at, label) in marks) {
                     val wait = at - elapsed
@@ -869,6 +892,8 @@ class VirtualApplicationManager @Inject constructor() {
             prevInstr = swapInStockInstrumentation(packageName)
 
             GuestBreadcrumb.log("framework makeApplication enter")
+            GuestBreadcrumb.log("framework bind identity " + loadedApkWitness(loadedApk))
+            secNeoLoadProbe(packageName, loadedApk, guestClassLoader)
             val application = try {
                 loadedApkClass.getMethod(
                     "makeApplication",
@@ -1690,5 +1715,589 @@ class VirtualApplicationManager @Inject constructor() {
         for (id in instanceIds) {
             terminateApplication(id)
         }
+    }
+}
+
+/**
+ * v52 diagnostic: compact identity summary of a framework LoadedApk
+ * (identity hash + package fields + whether an Application is
+ * already attached). Never throws. The LoadedApk fields read here
+ * are all declared on android.app.LoadedApk itself.
+ */
+private fun loadedApkWitness(loadedApk: Any): String {
+    fun field(name: String): Any? = try {
+        val f = loadedApk.javaClass.getDeclaredField(name)
+        f.isAccessible = true
+        f.get(loadedApk)
+    } catch (e: Exception) {
+        null
+    }
+    val ai = field("mApplicationInfo") as? android.content.pm.ApplicationInfo
+    val app = field("mApplication")
+    val appDesc = if (app == null) {
+        "null"
+    } else {
+        app.javaClass.name + "#" + System.identityHashCode(app)
+    }
+    return "loadedApk=#" + System.identityHashCode(loadedApk) +
+        " mPackageName=" + field("mPackageName") +
+        " ai.packageName=" + ai?.packageName +
+        " ai.sourceDir=" + ai?.sourceDir +
+        " mApplication=" + appDesc
+}
+
+/**
+ * v53 diagnostic probe: a SecNeo guest's AW.attachBaseContext calls
+ * System.loadLibrary("DexHelper") inside H.a(ApplicationInfo), which
+ * swallows any Throwable — the failure only surfaces later as an
+ * UnsatisfiedLinkError from H.is(). This probe runs just before the
+ * framework LoadedApk.makeApplication() and records what the packer
+ * hides: the guest class loader's full DexPathList (incl. native
+ * library directories), whether that loader can resolve libDexHelper
+ * at all, and — for the China Mobile guest only this round — the
+ * verbatim result of preloading the library against the guest class
+ * loader via Runtime.loadLibrary0. Never throws.
+ */
+private fun secNeoLoadProbe(
+    packageName: String,
+    loadedApk: Any,
+    guestClassLoader: ClassLoader
+) {
+    try {
+        GuestBreadcrumb.log("v53 probe cl=" + guestClassLoader.toString())
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v53 probe cl toString failed", t)
+    }
+    try {
+        val bdl = guestClassLoader as? dalvik.system.BaseDexClassLoader
+        val found = bdl?.findLibrary("DexHelper")
+        GuestBreadcrumb.log("v53 probe findLibrary(DexHelper)=" + (found ?: "null"))
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v53 probe findLibrary failed", t)
+    }
+    if (packageName != "com.greenpoint.android.mc10086.activity") return
+    val anchor = try {
+        Class.forName("com.secneo.apkwrapper.H", false, guestClassLoader)
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v55 probe anchor load failed", t)
+        return
+    }
+    GuestBreadcrumb.log(
+        "v55 probe anchor clId=" +
+            System.identityHashCode(anchor.classLoader) +
+            " guestClId=" + System.identityHashCode(guestClassLoader) +
+            " sameCl=" + (anchor.classLoader === guestClassLoader)
+    )
+    fun testIs(tag: String) {
+        try {
+            val m = anchor.getDeclaredMethod(
+                "is", Int::class.javaPrimitiveType
+            )
+            m.isAccessible = true
+            val r = m.invoke(null, 0)
+            GuestBreadcrumb.log("v55 probe H.is(0) $tag -> $r")
+        } catch (t: Throwable) {
+            val cause = (t as? java.lang.reflect.InvocationTargetException)
+                ?.cause ?: t
+            GuestBreadcrumb.logThrowable("v55 probe H.is(0) $tag FAILED", cause)
+        }
+    }
+    // v56: discriminator. Snapshot /proc/self/maps, then run H.a with
+    // the thread context classloader pointed at the guest CL, so the
+    // stub->payload chain sees a guest-flavoured context when it goes
+    // looking for a classloader. Maps snapshots before/after tell us
+    // whether the ~1.2MB payload image ever lands in memory.
+    fun mapsSnap(): Triple<Int, Int, Set<String>> {
+        val ws = Regex("\\s+")
+        val lines = java.io.File("/proc/self/maps").readLines()
+        var anonExec = 0
+        val paths = HashSet<String>()
+        for (ln in lines) {
+            val parts = ln.trim().split(ws, 6)
+            if (parts.size < 2) continue
+            val path = if (parts.size >= 6) parts[5].trim() else ""
+            if (path.isNotEmpty()) {
+                paths.add(path)
+            } else if (parts[1].contains('x')) {
+                anonExec++
+            }
+        }
+        return Triple(lines.size, anonExec, paths)
+    }
+    fun bigAnonExec(): List<String> {
+        val ws = Regex("\\s+")
+        val out = ArrayList<String>()
+        for (ln in java.io.File("/proc/self/maps").readLines()) {
+            val parts = ln.trim().split(ws, 6)
+            if (parts.size < 2 || !parts[1].contains('x')) continue
+            if (parts.size >= 6 && parts[5].trim().isNotEmpty()) continue
+            val se = parts[0].split("-")
+            if (se.size != 2) continue
+            val start = se[0].toLongOrNull(16) ?: continue
+            val end = se[1].toLongOrNull(16) ?: continue
+            val sz = end - start
+            if (sz in 0x80000L..0x180000L) {
+                out.add("0x" + sz.toString(16) + "/" + parts[1])
+            }
+        }
+        return out
+    }
+    // v59: REAL maps via the raw-syscall native channel
+    // (NativeHookBridge.readRealMaps). The v56 snapshots above go
+    // through java.io and are served by the engine's own Java-layer
+    // /proc fake (proven in launch77: identical readings while the
+    // native spoof was suspended), so they cannot say whether the
+    // SecNeo payload was ever really mapped. This channel can: it
+    // reads the kernel's own view, below both fake layers.
+    class RealSnap(
+        val lines: Int,
+        val execRanges: Set<String>,
+        val anonExecBytes: Long,
+        val bigAnon: List<String>,
+        val dexHelper: List<String>,
+        val memfd: List<String>,
+        val text: String
+    )
+    fun realSnap(): RealSnap? {
+        val text = NativeHookBridge.readRealMaps() ?: return null
+        val ws = Regex("\\s+")
+        var anonBytes = 0L
+        val exec = HashSet<String>()
+        val big = ArrayList<String>()
+        val dex = ArrayList<String>()
+        val memfd = ArrayList<String>()
+        val lines = text.split('\n').filter { it.isNotBlank() }
+        for (ln in lines) {
+            val parts = ln.trim().split(ws, 6)
+            if (parts.size < 2) continue
+            val range = parts[0]
+            val perms = parts[1]
+            val path = if (parts.size >= 6) parts[5].trim() else ""
+            if (ln.contains("DexHelper")) dex.add(ln.trim())
+            if (path.contains("memfd")) memfd.add(ln.trim())
+            if (!perms.contains('x')) continue
+            exec.add(range)
+            if (path.isNotEmpty()) continue
+            val se = range.split("-")
+            if (se.size != 2) continue
+            val start = se[0].toLongOrNull(16) ?: continue
+            val end = se[1].toLongOrNull(16) ?: continue
+            val sz = end - start
+            anonBytes += sz
+            if (sz in 0x80000L..0x200000L) {
+                big.add("0x" + sz.toString(16) + "/" + perms + "@" + range)
+            }
+        }
+        return RealSnap(lines.size, exec, anonBytes, big, dex, memfd, text)
+    }
+    fun logRealSnap(tag: String, snap: RealSnap?, prev: RealSnap?) {
+        if (snap == null) {
+            GuestBreadcrumb.log("v59 realmaps $tag UNAVAILABLE")
+            return
+        }
+        val newBig = if (prev != null) {
+            snap.bigAnon.filter { b ->
+                prev.bigAnon.none {
+                    it.substringAfter('@') == b.substringAfter('@')
+                }
+            }
+        } else {
+            snap.bigAnon
+        }
+        val newExec = if (prev != null) {
+            (snap.execRanges - prev.execRanges).size
+        } else {
+            snap.execRanges.size
+        }
+        GuestBreadcrumb.log(
+            "v59 realmaps " + tag + " lines=" + snap.lines +
+                " anonExecBytes=0x" + snap.anonExecBytes.toString(16) +
+                " newExecRanges=" + newExec +
+                " bigAnon=" + snap.bigAnon +
+                " newBigAnon=" + newBig +
+                " dexHelper=" + snap.dexHelper +
+                " memfd=" + snap.memfd
+        )
+    }
+    var realBefore: RealSnap? = null
+    var realAfter: RealSnap? = null
+    var v59DataDir: String? = null
+    fun dumpRealMaps(tag: String, snap: RealSnap?) {
+        val dir = v59DataDir ?: return
+        val s = snap ?: return
+        try {
+            val f = java.io.File(
+                java.io.File(dir, "files"),
+                "realmaps-" + android.os.Process.myPid() + "-" + tag + ".txt"
+            )
+            f.writeText(s.text)
+            GuestBreadcrumb.log(
+                "v59 realmaps dump " + tag + " -> " + f.name +
+                    " bytes=" + s.text.length
+            )
+        } catch (t: Throwable) {
+            GuestBreadcrumb.logThrowable("v59 realmaps dump $tag failed", t)
+        }
+    }
+    var mapsBefore: Triple<Int, Int, Set<String>>? = null
+    try {
+        mapsBefore = mapsSnap()
+        GuestBreadcrumb.log(
+            "v56 probe maps before lines=" + mapsBefore.first +
+                " anonExec=" + mapsBefore.second +
+                " paths=" + mapsBefore.third.size
+        )
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v56 probe maps before failed", t)
+    }
+    try {
+        realBefore = realSnap()
+        logRealSnap("before", realBefore, null)
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v59 realmaps before failed", t)
+    }
+    val probeThread = Thread.currentThread()
+    val oldCtxCl = probeThread.contextClassLoader
+    GuestBreadcrumb.log(
+        "v56 probe ctxCl was=" + oldCtxCl + " setting to guestCl"
+    )
+    probeThread.contextClassLoader = guestClassLoader
+    // v58 plant state (see the plant block inside the try below):
+    // declared here so the restore after the maps-after snapshot can
+    // still see them.
+    var v58AtObj: Any? = null
+    var v58InitAppField: java.lang.reflect.Field? = null
+    var v58OldInitApp: Any? = null
+    var v58BoundData: Any? = null
+    var v58BoundAiField: java.lang.reflect.Field? = null
+    var v58OldBoundAi: Any? = null
+    var v58Planted = false
+    var v60StubBase = 0L
+    try {
+        fun apkField(name: String): Any? {
+            var cls: Class<*>? = loadedApk.javaClass
+            while (cls != null) {
+                try {
+                    val f = cls.getDeclaredField(name)
+                    f.isAccessible = true
+                    return f.get(loadedApk)
+                } catch (e: NoSuchFieldException) {
+                    cls = cls.superclass
+                }
+            }
+            return null
+        }
+        val ai = apkField("mApplicationInfo")
+            as? android.content.pm.ApplicationInfo
+        GuestBreadcrumb.log(
+            "v55 probe ai packageName=" + ai?.packageName +
+                " dataDir=" + ai?.dataDir +
+                " nativeLibraryDir=" + ai?.nativeLibraryDir +
+                " sourceDir=" + ai?.sourceDir
+        )
+        v59DataDir = ai?.dataDir
+        // v60 note: the early discriminant block that used to sit
+        // here read the BEFORE snapshot, but the stub is only
+        // loaded during this probe's own H.a — the before maps
+        // never contain it (launch81: dexHelper=[] before,
+        // 5 segments after). All v60 checks moved to the single
+        // post-load block after the after-snapshot (below).
+        // v58 plant: the payload's registration must locate H
+        // through an ambient application identity. The thread ctxCl
+        // is already the guest CL (v56), so the remaining anchor is
+        // ActivityThread.mInitialApplication — in a stub process
+        // that is the HOST Application, whose CL has no H. Plant a
+        // pre-created guest AW instance (loaded by the guest CL)
+        // there, plus the guest ai into mBoundApplication.appInfo,
+        // for the H.a window; restored after the maps-after
+        // snapshot (see below) to also cover a short async tail.
+        try {
+            fun fieldOf(obj: Any, name: String):
+                java.lang.reflect.Field? {
+                var cls: Class<*>? = obj.javaClass
+                while (cls != null) {
+                    try {
+                        val f = cls.getDeclaredField(name)
+                        f.isAccessible = true
+                        return f
+                    } catch (e: NoSuchFieldException) {
+                        cls = cls.superclass
+                    }
+                }
+                return null
+            }
+            val atCls = Class.forName("android.app.ActivityThread")
+            val cur = atCls.getDeclaredMethod("currentActivityThread")
+            cur.isAccessible = true
+            v58AtObj = cur.invoke(null)
+            val at = v58AtObj
+            if (at != null) {
+                v58InitAppField = fieldOf(at, "mInitialApplication")
+                v58OldInitApp = v58InitAppField?.get(at)
+                val oldCl = (v58OldInitApp as? android.app.Application)
+                    ?.javaClass?.classLoader
+                GuestBreadcrumb.log(
+                    "v58 plant before mInitialApplication=" +
+                        v58OldInitApp?.javaClass?.name +
+                        " clId=" + System.identityHashCode(oldCl)
+                )
+                val bdField = fieldOf(at, "mBoundApplication")
+                v58BoundData = bdField?.get(at)
+                val bd = v58BoundData
+                if (bd != null) {
+                    v58BoundAiField = fieldOf(bd, "appInfo")
+                    v58OldBoundAi = v58BoundAiField?.get(bd)
+                    GuestBreadcrumb.log(
+                        "v58 plant before bound appInfo pkg=" +
+                            (v58OldBoundAi as?
+                                android.content.pm.ApplicationInfo)
+                                ?.packageName
+                    )
+                }
+                val awCls = guestClassLoader.loadClass(
+                    "com.secneo.apkwrapper.AW"
+                )
+                val awCtor = awCls.getDeclaredConstructor()
+                awCtor.isAccessible = true
+                val plant = awCtor.newInstance()
+                GuestBreadcrumb.log(
+                    "v58 plant AW created clId=" +
+                        System.identityHashCode(
+                            plant.javaClass.classLoader
+                        ) +
+                        " guestClId=" +
+                        System.identityHashCode(guestClassLoader)
+                )
+                v58InitAppField?.set(at, plant)
+                if (bd != null && ai != null) {
+                    v58BoundAiField?.set(bd, ai)
+                }
+                v58Planted = v58InitAppField != null
+                GuestBreadcrumb.log("v58 plant planted=" + v58Planted)
+            }
+        } catch (t: Throwable) {
+            GuestBreadcrumb.logThrowable("v58 plant FAILED", t)
+        }
+        // v63: the probe must NOT trigger the DexHelper load itself.
+        // launch83 verdict: with F3 (v62) the load now completes and
+        // the payload's JNI_OnLoad runs — and it reads H.sApp /
+        // H.sAppInfo, which AW.attachBaseContext only populates
+        // immediately before calling H.a in the shell's own
+        // sequence. Invoking H.a here, before makeApplication, made
+        // JNI_OnLoad read null statics and die on
+        // GetObjectClass(NULL) under CheckJNI, aborting the whole
+        // guest before the real bind ever ran. Let the natural
+        // sequence (attachBaseContext sets the statics, then H.a)
+        // perform the load during makeApplication instead.
+        GuestBreadcrumb.log(
+            "v63 probe: early H.a trigger removed " +
+                "(v58plant=" + v58Planted + ")"
+        )
+    } catch (t: Throwable) {
+        val cause = (t as? java.lang.reflect.InvocationTargetException)
+            ?.cause ?: t
+        GuestBreadcrumb.logThrowable("v55 probe H.a(ai) FAILED", cause)
+    }
+    try {
+        val after = mapsSnap()
+        val newPaths = mapsBefore?.let { after.third - it.third }
+            ?: after.third
+        GuestBreadcrumb.log(
+            "v56 probe maps after lines=" + after.first +
+                " anonExec=" + after.second +
+                " newPaths=" + newPaths.take(12) +
+                " bigAnonExec=" + bigAnonExec()
+        )
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v56 probe maps after failed", t)
+    }
+    try {
+        realAfter = realSnap()
+        logRealSnap("after", realAfter, realBefore)
+        dumpRealMaps("before", realBefore)
+        dumpRealMaps("after", realAfter)
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v59 realmaps after failed", t)
+    }
+    // v61 post-load discriminant (single block; v60's split
+    // blocks read the pre-load snapshot and found no stub).
+    // From the AFTER maps: compute the stub base, replicate
+    // S1's extraction (range containing the base, field 7
+    // verbatim) and S2's open of that path (control: the
+    // guest's real lib path), then read the stub's bss slots
+    // through /proc/self/mem. C0 stored the self base at
+    // +0x15048, C1 the sscanf pointer at +0x15038, C2 config
+    // (payload offset 0x8000 at +0x15040, tail offset
+    // 0x12c23d at +0x1507c); S3 would have copied the 16-byte
+    // RC4 key to +0x15068 and the XOR dword to +0x15080. An
+    // all-zero key buffer means S3 never landed (bad fd):
+    // the failure is at the S2/S3 boundary.
+    try {
+        val afterText = realAfter?.text ?: realSnap()?.text
+        if (afterText != null) {
+            val dexLines = afterText.lines()
+                .filter { it.contains("libDexHelper.so") }
+            var foundBase = 0L
+            for (ln in dexLines) {
+                val st = ln.substringBefore('-').trim()
+                    .toLongOrNull(16) ?: continue
+                if (foundBase == 0L || st < foundBase) {
+                    foundBase = st
+                }
+            }
+            v60StubBase = foundBase
+            GuestBreadcrumb.log(
+                "v61 stub base=0x" + foundBase.toString(16) +
+                    " dexLines=" + dexLines.size
+            )
+            if (foundBase != 0L) {
+                var hitPath: String? = null
+                for (ln in afterText.lines()) {
+                    val rng = ln.substringBefore(' ')
+                    val st = rng.substringBefore('-')
+                        .toLongOrNull(16) ?: continue
+                    val en = rng.substringAfter('-')
+                        .toLongOrNull(16) ?: continue
+                    if (st <= foundBase && foundBase < en) {
+                        val f = ln.trim().split(Regex("\\s+"))
+                        hitPath = f.getOrNull(6)
+                        GuestBreadcrumb.log(
+                            "v61 s1 replica hit line=" + ln
+                        )
+                        break
+                    }
+                }
+                GuestBreadcrumb.log(
+                    "v61 s1 replica extractedPath=" + hitPath
+                )
+                fun replicaOpen(tag: String, p: String?) {
+                    if (p == null) {
+                        GuestBreadcrumb.log(
+                            "v61 open $tag skipped (null path)"
+                        )
+                        return
+                    }
+                    try {
+                        val fd = android.system.Os.open(
+                            p,
+                            android.system.OsConstants.O_RDONLY,
+                            0
+                        )
+                        GuestBreadcrumb.log(
+                            "v61 open $tag OK path=" + p
+                        )
+                        android.system.Os.close(fd)
+                    } catch (e: android.system.ErrnoException) {
+                        GuestBreadcrumb.log(
+                            "v61 open $tag FAIL errno=" + e.errno +
+                                " msg=" + e.message +
+                                " path=" + p
+                        )
+                    } catch (t: Throwable) {
+                        GuestBreadcrumb.logThrowable(
+                            "v61 open $tag threw", t
+                        )
+                    }
+                }
+                replicaOpen("s1path", hitPath)
+                replicaOpen(
+                    "control",
+                    (v59DataDir ?: "?") + "/lib/libDexHelper.so"
+                )
+            }
+        } else {
+            GuestBreadcrumb.log("v61 no after maps text")
+        }
+        val base = v60StubBase
+        if (base != 0L) {
+            val memFd = android.system.Os.open(
+                "/proc/self/mem",
+                android.system.OsConstants.O_RDONLY, 0
+            )
+            fun readAt(addr: Long, n: Int): ByteArray {
+                val buf = java.nio.ByteBuffer.allocate(n)
+                val got = android.system.Os.pread(memFd, buf, addr)
+                if (got < n) {
+                    throw IllegalStateException(
+                        "short pread got=" + got
+                    )
+                }
+                return buf.array()
+            }
+            fun hexOf(b: ByteArray): String {
+                val sb = StringBuilder()
+                for (x in b) {
+                    sb.append("%02x".format(x.toInt() and 0xff))
+                }
+                return sb.toString()
+            }
+            fun longAt(off: Long): Long {
+                val bb = java.nio.ByteBuffer.wrap(
+                    readAt(base + off, 8)
+                )
+                bb.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                return bb.getLong(0)
+            }
+            GuestBreadcrumb.log(
+                "v61 bss sscanfPtr=0x" +
+                    longAt(0x15038).toString(16) +
+                    " payloadOffCfg=0x" +
+                    longAt(0x15040).toString(16) +
+                    " selfBaseSlot=0x" +
+                    longAt(0x15048).toString(16) +
+                    " (base=0x" + base.toString(16) + ")" +
+                    " tailOffCfg=0x" +
+                    longAt(0x1507c).toString(16) +
+                    " rc4key=" +
+                    hexOf(readAt(base + 0x15068, 16)) +
+                    " xorKey=" + hexOf(readAt(base + 0x15080, 4))
+            )
+            android.system.Os.close(memFd)
+        } else {
+            GuestBreadcrumb.log("v61 bss skipped: stub base unknown")
+        }
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v61 discriminant failed", t)
+    }
+    // v58 plant restore (window covered H.a + the maps-after
+    // snapshot, in case the payload registers on a short async tail)
+    if (v58Planted) {
+        try {
+            v58InitAppField?.set(v58AtObj, v58OldInitApp)
+            val bd = v58BoundData
+            if (bd != null) {
+                v58BoundAiField?.set(bd, v58OldBoundAi)
+            }
+            GuestBreadcrumb.log("v58 plant restored")
+        } catch (t: Throwable) {
+            GuestBreadcrumb.logThrowable("v58 plant restore FAILED", t)
+        }
+    }
+    probeThread.contextClassLoader = oldCtxCl
+    GuestBreadcrumb.log("v56 probe ctxCl restored")
+    // v63: the v54 loadLibrary0 preload block is removed for the
+    // same reason as the H.a trigger above — it loads DexHelper
+    // (stub ctor -> payload JNI_OnLoad) at probe time, before
+    // AW.attachBaseContext has populated H.sApp / H.sAppInfo.
+    GuestBreadcrumb.log("v63 probe: loadLibrary0 preload removed")
+    try {
+        val fin = mapsSnap()
+        val newPaths = mapsBefore?.let { fin.third - it.third }
+            ?: fin.third
+        GuestBreadcrumb.log(
+            "v56 probe maps final lines=" + fin.first +
+                " anonExec=" + fin.second +
+                " newPaths=" + newPaths.take(12) +
+                " bigAnonExec=" + bigAnonExec()
+        )
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v56 probe maps final failed", t)
+    }
+    try {
+        val realFin = realSnap()
+        logRealSnap("final", realFin, realAfter ?: realBefore)
+        dumpRealMaps("final", realFin)
+    } catch (t: Throwable) {
+        GuestBreadcrumb.logThrowable("v59 realmaps final failed", t)
     }
 }

@@ -12,6 +12,8 @@ import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
 import com.nextvm.core.common.runSafe
 import com.nextvm.core.model.VirtualIntentExtras
+import com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+import java.io.File
 import com.nextvm.core.services.gms.GoogleAccountInfo
 import timber.log.Timber
 
@@ -228,8 +230,42 @@ class ActivityThreadHook(
             @Suppress("UNCHECKED_CAST")
             val callbacks = getCallbacks.invoke(transaction) as? List<Any> ?: return false
 
+            // v76: delivery witness. Record every activity-related
+            // transaction item AMS delivers INTO this process, with
+            // wall-clock time (same clock as logcat and the
+            // binderwrap trace). launch99's rewritten AppTab start
+            // produced no second activity and no log of any delivery;
+            // this separates "AMS never delivered anything" from
+            // "AMS delivered (e.g. a NewIntentItem onto the existing
+            // record) and the guest side dropped it".
+            try {
+                val lifecycleReq = try {
+                    val m = transactionClass.getDeclaredMethod(
+                        "getLifecycleStateRequest"
+                    )
+                    m.isAccessible = true
+                    m.invoke(transaction)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (lifecycleReq != null) {
+                    val ln = lifecycleReq::class.java.name
+                    if (ln.contains("ActivityItem")) {
+                        traceDelivery("lifecycle-request " + ln.substringAfterLast('.'))
+                    }
+                }
+            } catch (_: Throwable) {
+                // witness only; never disturb delivery
+            }
+
             for (callback in callbacks) {
                 val callbackClassName = callback::class.java.name
+
+                if (callbackClassName.contains("ActivityItem") ||
+                    callbackClassName.contains("NewIntentItem")
+                ) {
+                    traceDelivery(describeTransactionItem(callback, callbackClassName))
+                }
 
                 if (callbackClassName.contains("LaunchActivityItem")) {
                     return handleLaunchActivityItem(callback, transactionToken)
@@ -246,6 +282,61 @@ class ActivityThreadHook(
         }
 
         return false
+    }
+
+    private val deliveryTraceLock = Any()
+
+    /** v76: append one delivery-witness line to the shared trace file. */
+    private fun traceDelivery(line: String) {
+        try {
+            val f = java.io.File(
+                context.filesDir,
+                "startactivity-trace-" + android.os.Process.myPid() + ".log"
+            )
+            synchronized(deliveryTraceLock) {
+                f.appendText(
+                    "[t=" + System.currentTimeMillis() + "] " +
+                        "athook-delivery: " + line + "\n"
+                )
+            }
+        } catch (_: Throwable) {
+            // witness only; never disturb delivery
+        }
+    }
+
+    /** v76: one-line description of a transaction item for the witness. */
+    private fun describeTransactionItem(item: Any, className: String): String {
+        val simple = className.substringAfterLast('.')
+        return try {
+            when {
+                className.contains("LaunchActivityItem") -> {
+                    val intentField = findField(item::class.java, "mIntent")
+                    intentField?.isAccessible = true
+                    val intent = intentField?.get(item) as? Intent
+                    simple + " cmp=" + intent?.component +
+                        " nextvmExtras=" +
+                        (intent?.getStringExtra(
+                            VirtualIntentExtras.TARGET_PACKAGE
+                        ) != null) +
+                        " target=" + intent?.getStringExtra(
+                            VirtualIntentExtras.TARGET_ACTIVITY
+                        )
+                }
+                className.contains("NewIntentItem") -> {
+                    val intentsField = findField(item::class.java, "mIntents")
+                    intentsField?.isAccessible = true
+                    @Suppress("UNCHECKED_CAST")
+                    val intents = intentsField?.get(item) as? List<Intent>
+                    simple + " intents=[" +
+                        (intents?.joinToString(",") {
+                            it.component?.flattenToShortString() ?: "?"
+                        } ?: "?") + "]"
+                }
+                else -> simple
+            }
+        } catch (_: Throwable) {
+            simple + " <describe failed>"
+        }
     }
 
     /**
@@ -467,8 +558,35 @@ class ActivityThreadHook(
             // Modify the Intent's component to point to the real Activity
             intent.component = ComponentName(targetPackage, targetActivity)
 
+            // === STEP 1.5 (v52): Begin the breadcrumb witness BEFORE
+            // the LoadedApk surgery below, and attach its file right
+            // away. The guest files dir is known from the instance data
+            // dir, so the log reaches disk even if this guest process
+            // dies seconds later. Previously the file was attached only
+            // on bind success (and the session itself was unicom-only),
+            // leaving failed binds of other guests with no witness.
+            runSafe(TAG) {
+                GuestBreadcrumb.begin(targetPackage)
+                val dataDir = engine.getDataDir(instanceId)
+                if (dataDir != null) {
+                    GuestBreadcrumb.attachFile(File(dataDir, "files"))
+                }
+            }
+
             // === STEP 2: Replace ClassLoader in LoadedApk ===
             replaceClassLoader(targetPackage, instanceId, apkPath)
+
+            // === STEP 2.1 (v79 probe): inspect the resource state of
+            // the clone AOSP is about to consume for this launch ===
+            probeLaunchResources(targetPackage, apkPath, targetActivity)
+
+            // === STEP 2.2 (v80/v81): launch103 proved the guest APK
+            // copy exists at StartPage time but is gone ~6s later
+            // when AppTab launches; launch104's watcher caught the
+            // unlink inside ZWRisk.setup() (agree flow, ~160ms
+            // before the AppTab start). startApkWatchdog now also
+            // restores the copy from its guard hard link. ===
+            startApkWatchdog(instanceId, apkPath)
 
             // === STEP 2.5: Boot guest Application lifecycle (CRITICAL) ===
             // Most Android apps require Application.onCreate() to run before any
@@ -542,6 +660,252 @@ class ActivityThreadHook(
     private val retainedGuestLoadedApks = java.util.Collections.synchronizedSet(mutableSetOf<Any>())
 
     /**
+     * v79 probe (launch102 follow-up): CM's second activity
+     * (AppTabFragment) died in performLaunchActivity with an NPE —
+     * Resources.addLoaders on a null Resources — 14ms after ART
+     * logged "Failed to open APK '<guest apk>': I/O error" on the
+     * main thread, a line launch100 (StartPage only) never produced.
+     * Two live suspects: (a) the per-launch LoadedApk clone that
+     * replaceClassLoader manufactures carries broken resource state;
+     * (b) opening the guest APK at that moment is interfered with.
+     * This probe runs right after replaceClassLoader, on the exact
+     * state AOSP is about to consume, and records: the clone's
+     * identity and its mResources field, what clone.getResources()
+     * yields here, and whether a plain in-process ZipFile open of
+     * the guest APK succeeds at the same moment. A non-null
+     * getResources() plus a good zip open convicts the clone's lazy
+     * state; a failing zip open convicts the file layer.
+     * NOTE: calling getResources() may populate the clone's cache,
+     * so a probed launch can heal itself — that outcome is itself
+     * the datum (resources were buildable at hook time). Diagnostic
+     * only; remove together with the eventual fix.
+     */
+    private fun probeLaunchResources(
+        packageName: String,
+        apkPath: String,
+        targetActivity: String
+    ) {
+        runSafe(TAG) {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val currentATMethod = atClass.getDeclaredMethod("currentActivityThread")
+            currentATMethod.isAccessible = true
+            val activityThread = currentATMethod.invoke(null) ?: return@runSafe
+            val mPackagesField = findField(atClass, "mPackages")
+            mPackagesField?.isAccessible = true
+            val mPackages = mPackagesField?.get(activityThread)
+                as? android.util.ArrayMap<*, *> ?: return@runSafe
+            val clone = (mPackages[packageName]
+                as? java.lang.ref.WeakReference<*>)?.get()
+            if (clone == null) {
+                GuestBreadcrumb.log(
+                    "v79 probe target=$targetActivity clone=null"
+                )
+                return@runSafe
+            }
+            val resField = findField(clone::class.java, "mResources")
+            resField?.isAccessible = true
+            val resBefore = resField?.get(clone)
+            val zipResult = try {
+                val zf = java.util.zip.ZipFile(java.io.File(apkPath))
+                val n = zf.size()
+                zf.close()
+                "ok entries=$n"
+            } catch (t: Throwable) {
+                "FAIL " + t.javaClass.simpleName + ": " + t.message
+            }
+            val getResResult = try {
+                val m = clone::class.java.getMethod("getResources", atClass)
+                m.isAccessible = true
+                val r = m.invoke(clone, activityThread)
+                if (r == null) "null"
+                else "#" + System.identityHashCode(r)
+            } catch (t: Throwable) {
+                val cause =
+                    (t as? java.lang.reflect.InvocationTargetException)
+                        ?.targetException ?: t
+                "THREW " + cause.javaClass.simpleName + ": " + cause.message
+            }
+            val resAfter = resField?.get(clone)
+            GuestBreadcrumb.log(
+                "v79 probe target=$targetActivity clone=#" +
+                    System.identityHashCode(clone) +
+                    " mResources(before)=" +
+                    (resBefore?.let {
+                        "#" + System.identityHashCode(it)
+                    } ?: "null") +
+                    " zipOpen=" + zipResult +
+                    " getResources()=" + getResResult +
+                    " mResources(after)=" +
+                    (resAfter?.let {
+                        "#" + System.identityHashCode(it)
+                    } ?: "null")
+            )
+        }
+    }
+
+    private val apkWatchStarted =
+        java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * v80 watcher turned v81 guard (launch103/104 follow-up): the
+     * guest APK copy under files/virtual/apks/<instanceId>.apk was
+     * present at StartPage launch and unlinked ~160ms before the
+     * AppTab launch; launch104's stack snapshot placed the unlink
+     * inside ZWRisk.setup() during FKong init in the agree flow —
+     * the SDK deletes the path it reads as its own sourceDir, an
+     * unlink that fails harmlessly on a real device (/data/app
+     * permissions) but succeeds here (same-uid copy). The copy
+     * carries a guard hard link in .apk_guard/ (created by
+     * VirtualEngine at install, or here on first watch for older
+     * installs). This watchdog polls the file every 50ms for the
+     * life of the process and, the moment it vanishes, re-links
+     * the visible name from the guard — single-digit ms against
+     * an observed ~170ms gap to the next launch. The first
+     * transition of a process still snapshots all thread stacks
+     * into v80-stacks-<pid>.txt as evidence.
+     */
+    private fun startApkWatchdog(instanceId: String, apkPath: String) {
+        if (!apkWatchStarted.compareAndSet(false, true)) return
+        runSafe(TAG) {
+            val filesDir = engine.getDataDir(instanceId)?.let {
+                java.io.File(it, "files")
+            }
+            val target = java.io.File(apkPath)
+            // v81 guard: VirtualEngine keeps a hard link to the copy
+            // at <virtualRoot>/.apk_guard/<same name>; the guest
+            // never sees that name, so its unlink of sourceDir can
+            // only drop one directory entry, never the bytes.
+            val guardFile = java.io.File(
+                java.io.File(
+                    target.parentFile?.parentFile, ".apk_guard"
+                ),
+                target.name
+            )
+            val t = Thread({
+                val fmt = java.text.SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US
+                )
+                val startMs = System.currentTimeMillis()
+                var wasExists = target.exists()
+                var lastLen = if (wasExists) target.length() else -1L
+                // Instances installed before v81 have no guard link;
+                // create it now (same-uid, both dirs owner-writable).
+                if (wasExists && !guardFile.exists()) {
+                    runSafe(TAG) {
+                        guardFile.parentFile?.mkdirs()
+                        android.system.Os.link(
+                            apkPath, guardFile.absolutePath
+                        )
+                    }
+                }
+                GuestBreadcrumb.log(
+                    "v81 watch start path=$apkPath exists=$wasExists" +
+                        " len=$lastLen guard=" + guardFile.exists()
+                )
+                var restoreCount = 0
+                var dumpedStacks = false
+                while (true) {
+                    try {
+                        Thread.sleep(50)
+                    } catch (ie: InterruptedException) {
+                        break
+                    }
+                    val nowExists = target.exists()
+                    if (nowExists != wasExists) {
+                        val wall = fmt.format(java.util.Date())
+                        val afterMs =
+                            System.currentTimeMillis() - startMs
+                        GuestBreadcrumb.log(
+                            "v81 watch TRANSITION " +
+                                (if (wasExists) "exists->missing"
+                                else "missing->exists") +
+                                " wall=" + wall +
+                                " afterMs=" + afterMs +
+                                " lastLen=" + lastLen
+                        )
+                        if (wasExists && !nowExists) {
+                            // The copy was unlinked (launch104:
+                            // ZWRisk.setup does this in the agree
+                            // flow). Re-link the visible name from
+                            // the guard immediately; the observed
+                            // gap to the next activity launch is
+                            // ~170ms, this takes single-digit ms.
+                            var restored = false
+                            var restoreErr = ""
+                            if (guardFile.exists()) {
+                                for (attempt in 1..5) {
+                                    try {
+                                        android.system.Os.link(
+                                            guardFile.absolutePath,
+                                            apkPath
+                                        )
+                                        restored = target.exists()
+                                        if (restored) break
+                                    } catch (t2: Throwable) {
+                                        restoreErr = t2.toString()
+                                    }
+                                    try {
+                                        Thread.sleep(10)
+                                    } catch (ie2: InterruptedException) {
+                                        break
+                                    }
+                                }
+                            } else {
+                                restoreErr = "guard-missing"
+                            }
+                            if (restored) restoreCount++
+                            GuestBreadcrumb.log(
+                                "v81 guard RESTORE ok=$restored" +
+                                    " count=$restoreCount wall=" +
+                                    fmt.format(java.util.Date()) +
+                                    (if (restored) ""
+                                    else " err=$restoreErr")
+                            )
+                            wasExists = restored
+                        } else {
+                            wasExists = nowExists
+                        }
+                        // Keep the v80 stack snapshot for the first
+                        // transition of the process (validation
+                        // evidence for who deleted the copy).
+                        if (!dumpedStacks && filesDir != null) {
+                            dumpedStacks = true
+                            runSafe(TAG) {
+                                val out = java.io.File(
+                                    filesDir,
+                                    "v80-stacks-" +
+                                        android.os.Process.myPid() + ".txt"
+                                )
+                                val sb = StringBuilder()
+                                sb.append("transition wall=").append(wall)
+                                    .append(" path=").append(apkPath)
+                                    .append('\n')
+                                for ((thread, stack) in
+                                    Thread.getAllStackTraces()) {
+                                    sb.append("\n--- \"")
+                                        .append(thread.name)
+                                        .append("\" ")
+                                        .append(thread.state)
+                                        .append('\n')
+                                    for (el in stack.take(40)) {
+                                        sb.append("    at ").append(el)
+                                            .append('\n')
+                                    }
+                                }
+                                out.appendText(sb.toString())
+                            }
+                        }
+                    }
+                    if (nowExists) lastLen = target.length()
+                }
+                GuestBreadcrumb.log("v81 watch stop (interrupt)")
+            }, "v81-apk-watch")
+            t.isDaemon = true
+            t.start()
+        }
+    }
+
+    /**
      * Replace the ClassLoader in ActivityThread's LoadedApk (mPackages) registry.
      * This ensures performLaunchActivity() uses our DexClassLoader to load the guest class.
      *
@@ -559,6 +923,7 @@ class ActivityThreadHook(
      */
     private fun replaceClassLoader(packageName: String, instanceId: String, apkPath: String) {
         runSafe(TAG) {
+            GuestBreadcrumb.log("replaceClassLoader enter pkg=$packageName instance=$instanceId")
             val atClass = Class.forName("android.app.ActivityThread")
             val currentATMethod = atClass.getDeclaredMethod("currentActivityThread")
             currentATMethod.isAccessible = true
@@ -576,6 +941,11 @@ class ActivityThreadHook(
 
             // Get or create the ClassLoader from the engine for this guest app
             val guestClassLoader = engine.getOrCreateClassLoader(instanceId, apkPath)
+            GuestBreadcrumb.log(
+                "replaceClassLoader host=#" + System.identityHashCode(hostLoadedApk) +
+                    " guestCL=" +
+                    (guestClassLoader?.let { "#" + System.identityHashCode(it) } ?: "null")
+            )
             if (guestClassLoader != null) {
                 val loadedApkClass = hostLoadedApk::class.java
 
@@ -698,6 +1068,18 @@ class ActivityThreadHook(
                     hostPackageName = hostPkgName
                 )
 
+                val guestRefNow =
+                    (typedPackages[packageName] as? java.lang.ref.WeakReference<*>)?.get()
+                val hostRefNow =
+                    (typedPackages[hostPkgName] as? java.lang.ref.WeakReference<*>)?.get()
+                GuestBreadcrumb.log(
+                    "replaceClassLoader done pkg=$packageName target=#" +
+                        System.identityHashCode(targetLoadedApk) +
+                        " mPackages[guest]=#" +
+                        (guestRefNow?.let { System.identityHashCode(it) } ?: -1) +
+                        " mPackages[host]=#" +
+                        (hostRefNow?.let { System.identityHashCode(it) } ?: -1)
+                )
                 Timber.tag(TAG).d("ClassLoader replaced for $packageName (instance: $instanceId)")
             } else {
                 Timber.tag(TAG).w("No ClassLoader available for $instanceId — class loading may fail")
@@ -1527,7 +1909,10 @@ class NextVmInstrumentation(
 
     override fun newApplication(cl: ClassLoader?, className: String?, context: Context?): android.app.Application {
         com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
-            .log("instr newApplication " + className)
+            .log(
+                "instr newApplication " + className +
+                    " clId=" + System.identityHashCode(cl)
+            )
         return base.newApplication(cl, className, context)
     }
 

@@ -22,6 +22,7 @@ import com.nextvm.core.sandbox.NativeLibManager
 import com.nextvm.core.sandbox.SandboxManager
 import com.nextvm.core.sandbox.VirtualEnvironmentHook
 import com.nextvm.core.services.VirtualServiceManager
+import com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
 import com.nextvm.core.virtualization.lifecycle.VirtualApplicationManager
 import com.nextvm.core.virtualization.lifecycle.VirtualConfigurationManager
 import com.nextvm.core.virtualization.lifecycle.VirtualResourceManager
@@ -383,6 +384,7 @@ class VirtualEngine @Inject constructor(
                         destFile.setWritable(false, false)
                         destFile.setReadable(true, false)
                         destFile.setExecutable(false, false)
+                        createApkGuardLink(destFile)
                         virtualSplitPaths.add(destFile.absolutePath)
                         Timber.tag(TAG).d("Copied split APK: $splitName")
                     } catch (e: Exception) {
@@ -684,6 +686,19 @@ class VirtualEngine @Inject constructor(
             // Remove APK
             File(app.apkPath).delete()
 
+            // v81: remove guard hard links for this instance (base +
+            // splits share the instanceId name prefix), otherwise the
+            // inode (the full APK bytes) would never be freed.
+            try {
+                File(virtualRoot, ".apk_guard").listFiles()
+                    ?.filter { it.name.startsWith(instanceId) }
+                    ?.forEach { it.delete() }
+            } catch (t: Throwable) {
+                Timber.tag(TAG).w(
+                    "APK guard cleanup failed for $instanceId: ${t.message}"
+                )
+            }
+
             // Unregister from virtual PMS (real service)
             serviceManager.packageManager.unregisterPackage(app.packageName)
 
@@ -900,7 +915,13 @@ class VirtualEngine @Inject constructor(
      * ApplicationInfo. Returns null on any failure.
      */
     private fun createFrameworkLoadedApk(app: VirtualApp): Any? {
-        frameworkLoadedApks[app.instanceId]?.let { return it }
+        frameworkLoadedApks[app.instanceId]?.let { cached ->
+            GuestBreadcrumb.log(
+                "createFrameworkLoadedApk cache hit pkg=${app.packageName} " +
+                    loadedApkWitness(cached)
+            )
+            return cached
+        }
         return try {
             val baseInfo = serviceManager.packageManager.getApplicationInfo(app.packageName)
                 ?: return null
@@ -943,15 +964,94 @@ class VirtualEngine @Inject constructor(
                 ?: return null
             val compatClass = Class.forName("android.content.res.CompatibilityInfo")
             val compat = compatClass.getField("DEFAULT_COMPATIBILITY_INFO").get(null)
+            GuestBreadcrumb.log(
+                "createFrameworkLoadedApk call pkg=${app.packageName} appInfo.packageName=" +
+                    appInfo.packageName + " appInfo.className=" + appInfo.className +
+                    " appInfo.sourceDir=" + appInfo.sourceDir
+            )
             val loadedApk = atClass
                 .getMethod("getPackageInfoNoCheck", ApplicationInfo::class.java, compatClass)
                 .invoke(activityThread, appInfo, compat)
                 ?: return null
+            GuestBreadcrumb.log(
+                "createFrameworkLoadedApk result " + loadedApkWitness(loadedApk) +
+                    mPackagesWitness(app.packageName)
+            )
             frameworkLoadedApks[app.instanceId] = loadedApk
             loadedApk
         } catch (e: Exception) {
             Timber.tag(TAG).w(e, "Framework LoadedApk failed for ${app.packageName}")
             null
+        }
+    }
+
+    /**
+     * v52 diagnostic: compact identity summary of a framework LoadedApk
+     * (identity hash + package fields + whether an Application is
+     * already attached). Never throws.
+     */
+    private fun loadedApkWitness(loadedApk: Any): String {
+        fun field(name: String): Any? = try {
+            var cls: Class<*>? = loadedApk.javaClass
+            var f: java.lang.reflect.Field? = null
+            while (cls != null && f == null) {
+                f = try {
+                    cls.getDeclaredField(name)
+                } catch (e: NoSuchFieldException) {
+                    null
+                }
+                if (f == null) cls = cls.superclass
+            }
+            f?.apply { isAccessible = true }?.get(loadedApk)
+        } catch (e: Exception) {
+            null
+        }
+        val ai = field("mApplicationInfo") as? ApplicationInfo
+        val app = field("mApplication")
+        val appDesc = if (app == null) {
+            "null"
+        } else {
+            app.javaClass.name + "#" + System.identityHashCode(app)
+        }
+        return "loadedApk=#" + System.identityHashCode(loadedApk) +
+            " mPackageName=" + field("mPackageName") +
+            " ai.packageName=" + ai?.packageName +
+            " ai.sourceDir=" + ai?.sourceDir +
+            " mApplication=" + appDesc
+    }
+
+    /**
+     * v52 diagnostic: identity hashes of the LoadedApks currently
+     * registered in ActivityThread.mPackages under the guest and host
+     * package names. Never throws.
+     */
+    private fun mPackagesWitness(guestPkg: String): String {
+        return try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val activityThread = atClass.getMethod("currentActivityThread").invoke(null)
+                ?: return " mPackages=<no ActivityThread>"
+            var cls: Class<*>? = atClass
+            var f: java.lang.reflect.Field? = null
+            while (cls != null && f == null) {
+                f = try {
+                    cls.getDeclaredField("mPackages")
+                } catch (e: NoSuchFieldException) {
+                    null
+                }
+                if (f == null) cls = cls.superclass
+            }
+            f?.isAccessible = true
+            val packages = f?.get(activityThread) as? android.util.ArrayMap<*, *>
+                ?: return " mPackages=<null>"
+            fun refHash(key: String): Int {
+                val ref = packages[key] as? java.lang.ref.WeakReference<*>
+                val obj = ref?.get() ?: return -1
+                return System.identityHashCode(obj)
+            }
+            " mPackages[guest]=#" + refHash(guestPkg) +
+                " mPackages[host]=#" + refHash(context.packageName)
+        } catch (e: Exception) {
+            " mPackages=<error ${e.javaClass.simpleName}>"
         }
     }
 
@@ -1112,8 +1212,40 @@ class VirtualEngine @Inject constructor(
         destFile.setReadable(true, false)    // ensure readable by all
         destFile.setExecutable(false, false) // APKs don't need execute bit
 
+        createApkGuardLink(destFile)
+
         Timber.tag(TAG).d("APK copied to: ${destFile.absolutePath}")
         return destFile.absolutePath
+    }
+
+    /**
+     * v81 (launch104 fix): some guest SDKs delete the app's own APK
+     * copy during init — ZWRisk.setup() unlinks the path it reads
+     * from ApplicationInfo.sourceDir while running inside the agree
+     * flow. On a real device that unlink targets /data/app and fails
+     * on permissions; here the copy sits in same-uid storage, so it
+     * succeeds and the next activity launch dies with Resources
+     * NPE ("Failed to open APK"). Keep a hard link to every copied
+     * APK in .apk_guard/, a directory name the guest never sees:
+     * unlinking the visible name leaves the inode alive, and the
+     * in-process watchdog (ActivityThreadHook) re-links the name
+     * back within milliseconds. A hard link costs no extra space.
+     */
+    internal fun createApkGuardLink(apkFile: File) {
+        try {
+            val guardDir = File(virtualRoot, ".apk_guard")
+            if (!guardDir.exists()) guardDir.mkdirs()
+            val guardFile = File(guardDir, apkFile.name)
+            if (guardFile.exists()) guardFile.delete()
+            android.system.Os.link(
+                apkFile.absolutePath, guardFile.absolutePath
+            )
+            Timber.tag(TAG).d("APK guard link: ${guardFile.absolutePath}")
+        } catch (t: Throwable) {
+            Timber.tag(TAG).w(
+                "APK guard link failed for ${apkFile.name}: ${t.message}"
+            )
+        }
     }
 
     /**
@@ -1496,19 +1628,49 @@ class VirtualEngine @Inject constructor(
                 Timber.tag(TAG).w(e, "rewriteBoundProcessName failed for $packageName")
             }
 
-            // Boot the Application via ApplicationManager
-            applicationManager.bindApplication(
-                instanceId = instanceId,
-                packageName = packageName,
-                applicationClassName = applicationClassName,
-                apkPath = apkPath,
-                classLoader = classLoader,
-                virtualContext = virtualContext,
-                providerNames = providerNames,
-                providerAuthorities = providerAuthorities,
-                providerMetaData = providerMetaData,
-                frameworkLoadedApk = frameworkLoadedApks[instanceId]
-            )
+            // v57: for the CM guest, suspend /proc/self spoofing for
+            // the duration of the bind. Its SecNeo mini-linker stub
+            // (libDexHelper.so) parses the real /proc/self/maps in its
+            // constructor — which runs inside bindApplication below,
+            // when the shell's attach triggers System.loadLibrary —
+            // to resolve libc symbols and locate its own image; the
+            // spoofed maps silently abort its registration chain and
+            // every H.* native stays unregistered. The stub is also
+            // exempt from GOT late-patching on the native side.
+            val suspendSpoof =
+                packageName == "com.greenpoint.android.mc10086.activity"
+            if (suspendSpoof) {
+                try {
+                    nativeHookBridge.setProcSpoofSuspended(true)
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w(e, "setProcSpoofSuspended(true) failed")
+                }
+            }
+            try {
+                // Boot the Application via ApplicationManager
+                applicationManager.bindApplication(
+                    instanceId = instanceId,
+                    packageName = packageName,
+                    applicationClassName = applicationClassName,
+                    apkPath = apkPath,
+                    classLoader = classLoader,
+                    virtualContext = virtualContext,
+                    providerNames = providerNames,
+                    providerAuthorities = providerAuthorities,
+                    providerMetaData = providerMetaData,
+                    frameworkLoadedApk = frameworkLoadedApks[instanceId]
+                )
+            } finally {
+                if (suspendSpoof) {
+                    try {
+                        nativeHookBridge.setProcSpoofSuspended(false)
+                    } catch (e: Exception) {
+                        Timber.tag(TAG).w(
+                            e, "setProcSpoofSuspended(false) failed"
+                        )
+                    }
+                }
+            }
 
             Timber.tag(TAG).i("Guest Application booted successfully for $instanceId")
         } catch (e: UnsatisfiedLinkError) {

@@ -88,6 +88,26 @@ class NativeHookBridge @Inject constructor() {
                 false
             }
         }
+
+        /**
+         * v59: read the REAL /proc/self/maps. The native side uses
+         * raw syscalls only, bypassing both the Java-layer fake file
+         * content and the libc PLT hooks, so the result is the
+         * kernel's own view of the process map. Null when the native
+         * library is unavailable or the read fails.
+         */
+        @JvmStatic
+        fun readRealMaps(): String? {
+            if (!nativeLibLoaded) return null
+            return try {
+                nativeReadRealMaps()
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        @JvmStatic
+        external fun nativeReadRealMaps(): String?
     }
 
     fun initialize() {
@@ -361,6 +381,20 @@ class NativeHookBridge @Inject constructor() {
         }
 
         Timber.tag(TAG).d("/proc/self spoofed: pid=$pid, pkg=$packageName")
+    }
+
+    /**
+     * v57: suspend (or resume) native /proc/self spoofing. While
+     * suspended, hooked readers get the real /proc content. Used
+     * around the CM guest's bind: its SecNeo mini-linker stub parses
+     * the real maps in its constructor to resolve libc symbols, and
+     * the spoofed maps silently abort its registration chain.
+     */
+    fun setProcSpoofSuspended(suspended: Boolean) {
+        if (nativeHooksAvailable) {
+            nativeSetProcSpoofSuspended(suspended)
+        }
+        Timber.tag(TAG).d("/proc spoof suspended=$suspended")
     }
 
     /**
@@ -694,6 +728,9 @@ class NativeHookBridge @Inject constructor() {
 
     /** Set up /proc/self spoofing at native level. */
     private external fun nativeSpoofProcSelf(pid: Int, packageName: String)
+
+    /** v57: suspend/resume /proc/self spoofing at native level. */
+    private external fun nativeSetProcSpoofSuspended(suspended: Boolean)
 
     private external fun nativeSetProcessName(name: String)
 

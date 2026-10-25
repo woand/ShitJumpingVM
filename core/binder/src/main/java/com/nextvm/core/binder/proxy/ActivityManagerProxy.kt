@@ -177,7 +177,11 @@ class ActivityManagerProxy(
     private fun appendStartTrace(line: String) {
         try {
             synchronized(startTraceFile) {
-                startTraceFile.appendText(line + "\n")
+                // v76: same wall-clock prefix as ActivityBinderWrap so
+                // every writer of this file shares one timeline.
+                startTraceFile.appendText(
+                    "[t=" + System.currentTimeMillis() + "] " + line + "\n"
+                )
             }
         } catch (_: Throwable) {
             // tracing must never disturb the guest
@@ -322,6 +326,9 @@ class ActivityManagerProxy(
                     putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
                     putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
                     putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
+                    // v77: same singleTop fold hazard as the binderwrap
+                    // path — see clearSingleTopSemantics().
+                    clearSingleTopSemantics()
                 }
 
                 newArgs[intentIndex] = newIntent
@@ -356,7 +363,34 @@ class ActivityManagerProxy(
             putExtra(VirtualIntentExtras.INSTANCE_ID, app.instanceId)
             putExtra(VirtualIntentExtras.APK_PATH, app.apkPath)
             putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
+            clearSingleTopSemantics()
         }
+    }
+
+    /**
+     * v77: strip FLAG_ACTIVITY_SINGLE_TOP / FLAG_ACTIVITY_CLEAR_TOP
+     * from a rewritten stub intent. launch100定案: CM's agree flow
+     * started AppTabFragment, the rewrite pointed it at the same stub
+     * component (P2$Standard00) that already hosted StartPageActivity
+     * on top, and AMS folded the start into START_DELIVERED_TO_TOP
+     * (code=3) — the AppTab record was never created and the splash
+     * ignored the bounced onNewIntent. On a real device the two are
+     * distinct components so singleTop semantics never fold across
+     * activities; inside the sandbox every guest activity in a slot
+     * shares one stub component, so AMS cannot tell them apart and
+     * the fold misfires. Clearing the two flags makes AMS create a
+     * fresh stub record for every rewritten start; the engine still
+     * restores the real target from the NEXTVM extras. Cost: a guest
+     * re-starting the *same* activity with singleTop intent now gets
+     * a new instance instead of onNewIntent — acceptable, and the
+     * pre-v77 behaviour for cross-activity starts was silent loss.
+     * Only the rewritten copy is touched; the caller's original
+     * intent object keeps its flags (the binderwrap trace records
+     * them as origFlags).
+     */
+    private fun Intent.clearSingleTopSemantics() {
+        flags = flags and Intent.FLAG_ACTIVITY_SINGLE_TOP.inv() and
+            Intent.FLAG_ACTIVITY_CLEAR_TOP.inv()
     }
 
     /**
