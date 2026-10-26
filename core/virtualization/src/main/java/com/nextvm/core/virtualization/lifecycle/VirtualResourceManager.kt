@@ -802,9 +802,10 @@ class VirtualResourceManager @Inject constructor() {
                 if (mPackages != null) {
                     val weakRef = mPackages[packageName]
                     if (weakRef != null) {
-                        val getMethod = weakRef.javaClass.getDeclaredMethod("get")
-                        getMethod.isAccessible = true
-                        val loadedApk = getMethod.invoke(weakRef)
+                        // WeakReference.get() is inherited from a public JDK class;
+                        // looking it up on the concrete class with getDeclaredMethod
+                        // fails on Android and makes this injection silently no-op.
+                        val loadedApk = (weakRef as? java.lang.ref.WeakReference<*>)?.get()
                         if (loadedApk != null) {
                             val resField = findField(loadedApk.javaClass, "mResources")
                             if (resField != null) {

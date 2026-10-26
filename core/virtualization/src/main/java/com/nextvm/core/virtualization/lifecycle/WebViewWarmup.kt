@@ -56,7 +56,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * LoadedApk fields it never refreshes.
  *
  * Output: webviewwarm-<pid>.log next to the other guest
- * diagnostics. Unicom only.
+ * diagnostics. The provider is process-global, so this applies to every
+ * guest that can create a WebView.
  */
 object WebViewWarmup {
 
@@ -66,7 +67,7 @@ object WebViewWarmup {
         "Already registered a list of actions in this process"
 
     fun schedule(packageName: String, filesDir: File) {
-        if (packageName != "com.sinovatech.unicom.ui") return
+        if (packageName.isBlank()) return
         if (!started.compareAndSet(false, true)) return
         Thread {
             try {

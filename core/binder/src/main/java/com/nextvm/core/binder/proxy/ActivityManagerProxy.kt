@@ -332,7 +332,7 @@ class ActivityManagerProxy(
         }
 
         // Check if target is a virtual app
-        val resolvedTargetPkg = intent.component?.packageName ?: intent.`package`
+        val resolvedTargetPkg = resolveVirtualTargetPackage(intent)
         if (resolvedTargetPkg != null && virtualApps.containsKey(resolvedTargetPkg)) {
             val app = virtualApps[resolvedTargetPkg]!!
             val targetClass = intent.component?.className ?: app.mainActivity
@@ -373,8 +373,7 @@ class ActivityManagerProxy(
         if (intent.hasExtra(VirtualIntentExtras.TARGET_PACKAGE)) {
             return null
         }
-        val pkg = intent.component?.packageName ?: intent.`package`
-            ?: return null
+        val pkg = resolveVirtualTargetPackage(intent) ?: return null
         val app = virtualApps[pkg] ?: return null
         val targetClass = intent.component?.className ?: app.mainActivity
             ?: return null
@@ -387,6 +386,39 @@ class ActivityManagerProxy(
             putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
             clearSingleTopSemantics()
         }
+    }
+
+    /**
+     * Resolve the guest package for an activity start without relying on a
+     * guest-specific class name. Normally the Intent component package is
+     * already the registered virtual package. Some guest code, however,
+     * creates an explicit component through a context whose package identity
+     * is still the host package; the Intent then looks like host.package/
+     * guest.Class. VirtualContext carries the actual caller package in that
+     * case, so recover it only for a host-package component with a non-host
+     * class. Ordinary host and external/system intents pass through.
+     */
+    private fun resolveVirtualTargetPackage(intent: Intent): String? {
+        val directPkg = intent.component?.packageName ?: intent.`package`
+        if (directPkg != null && virtualApps.containsKey(directPkg)) {
+            return directPkg
+        }
+
+        val callerPkg = intent.getStringExtra(VirtualIntentExtras.CALLER_PACKAGE)
+        val targetClass = intent.component?.className
+        if (directPkg == hostPackage &&
+            callerPkg != null &&
+            virtualApps.containsKey(callerPkg) &&
+            targetClass != null &&
+            !targetClass.startsWith("$hostPackage.")
+        ) {
+            Timber.tag(TAG).i(
+                "Recovering virtual target from caller metadata: " +
+                    "host=$directPkg caller=$callerPkg class=$targetClass"
+            )
+            return callerPkg
+        }
+        return directPkg
     }
 
     /**

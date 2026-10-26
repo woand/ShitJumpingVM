@@ -159,7 +159,31 @@ class ActivityThreadHook(
                         // caused by virtualized GMS calls. Guest resource failures must
                         // remain fatal so missing resource injection is observable;
                         // compatibility belongs in the guest Resources instance.
+                        var isToastWindowFailure = false
+                        var cursor: Throwable? = e
+                        while (cursor != null) {
+                            if (cursor.message?.contains("Adding window failed") == true ||
+                                cursor.stackTrace.any {
+                                    it.className == "android.widget.ToastPresenter" ||
+                                        it.className.startsWith("android.widget.Toast")
+                                }) {
+                                isToastWindowFailure = true
+                                break
+                            }
+                            cursor = cursor.cause
+                        }
+
+                        // ToastPresenter validates the operation package against the
+                        // host UID. Consume only this narrow mismatch; other Toast
+                        // and all guest exceptions must still crash normally.
                         if (root is SecurityException &&
+                            root.message?.contains("not in UID") == true &&
+                            isToastWindowFailure) {
+                            com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+                                .logThrowable(
+                                    "main-looper guard SUPPRESSED guest Toast UID mismatch", e)
+                            Timber.tag(TAG).w(e, "Suppressed guest Toast UID mismatch: ${root.message}")
+                        } else if (root is SecurityException &&
                             (root.message?.contains("Unknown calling package name") == true ||
                              root.message?.contains("does not belong to") == true)) {
                             com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb

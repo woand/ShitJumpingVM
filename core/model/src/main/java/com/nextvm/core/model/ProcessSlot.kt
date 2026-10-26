@@ -46,6 +46,11 @@ object VirtualIntentExtras {
     const val APK_PATH = "_nextvm_apk_path"
     const val PROCESS_SLOT = "_nextvm_process_slot"
     const val LAUNCH_MODE = "_nextvm_launch_mode"
+    // Caller identity added by VirtualContext before an AMS start/bind.
+    // Kept separate from stub-target metadata: a guest can construct an
+    // explicit Intent whose component package is still the host package.
+    const val CALLER_INSTANCE = "_nextvm_caller_instance"
+    const val CALLER_PACKAGE = "_nextvm_caller_pkg"
 }
 
 /**

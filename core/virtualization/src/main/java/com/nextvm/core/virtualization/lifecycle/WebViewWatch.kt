@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * Sampling uses Thread.getStackTrace() on the main thread only:
  * it never calls getAllStackTraces (see DiagSuspendGate /
- * launch58). Unicom only, once per process; output
+ * launch58). Once per guest process; output
  * webviewwatch-<pid>.log next to the other guest diagnostics.
  */
 object WebViewWatch {
@@ -47,7 +47,7 @@ object WebViewWatch {
     private const val MAX_STACKS = 90
 
     fun schedule(packageName: String, filesDir: File) {
-        if (packageName != "com.sinovatech.unicom.ui") return
+        if (packageName.isBlank()) return
         if (!started.compareAndSet(false, true)) return
         Thread {
             try {

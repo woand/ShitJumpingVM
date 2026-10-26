@@ -13,6 +13,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
+import com.nextvm.core.model.VirtualConstants
 import timber.log.Timber
 import java.io.File
 
@@ -157,6 +158,13 @@ class VirtualContext(
     // === Identity overrides ===
 
     override fun getPackageName(): String = guestPackageName
+
+    /**
+     * Binder services validate the operation package against the host UID.
+     * Keep getPackageName() virtual for guest code, but use the host identity
+     * for framework operations such as Toast windows.
+     */
+    override fun getOpPackageName(): String = VirtualConstants.HOST_PACKAGE
 
     override fun getApplicationInfo(): ApplicationInfo {
         return super.getApplicationInfo().apply {
