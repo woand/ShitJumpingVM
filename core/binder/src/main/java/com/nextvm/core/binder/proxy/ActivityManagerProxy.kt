@@ -406,6 +406,19 @@ class ActivityManagerProxy(
 
         val callerPkg = intent.getStringExtra(VirtualIntentExtras.CALLER_PACKAGE)
         val targetClass = intent.component?.className
+        val processPkg = currentProcessGuestPackage()
+        if (directPkg == hostPackage &&
+            processPkg != null &&
+            virtualApps.containsKey(processPkg) &&
+            targetClass != null &&
+            !targetClass.startsWith("$hostPackage.")
+        ) {
+            Timber.tag(TAG).i(
+                "Recovering virtual target from process identity: " +
+                    "host=$directPkg process=$processPkg class=$targetClass"
+            )
+            return processPkg
+        }
         if (directPkg == hostPackage &&
             callerPkg != null &&
             virtualApps.containsKey(callerPkg) &&
@@ -419,6 +432,24 @@ class ActivityManagerProxy(
             return callerPkg
         }
         return directPkg
+    }
+
+    /**
+     * Raw Binder calls may lose the caller extras when Activity.startActivity
+     * is issued through Instrumentation/startActivityForResult. The call still
+     * executes in the guest process, whose process name is the guest package
+     * (optionally followed by a process suffix). Match that name against the
+     * registered virtual apps to recover the caller generically.
+     */
+    private fun currentProcessGuestPackage(): String? {
+        val processName = try {
+            android.app.Application.getProcessName()
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return virtualApps.keys.firstOrNull { packageName ->
+            processName == packageName || processName.startsWith("$packageName:")
+        }
     }
 
     /**
