@@ -155,7 +155,10 @@ class ActivityThreadHook(
                         var root: Throwable = e
                         while (root.cause != null) root = root.cause!!
 
-                        // Only suppress GMS-related SecurityExceptions
+                        // Only consume the narrowly identified system-identity failures
+                        // caused by virtualized GMS calls. Guest resource failures must
+                        // remain fatal so missing resource injection is observable;
+                        // compatibility belongs in the guest Resources instance.
                         if (root is SecurityException &&
                             (root.message?.contains("Unknown calling package name") == true ||
                              root.message?.contains("does not belong to") == true)) {
@@ -1341,6 +1344,8 @@ class ActivityThreadHook(
      * This is the injection point for resources, theme, and context wrapping.
      */
     internal fun onActivityPreCreate(activity: android.app.Activity) {
+        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
+            .log("preCreate enter " + activity.javaClass.name)
         var instanceId = lastLaunchInstanceId
         var apkPath = lastLaunchApkPath
         var packageName = lastLaunchPackageName
@@ -1351,16 +1356,27 @@ class ActivityThreadHook(
         // system or arrive after lastLaunchInstanceId has been cleared. In this case,
         // resolve the instanceId by matching the Activity's ClassLoader against the
         // GuestClassLoaderRegistry, or from the intent extras.
-        if (instanceId == null) {
+        if (instanceId == null || apkPath == null || packageName == null) {
             val activityCl = activity::class.java.classLoader
-            // Try to find instanceId from the Activity's intent
+            // Try to find instanceId from the Activity's intent, preserving
+            // any launch fields that are already available.
             val intent = runSafe(TAG) { activity.intent }
-            instanceId = intent?.getStringExtra(VirtualIntentExtras.INSTANCE_ID)
-            apkPath = intent?.getStringExtra(VirtualIntentExtras.APK_PATH)
-            packageName = intent?.getStringExtra(VirtualIntentExtras.TARGET_PACKAGE)
+            instanceId = intent?.getStringExtra(VirtualIntentExtras.INSTANCE_ID) ?: instanceId
+            apkPath = intent?.getStringExtra(VirtualIntentExtras.APK_PATH) ?: apkPath
+            packageName = intent?.getStringExtra(VirtualIntentExtras.TARGET_PACKAGE) ?: packageName
 
-            // If intent doesn't have extras, try resolving from the ClassLoader registry
-            if (instanceId == null && activityCl != null) {
+            // If an instance ID is already known, recover any missing fields
+            // from the authoritative VirtualApp record first.
+            instanceId?.let { knownInstanceId ->
+                engine.findApp(knownInstanceId)?.let { app ->
+                    if (apkPath == null) apkPath = app.apkPath
+                    if (packageName == null) packageName = app.packageName
+                }
+            }
+
+            // If any launch field is still missing, resolve from the Activity's
+            // exact ClassLoader or from the process-wide registry.
+            if ((instanceId == null || apkPath == null || packageName == null) && activityCl != null) {
                 val app = engine.findAppByClassLoader(activityCl)
                 if (app != null) {
                     instanceId = app.instanceId
@@ -1368,10 +1384,53 @@ class ActivityThreadHook(
                     packageName = app.packageName
                     Timber.tag(TAG).d("Resolved instanceId from ClassLoader for ${activity::class.java.name}: $instanceId")
                 }
+                // The engine's local classLoader map can contain a different loader
+                // instance from the one used by Instrumentation.newActivity(). The
+                // process-wide registry is authoritative for that exact object.
+                if (instanceId == null || apkPath == null || packageName == null) {
+                    val registryInstanceId =
+                        GuestClassLoaderRegistry.findInstanceIdByClassLoader(activityCl)
+                    if (registryInstanceId != null) {
+                        val registryApp = engine.findApp(registryInstanceId)
+                        if (registryApp != null) {
+                            instanceId = registryApp.instanceId
+                            apkPath = registryApp.apkPath
+                            packageName = registryApp.packageName
+                            Timber.tag(TAG).d(
+                                "Resolved instanceId from registry ClassLoader for " +
+                                    "${activity::class.java.name}: $instanceId"
+                            )
+                        }
+                    }
+                }
+
+                // Last fallback for framework-created Activities whose ClassLoader
+                // object is not the registered exact instance.
+                if (instanceId == null || apkPath == null || packageName == null) {
+                    val activityPackageName =
+                        runSafe(TAG) { activity.applicationInfo?.packageName }
+                    val packageApp =
+                        activityPackageName?.let { engine.findAppByPackage(it) }
+                    if (packageApp != null) {
+                        instanceId = packageApp.instanceId
+                        apkPath = packageApp.apkPath
+                        packageName = packageApp.packageName
+                        Timber.tag(TAG).d(
+                            "Resolved instanceId from Activity package for " +
+                                "${activity::class.java.name}: $instanceId"
+                        )
+                    }
+                }
             }
         }
 
-        if (instanceId == null || apkPath == null || packageName == null) return
+        if (instanceId == null || apkPath == null || packageName == null) {
+            Timber.tag(TAG).w(
+                "Skipping pre-create injection for ${activity::class.java.name}: " +
+                    "instanceId=$instanceId apkPath=${apkPath != null} packageName=$packageName"
+            )
+            return
+        }
 
         Timber.tag(TAG).d("Pre-create injection for activity ${activity::class.java.name} (instance: $instanceId)")
 
@@ -1389,7 +1448,7 @@ class ActivityThreadHook(
                     instanceId = instanceId
                 )
                 if (guestResources != null) {
-                    resMgr.injectResourcesIntoContext(activity, guestResources!!)
+                    resMgr.injectResourcesIntoActivity(activity, guestResources!!)
                     Timber.tag(TAG).d("Resources injected for $instanceId")
                 }
             }

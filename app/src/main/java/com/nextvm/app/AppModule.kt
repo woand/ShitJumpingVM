@@ -67,8 +67,10 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideVirtualApplicationManager(): VirtualApplicationManager =
-        VirtualApplicationManager()
+    fun provideVirtualApplicationManager(
+        resourceManager: VirtualResourceManager
+    ): VirtualApplicationManager =
+        VirtualApplicationManager(resourceManager)
 
     @Provides
     @Singleton

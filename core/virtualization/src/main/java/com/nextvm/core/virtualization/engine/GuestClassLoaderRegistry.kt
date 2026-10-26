@@ -47,6 +47,12 @@ object GuestClassLoaderRegistry {
      */
     fun getByInstanceId(instanceId: String): ClassLoader? = byInstanceId[instanceId]
 
+    /** Find the guest instance that owns an exact ClassLoader object. */
+    fun findInstanceIdByClassLoader(classLoader: ClassLoader?): String? {
+        if (classLoader == null) return null
+        return byInstanceId.entries.firstOrNull { it.value === classLoader }?.key
+    }
+
     /**
      * Get all registered ClassLoaders (for exhaustive retry in newActivity).
      */

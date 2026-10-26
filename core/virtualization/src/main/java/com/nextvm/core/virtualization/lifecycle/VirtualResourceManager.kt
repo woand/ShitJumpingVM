@@ -191,25 +191,75 @@ class VirtualResourceManager @Inject constructor() {
                 Resources(assetManager, displayMetrics, configuration)
             }
 
+            // Some optional CM title/bubble dimensions are delivered as resource ID 0
+            // by the packed guest. Keep the real guest ResourcesImpl, but make the
+            // zero-dimension sentinel harmless instead of crashing layout traversal.
+            val compatibleResources = wrapZeroDimensionResources(
+                resources, assetManager, displayMetrics, configuration
+            )
+
             // Step 6: Cache
             val splits = splitApkPaths ?: emptyList()
             resourceCache[instanceId] = ResourceEntry(
                 instanceId = instanceId,
                 apkPath = apkPath,
                 assetManager = assetManager,
-                resources = resources,
+                resources = compatibleResources,
                 configuration = configuration,
                 splitApkPaths = splits
             )
 
             Timber.tag(TAG).i("Resources created for $apkPath (density=${displayMetrics.densityDpi}, " +
                 "locale=${configuration.locales.get(0)}, splits=${splits.size})")
-            return resources
+            return compatibleResources
 
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to create Resources for $apkPath")
             return null
         }
+    }
+    /**
+     * Resources subclass used only for the guest resource instance.
+     * Resource ID 0 is invalid for normal Android Resources, but this packed
+     * guest uses it for optional CM UI dimensions. Returning 0 preserves the
+     * optional UI's intended default without hiding unrelated resource errors.
+     */
+    private class ZeroDimensionResources(
+        assetManager: AssetManager,
+        displayMetrics: DisplayMetrics,
+        configuration: Configuration
+    ) : Resources(assetManager, displayMetrics, configuration) {
+        override fun getDimensionPixelSize(id: Int): Int {
+            if (id == 0) return 0
+            return super.getDimensionPixelSize(id)
+        }
+
+        override fun getDimension(id: Int): Float {
+            if (id == 0) return 0f
+            return super.getDimension(id)
+        }
+    }
+
+    private fun wrapZeroDimensionResources(
+        resources: Resources,
+        assetManager: AssetManager,
+        displayMetrics: DisplayMetrics,
+        configuration: Configuration
+    ): Resources {
+        val compatible = ZeroDimensionResources(assetManager, displayMetrics, configuration)
+        runCatching {
+            // Preserve the already-created guest ResourcesImpl, including its
+            // ApkAssets and configuration-specific caches.
+            val implField = findField(Resources::class.java, "mResourcesImpl")
+            implField?.isAccessible = true
+            implField?.set(compatible, implField?.get(resources))
+            val classLoaderField = findField(Resources::class.java, "mClassLoader")
+            classLoaderField?.isAccessible = true
+            classLoaderField?.set(compatible, classLoaderField?.get(resources))
+        }.onFailure {
+            Timber.tag(TAG).w(it, "Could not copy guest Resources internals into compatibility wrapper")
+        }
+        return compatible
     }
 
     /**

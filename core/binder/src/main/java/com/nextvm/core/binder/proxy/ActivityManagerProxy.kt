@@ -1,8 +1,10 @@
 package com.nextvm.core.binder.proxy
 
 import android.content.ComponentName
+import android.content.ContentProvider
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ProviderInfo
 import android.os.Bundle
 import android.provider.Settings
 import com.nextvm.core.common.findField
@@ -101,6 +103,26 @@ class ActivityManagerProxy(
 
     private val virtualApps = mutableMapOf<String, VirtualApp>()
     private val hostPackage = VirtualConstants.HOST_PACKAGE
+
+    // Providers declared by a guest are instantiated in-process by
+    // VirtualApplicationManager. Keep their binders here so a guest lookup
+    // never falls through to the real package installed on the device. The
+    // latter has a different UID and is commonly non-exported, which makes
+    // AMS reject the lookup before the guest can reach its own provider.
+    private val virtualProviders = java.util.concurrent.ConcurrentHashMap<String, ContentProvider>()
+
+    fun registerVirtualProvider(authority: String, provider: ContentProvider) {
+        for (name in authority.split(';').map { it.trim() }.filter { it.isNotEmpty() }) {
+            virtualProviders[name] = provider
+            Timber.tag(TAG).i("Registered in-process provider: $name -> ${provider.javaClass.name}")
+        }
+    }
+
+    fun unregisterVirtualProvider(authority: String) {
+        for (name in authority.split(';').map { it.trim() }.filter { it.isNotEmpty() }) {
+            virtualProviders.remove(name)
+        }
+    }
 
     // GMS service router — set by VirtualEngine after initialization
     @Volatile
@@ -664,6 +686,23 @@ class ActivityManagerProxy(
     private fun handleGetContentProvider(method: Method, args: Array<out Any>?): Any? {
         if (args == null) return invokeOriginal(method, args)
 
+        val authority = args.getOrNull(2) as? String
+        val localProvider = authority?.let { virtualProviders[it] }
+        if (localProvider != null) {
+            val holder = buildVirtualContentProviderHolder(method, authority, localProvider)
+            if (holder != null) {
+                Timber.tag(TAG).i(
+                    "getContentProvider: serving in-process guest provider " +
+                        "$authority -> ${localProvider.javaClass.name}"
+                )
+                return holder
+            }
+            Timber.tag(TAG).w(
+                "getContentProvider: failed to build holder for local provider " +
+                    "$authority; falling back to AMS"
+            )
+        }
+
         // Android 16 AIDL signature:
         // getContentProvider(IApplicationThread caller, String callingPackage,
         //                    String name, int userId, boolean stable)
@@ -708,6 +747,52 @@ class ActivityManagerProxy(
             } else {
                 throw e
             }
+        }
+    }
+
+    /**
+     * Build the hidden android.app.ContentProviderHolder returned by AMS.
+     * ContentProvider.getIContentProvider() is hidden, so use reflection just
+     * as ActivityThread does internally. The holder is deliberately marked
+     * noReleaseNeeded: the provider is owned by the virtual ApplicationManager
+     * and must not be released through the real AMS provider bookkeeping.
+     */
+    private fun buildVirtualContentProviderHolder(
+        method: Method,
+        authority: String,
+        provider: ContentProvider
+    ): Any? {
+        return try {
+            val getIcp = ContentProvider::class.java.getDeclaredMethod("getIContentProvider")
+            getIcp.isAccessible = true
+            val icp = getIcp.invoke(provider)
+
+            val holderClass = method.returnType
+            val info = ProviderInfo().apply {
+                name = provider.javaClass.name
+                this.authority = authority
+                applicationInfo = provider.context?.applicationInfo
+                exported = false
+                enabled = true
+                grantUriPermissions = true
+            }
+            val ctor = holderClass.getDeclaredConstructor(ProviderInfo::class.java)
+            ctor.isAccessible = true
+            val holder = ctor.newInstance(info)
+
+            val providerField = findField(holderClass, "provider")
+                ?: throw NoSuchFieldException("ContentProviderHolder.provider")
+            providerField.isAccessible = true
+            providerField.set(holder, icp)
+
+            findField(holderClass, "noReleaseNeeded")?.let { field ->
+                field.isAccessible = true
+                field.setBoolean(holder, true)
+            }
+            holder
+        } catch (e: Throwable) {
+            Timber.tag(TAG).w(e, "Unable to create local ContentProviderHolder for $authority")
+            null
         }
     }
 

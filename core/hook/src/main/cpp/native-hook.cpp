@@ -144,6 +144,7 @@ bool g_v90_bss_probe = false;
 // live); snapshots lseek+read it (read is not in the trap set).
 bool g_v91_probe = false;
 int g_sc_maps_fd = -1;
+bool g_v92_probe = false;
 
 // v57: while true, /proc/self spoofing is suspended and hooked readers
 // get the real content. Opened around the CM guest's bind: the SecNeo
@@ -3411,6 +3412,117 @@ long sc_install_filter_ex_v91(bool notif, bool with_signals = true,
     return -1;
 #endif
 }
+
+// v92 (launch118): combined pread and executable-mapping witness.
+long sc_install_filter_ex_v92(bool notif, bool with_signals = true,
+                              bool tsync = true) {
+#if !defined(__aarch64__)
+    (void)notif; (void)with_signals; (void)tsync;
+    return -1;
+#else
+    const unsigned s_kill = with_signals ? 129 : 0x3FFFF210u;
+    const unsigned s_tkill = with_signals ? 130 : 0x3FFFF211u;
+    const unsigned s_tgkill = with_signals ? 131 : 0x3FFFF212u;
+    const unsigned s_sigaction = with_signals ? 134 : 0x3FFFF213u;
+    const unsigned s_sigprocmask = with_signals ? 135 : 0x3FFFF214u;
+    const unsigned s_tgsigqueue = with_signals ? 297 : 0x3FFFF215u;
+    const unsigned s_pidfd = with_signals ? 424 : 0x3FFFF216u;
+    const unsigned s_sigreturn = (notif && with_signals) ? 139 : 0x3FFFF217u;
+    const unsigned t_openat = (g_sc_trap_mask & 0x01) ? __NR_openat : 0x3FFFF200u;
+    const unsigned t_openat2 = (g_sc_trap_mask & 0x02) ? __NR_openat2 : 0x3FFFF201u;
+    const unsigned t_readlinkat = (g_sc_trap_mask & 0x04) ? __NR_readlinkat : 0x3FFFF202u;
+    const unsigned t_faccessat = (g_sc_trap_mask & 0x08) ? __NR_faccessat : 0x3FFFF203u;
+    const unsigned t_faccessat2 = (g_sc_trap_mask & 0x10) ? __NR_faccessat2 : 0x3FFFF204u;
+    const unsigned t_newfstatat = (g_sc_trap_mask & 0x20) ? __NR_newfstatat : 0x3FFFF205u;
+    const unsigned t_unlinkat = (g_sc_trap_mask & 0x40) ? __NR_unlinkat : 0x3FFFF206u;
+    const unsigned t_pread64 = __NR_pread64;
+    const unsigned t_mmap = __NR_mmap;
+    const unsigned t_mprotect = __NR_mprotect;
+    const unsigned t_memfd_create = __NR_memfd_create;
+    uintptr_t svc = reinterpret_cast<uintptr_t>(&nv_seccomp_svc_point);
+    uint32_t lo = static_cast<uint32_t>(svc & 0xffffffffu);
+    uint32_t hi = static_cast<uint32_t>(svc >> 32);
+    const unsigned kOutcome = notif ? SECCOMP_RET_USER_NOTIF : SECCOMP_RET_TRAP;
+    const unsigned kArgsProt = offsetof(struct seccomp_data, args) + 2 * sizeof(__u64);
+    const unsigned kArgsCount = kArgsProt;
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 42),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat, 19, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_openat2, 18, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_readlinkat, 17, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat, 16, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_faccessat2, 15, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_newfstatat, 14, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_unlinkat, 13, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_kill, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tkill, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgkill, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigaction, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigprocmask, 8, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_tgsigqueue, 7, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_pidfd, 6, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, s_sigreturn, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_pread64, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mmap, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mprotect, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_memfd_create, 1, 0),
+        BPF_STMT(BPF_JMP | BPF_JA, 21),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo, 0, 3),
+        BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, lo + 8, 2, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, hi, 16, 0),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mmap, 3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_mprotect, 5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, t_pread64, 7, 0),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsProt),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 8, 7),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsProt),
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 5, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, kArgsCount),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x14, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x40, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, kOutcome),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog;
+    prog.len = static_cast<unsigned short>(sizeof(f) / sizeof(f[0]));
+    prog.filter = f;
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (notif) {
+        unsigned flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        if (tsync) flags |= SECCOMP_FILTER_FLAG_TSYNC;
+        long fd = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, flags, &prog);
+        if (fd >= 0) {
+            LOGI("seccomp-diag: USER_NOTIF filter installed (v92), listener=%ld flags=0x%x", fd, flags);
+            return fd;
+        }
+        LOGE("seccomp-diag: USER_NOTIF install FAILED (v92) (errno=%d flags=0x%x)", errno, flags);
+        return -1;
+    }
+    long rc = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                      SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v92, TSYNC)");
+        return 0;
+    }
+    int e1 = errno;
+    rc = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+    if (rc == 0) {
+        LOGI("seccomp-diag: filter installed (v92, prctl, single thread + inheritors)");
+        return 0;
+    }
+    LOGE("seccomp-diag: filter install FAILED (v92) (seccomp errno=%d, prctl errno=%d)", e1, errno);
+    return -1;
+#endif
+}
 // used inside the SIGSYS handler (no allocation, no libc calls).
 // Returns the rewritten length, or -1 when no rewrite applies.
 #if defined(__aarch64__)
@@ -3974,14 +4086,15 @@ static int sc_v91_lib_tag(const char* p) {
 static pthread_mutex_t g_v91_snap_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void sc_v91_snapshot(const char* lib) {
+    const char* tag = g_v92_probe ? "V92 SNAP" : "SNAP";
     if (g_sc_maps_fd < 0) {
-        sc_slogf("SNAP-UNAVAIL lib=%s\n", lib);
+        sc_slogf("%s-UNAVAIL lib=%s\n", tag, lib);
         return;
     }
     pthread_mutex_lock(&g_v91_snap_mu);
     if (lseek(g_sc_maps_fd, 0, SEEK_SET) < 0) {
         pthread_mutex_unlock(&g_v91_snap_mu);
-        sc_slogf("SNAP-UNAVAIL lib=%s\n", lib);
+        sc_slogf("%s-UNAVAIL lib=%s\n", tag, lib);
         return;
     }
     char chunk[8192];
@@ -4047,7 +4160,7 @@ static void sc_v91_snapshot(const char* lib) {
                     bool is_dexvmp = sc_v91_contains(pn, "dexvmp");
                     if (is_anon || is_dexvmp) {
                         if (regions < 64) {
-                            sc_slogf("SNAP 0x%lx-0x%lx %s %lu %s\n",
+                            sc_slogf("%s 0x%lx-0x%lx %s %lu %s\n", tag,
                                      start, end, perms, end - start,
                                      is_dexvmp ? "dexvmp" : "anon");
                         } else {
@@ -4061,8 +4174,8 @@ static void sc_v91_snapshot(const char* lib) {
             }
         }
     }
-    if (capped) sc_slogf("SNAP-CAP lib=%s\n", lib);
-    sc_slogf("SNAP-DONE lib=%s regions=%d\n", lib, regions);
+    if (capped) sc_slogf("%s-CAP lib=%s\n", tag, lib);
+    sc_slogf("%s-DONE lib=%s regions=%d\n", tag, lib, regions);
     pthread_mutex_unlock(&g_v91_snap_mu);
 }
 
@@ -4325,31 +4438,66 @@ bool sc_serve_notif(struct seccomp_notif* req,
         }
     }
 
+
+    // v92 (launch118): combined raw mapping witness, record-only.
+    if (g_v92_probe &&
+        g_v89_window_open.load(std::memory_order_relaxed) &&
+        (g_v87_probe_all ||
+         sc_streq(g_sc_guest_pkg,
+                  "com.greenpoint.android.mc10086.activity"))) {
+        if (nr == __NR_mmap || nr == __NR_mprotect ||
+            nr == __NR_memfd_create) {
+            static std::atomic<long> v92_logged{0};
+            long n = v92_logged.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4096) {
+                if (nr == __NR_mmap) {
+                    sc_slogf("V92 MMAP tid=%u by=%s ip=0x%lx len=%lu "
+                             "prot=0x%lx flags=0x%lx fd=%ld\n",
+                             req->pid, modname, (unsigned long)ip, a1, a2,
+                             a3, (long)req->data.args[4]);
+                } else if (nr == __NR_mprotect) {
+                    sc_slogf("V92 MPROTECT tid=%u by=%s ip=0x%lx "
+                             "addr=0x%lx len=%lu prot=0x%lx\n",
+                             req->pid, modname, (unsigned long)ip, a0, a1, a2);
+                } else {
+                    sc_slogf("V92 MEMFD tid=%u by=%s ip=0x%lx flags=%lu\n",
+                             req->pid, modname, (unsigned long)ip, a1);
+                }
+            } else if (n == 4096) {
+                sc_slogf("V92 CAP\n");
+            }
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            return false;
+        }
+    }
+
     // v91 (diagnostic only, launch117): NOTIF pread existence probe.
     // BPF already pre-filtered to count 20/64; here the fd set
     // attributes the call to a loader lib. No CM gate, no window
     // gate: the fd set itself restricts attribution to key fds,
     // and the TRAP-ALIVE line is meant for noise rounds too.
     // Record-only CONTINUE.
-    if (g_v91_probe && nr == __NR_pread64) {
+    if ((g_v91_probe || g_v92_probe) && nr == __NR_pread64) {
         static std::atomic<long> v91_logged{0};
         static std::atomic<int> v91_alive{0};
         int lib = sc_v91_lookup_fd(static_cast<long>(a0));
         if (lib != 0) {
             long n = v91_logged.fetch_add(1, std::memory_order_relaxed);
             if (n < 64) {
-                sc_slogf("V91 PREAD lib=%s fd=%ld count=%lu "
+                sc_slogf("%s lib=%s fd=%ld count=%lu "
                          "offset=0x%lx tid=%u seq=%ld\n",
+                         g_v92_probe ? "V92 PREAD" : "V91 PREAD",
                          lib == 1 ? "DexHelper" : "dexjni",
                          static_cast<long>(a0),
                          static_cast<unsigned long>(a2),
                          static_cast<unsigned long>(a3),
                          req->pid, n);
             } else if (n == 64) {
-                sc_slogf("V91 CAP\n");
+                sc_slogf("%s\n", g_v92_probe ? "V92 CAP" : "V91 CAP");
             }
         } else if (v91_alive.fetch_add(1, std::memory_order_relaxed) == 0) {
-            sc_slogf("V91 TRAP-ALIVE fd=%ld count=%lu tid=%u\n",
+            sc_slogf("%s fd=%ld count=%lu tid=%u\n",
+                     g_v92_probe ? "V92 TRAP-ALIVE" : "V91 TRAP-ALIVE",
                      static_cast<long>(a0),
                      static_cast<unsigned long>(a2),
                      req->pid);
@@ -4557,7 +4705,7 @@ bool sc_serve_notif(struct seccomp_notif* req,
                             sc_slogf("NREDIR tid=%u fd=%ld "
                                      "(direct)\n",
                                      req->pid, rfd);
-                            if (g_v91_probe) {
+                            if (g_v91_probe || g_v92_probe) {
                                 int lib = sc_v91_lib_tag(path);
                                 if (lib != 0) {
                                     sc_v91_record_fd(rfd, lib);
@@ -4579,7 +4727,7 @@ bool sc_serve_notif(struct seccomp_notif* req,
                         if (nfd >= 0) {
                             sc_slogf("NREDIRX tid=%u fd=%ld\n",
                                      req->pid, nfd);
-                            if (g_v91_probe) {
+                            if (g_v91_probe || g_v92_probe) {
                                 int lib = sc_v91_lib_tag(path);
                                 if (lib != 0) {
                                     sc_v91_record_fd(nfd, lib);
@@ -5501,6 +5649,14 @@ int sc_arm(const char* log_path) {
             int mfd = open("/proc/self/maps", O_RDONLY);
             if (mfd >= 0) g_sc_maps_fd = mfd;
         }
+        // v92: arm the combined pread + executable-mapping witness.
+        int p92fd = open(sibling("/sc-v92-probe"), O_RDONLY);
+        if (p92fd >= 0) {
+            close(p92fd);
+            g_v92_probe = true;
+            int mfd = open("/proc/self/maps", O_RDONLY);
+            if (mfd >= 0) g_sc_maps_fd = mfd;
+        }
         if (g_sc_log_fd >= 0) {
             char note[96];
             int nl = 0;
@@ -5517,6 +5673,8 @@ int sc_arm(const char* log_path) {
             sc_app_dec(note, nl, ncap, g_v90_bss_probe ? 1 : 0);
             sc_app(note, nl, ncap, " v91=");
             sc_app_dec(note, nl, ncap, g_v91_probe ? 1 : 0);
+            sc_app(note, nl, ncap, " v92=");
+            sc_app_dec(note, nl, ncap, g_v92_probe ? 1 : 0);
             sc_app(note, nl, ncap, "\n");
             note[nl] = 0;
             ssize_t u = write(g_sc_log_fd, note, nl);
@@ -5542,13 +5700,15 @@ int sc_arm(const char* log_path) {
             pthread_detach(th);
         }
     }
-    long lfd = g_v91_probe ? sc_install_filter_ex_v91(true)
+    long lfd = g_v92_probe ? sc_install_filter_ex_v92(true)
+                           : g_v91_probe ? sc_install_filter_ex_v91(true)
                            : g_v89_syscall ? sc_install_filter_ex_v89(true)
                                            : sc_install_filter_ex(true);
     if (lfd < 0) {
         // Retry without TSYNC (covers the calling thread and all
         // threads created afterwards, which includes the guest's).
-        lfd = g_v91_probe ? sc_install_filter_ex_v91(true, true, false)
+        lfd = g_v92_probe ? sc_install_filter_ex_v92(true, true, false)
+                          : g_v91_probe ? sc_install_filter_ex_v91(true, true, false)
                           : g_v89_syscall
                           ? sc_install_filter_ex_v89(true, true, false)
                           : sc_install_filter_ex(true, true, false);
@@ -5564,6 +5724,9 @@ int sc_arm(const char* log_path) {
         }
         if (g_v91_probe) {
             LOGI("seccomp-diag: v91 pread+snap probe armed");
+        }
+        if (g_v92_probe) {
+            LOGI("seccomp-diag: v92 pread+maps+syscall probe armed");
         }
         return 0;
     }

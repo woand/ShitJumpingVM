@@ -13,6 +13,7 @@ import com.nextvm.core.common.AndroidCompat
 import com.nextvm.core.common.findField
 import com.nextvm.core.common.findMethod
 import com.nextvm.core.common.runSafe
+import com.nextvm.core.binder.proxy.ActivityManagerProxy
 import com.nextvm.core.hook.NativeHookBridge
 import timber.log.Timber
 import java.util.concurrent.ConcurrentHashMap
@@ -43,7 +44,9 @@ import javax.inject.Singleton
  *   6. Call Application.onCreate()
  */
 @Singleton
-class VirtualApplicationManager @Inject constructor() {
+class VirtualApplicationManager @Inject constructor(
+    private val resourceManager: VirtualResourceManager
+) {
 
     companion object {
         private const val TAG = "VAppLifecycle"
@@ -876,6 +879,17 @@ class VirtualApplicationManager @Inject constructor() {
             )
             createAppContext.isAccessible = true
             val appContext = createAppContext.invoke(null, activityThread, loadedApk) as Context
+            val guestResources = (virtualContext as? com.nextvm.core.sandbox.VirtualContext)
+                ?.resources
+            if (guestResources != null) {
+                val before = appContext.resources
+                if (guestResources !== before) {
+                    resourceManager.injectResourcesIntoContext(appContext, guestResources)
+                }
+                // Keep the framework registry pointing at the same guest resource
+                // object. This covers ContextImpls created after Application attach.
+                resourceManager.injectResourcesIntoActivityThread(packageName, guestResources)
+            }
 
             val guestClassLoader = loadedApkClass.getMethod("getClassLoader")
                 .invoke(loadedApk) as? ClassLoader ?: return null
@@ -915,6 +929,15 @@ class VirtualApplicationManager @Inject constructor() {
             }
             GuestBreadcrumb.log("framework makeApplication exit app=" +
                 application.javaClass.name)
+
+            // LoadedApk.makeApplication() creates and attaches the guest Application.
+            // Rebind its actual base Context as well; otherwise Application code can
+            // retain a framework-created ContextImpl with host resources.
+            if (guestResources != null) {
+                application.baseContext?.let { base ->
+                    resourceManager.injectResourcesIntoContext(base, guestResources)
+                }
+            }
 
             val record = ApplicationRecord(
                 instanceId = instanceId,
@@ -1452,8 +1475,14 @@ class VirtualApplicationManager @Inject constructor() {
                 provider.attachInfo(application, providerInfo)
 
                 record?.contentProviders?.add(provider)
+                ActivityManagerProxy.activeInstance?.registerVirtualProvider(
+                    providerInfo.authority,
+                    provider
+                )
                 Timber.tag(TAG).d("  Provider installed: $providerClassName")
-                GuestBreadcrumb.log("provider ok $providerClassName")
+                GuestBreadcrumb.log(
+                    "provider ok $providerClassName authority=${providerInfo.authority}"
+                )
 
             } catch (e: ClassNotFoundException) {
                 GuestBreadcrumb.logThrowable(
