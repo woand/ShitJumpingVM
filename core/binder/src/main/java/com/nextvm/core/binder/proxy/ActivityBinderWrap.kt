@@ -407,9 +407,7 @@ class ActivityBinderWrap private constructor(
         // start and create the record. Starts with no activity
         // context (services/receivers) keep NEW_TASK: AMS demands it
         // there and there is no source task to stack onto anyway.
-        val ntCleared = if (resultTo != null &&
-            (rewritten.flags and Intent.FLAG_ACTIVITY_NEW_TASK) != 0
-        ) {
+        val ntCleared = if ((rewritten.flags and Intent.FLAG_ACTIVITY_NEW_TASK) != 0) {
             rewritten.flags =
                 rewritten.flags and Intent.FLAG_ACTIVITY_NEW_TASK.inv()
             true
