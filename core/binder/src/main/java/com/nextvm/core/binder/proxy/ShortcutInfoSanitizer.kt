@@ -53,6 +53,61 @@ internal object ShortcutInfoSanitizer {
         return kept
     }
 
+    /**
+     * v109: ShortcutManager.setDynamicShortcuts wraps the List in a
+     * ParceledListSlice before calling IShortcutService, so the proxy
+     * receives a slice, not a List (this is why v108 never ran: its
+     * List-only branch never matched). ParceledListSlice is hidden
+     * from the SDK stub, so it is handled purely by reflection and
+     * identified by class name, never imported.
+     *
+     * Returns: the original slice when nothing is dropped, a new slice
+     * wrapping the kept entries when some are dropped, or null when
+     * every entry is dropped or the slice cannot be inspected —
+     * in both null cases the caller must not call the service at all.
+     */
+    fun sanitizeSlice(slice: Any): Any? {
+        val list = extractSliceList(slice)
+        if (list == null) {
+            Timber.tag(TAG).w("cannot inspect ParceledListSlice, dropping call")
+            return null
+        }
+        if (list.isEmpty() || list[0] !is ShortcutInfo) return slice
+        @Suppress("UNCHECKED_CAST")
+        val kept = sanitize(list as List<ShortcutInfo>)
+        if (kept.isEmpty()) return null
+        if (kept.size == list.size) return slice
+        return try {
+            slice.javaClass.getConstructor(List::class.java).newInstance(kept)
+        } catch (e: Throwable) {
+            Timber.tag(TAG).w(e, "cannot repack ParceledListSlice, dropping call")
+            null
+        }
+    }
+
+    private fun extractSliceList(slice: Any): List<*>? {
+        try {
+            val method = slice.javaClass.getMethod("getList")
+            val result = method.invoke(slice)
+            if (result is List<*>) return result
+        } catch (_: Throwable) {
+            // Fall through to field access.
+        }
+        var clazz: Class<*>? = slice.javaClass
+        while (clazz != null) {
+            try {
+                val field = clazz.getDeclaredField("mList")
+                field.isAccessible = true
+                val result = field.get(slice)
+                if (result is List<*>) return result
+                return null
+            } catch (_: Throwable) {
+                clazz = clazz.superclass
+            }
+        }
+        return null
+    }
+
     private fun hasInvalidBitmap(info: ShortcutInfo): Boolean {
         try {
             val icon = getIcon(info) ?: return false
