@@ -353,7 +353,15 @@ class ActivityManagerProxy(
                     clearSingleTopSemantics()
                 }
 
-                newArgs[intentIndex] = newIntent
+                val safeIntent = IntentParcelSanitizer.sanitize(newIntent)
+                if (safeIntent.dropped != 0) {
+                    Timber.tag(TAG).w(
+                        "startActivity sanitized %d invalid extra(s) for %s",
+                        safeIntent.dropped,
+                        resolvedTargetPkg
+                    )
+                }
+                newArgs[intentIndex] = safeIntent.intent
                 return method.invoke(original, *newArgs)
             }
         }
@@ -377,7 +385,7 @@ class ActivityManagerProxy(
         val app = virtualApps[pkg] ?: return null
         val targetClass = intent.component?.className ?: app.mainActivity
             ?: return null
-        return Intent(intent).apply {
+        val rewritten = Intent(intent).apply {
             setClassName(hostPackage, getStubForApp(app))
             putExtra(VirtualIntentExtras.TARGET_PACKAGE, pkg)
             putExtra(VirtualIntentExtras.TARGET_ACTIVITY, targetClass)
@@ -386,6 +394,7 @@ class ActivityManagerProxy(
             putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
             clearSingleTopSemantics()
         }
+        return IntentParcelSanitizer.sanitize(rewritten).intent
     }
 
     /**
