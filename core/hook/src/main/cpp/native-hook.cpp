@@ -146,6 +146,13 @@ bool g_v91_probe = false;
 int g_sc_maps_fd = -1;
 bool g_v92_probe = false;
 
+// v106 diagnostic safety: the CM guest installs its own fault handlers and
+// the old SEGV witness re-installed/chained over them. That made a real
+// Bitmap/Parcel fault recurse through the witness and hide the original
+// tombstone. The witness and signal-channel interception are now opt-in
+// through files/sc-enable-fault-witness.
+bool g_sc_fault_witness = false;
+
 // v57: while true, /proc/self spoofing is suspended and hooked readers
 // get the real content. Opened around the CM guest's bind: the SecNeo
 // mini-linker stub (libDexHelper.so) parses the real /proc/self/maps
@@ -2985,6 +2992,11 @@ void sc_handle(int sig, siginfo_t* info, void* uctx) {
 
 volatile sig_atomic_t g_sc_armed = 0;
 
+// sc_arm() may be reached more than once while guest bootstrap is replayed.
+// Publish the armed bit only after installing the filter, so serialize the
+// whole sequence to prevent two USER_NOTIF listeners racing to install.
+static std::mutex g_sc_arm_mutex;
+
 static void sc_refresh_modules() {
 #if defined(__aarch64__)
     if (!g_sc_armed) return;
@@ -5484,6 +5496,7 @@ int sc_arm(const char* log_path) {
     (void)log_path;
     return -1;
 #else
+    std::lock_guard<std::mutex> arm_lock(g_sc_arm_mutex);
     if (g_sc_armed) return 0;
     g_sc_module_count = 0;
     dl_iterate_phdr(sc_phdr_cb, nullptr);
@@ -5588,6 +5601,34 @@ int sc_arm(const char* log_path) {
             flag2[fl] = 0;
             return flag2;
         };
+
+        // v106: explicit kill switch for the whole seccomp diagnostic.
+        // The existing launch harness can create this sibling flag for a
+        // clean runtime comparison without changing Java state or clearing
+        // the guest. Mark the process armed so a duplicate JNI call is a
+        // harmless no-op after the diagnostic has been disabled.
+        int disablefd = open(sibling("/sc-disable-seccomp-diag"), O_RDONLY);
+        if (disablefd >= 0) {
+            close(disablefd);
+            g_sc_armed = 1;
+            g_sc_mode = 3;
+            if (g_sc_log_fd >= 0) {
+                const char note[] = "MODE seccomp-disabled-v106\n";
+                ssize_t u = write(g_sc_log_fd, note, sizeof(note) - 1);
+                (void)u;
+            }
+            LOGI("seccomp-diag: disabled by sc-disable-seccomp-diag (v106)");
+            return 0;
+        }
+
+        // v106 default: do not take over guest fault signals. The old
+        // witness remains available as an explicit opt-in for experiments
+        // that need its signal telemetry.
+        int witnessfd = open(sibling("/sc-enable-fault-witness"), O_RDONLY);
+        if (witnessfd >= 0) {
+            close(witnessfd);
+            g_sc_fault_witness = true;
+        }
         int lfd = open(sibling("/sc-lean"), O_RDONLY);
         if (lfd >= 0) {
             close(lfd);
@@ -5685,9 +5726,13 @@ int sc_arm(const char* log_path) {
     // v64: arm the synchronous-fault witness for the CM guest
     // (see segvw block above). Installed before the filter so the
     // handlers are in place long before any guest library loads.
-    if (sc_streq(g_sc_guest_pkg,
+    if (g_sc_fault_witness &&
+        sc_streq(g_sc_guest_pkg,
                  "com.greenpoint.android.mc10086.activity")) {
         segvw_install();
+    } else if (sc_streq(g_sc_guest_pkg,
+                        "com.greenpoint.android.mc10086.activity")) {
+        LOGI("seccomp-diag: guest fault witness disabled (v106)");
     }
 
     // The supervisor thread starts BEFORE any filter exists, so
@@ -5700,18 +5745,19 @@ int sc_arm(const char* log_path) {
             pthread_detach(th);
         }
     }
-    long lfd = g_v92_probe ? sc_install_filter_ex_v92(true)
-                           : g_v91_probe ? sc_install_filter_ex_v91(true)
-                           : g_v89_syscall ? sc_install_filter_ex_v89(true)
-                                           : sc_install_filter_ex(true);
+    const bool watch_signals = g_sc_fault_witness;
+    long lfd = g_v92_probe ? sc_install_filter_ex_v92(true, watch_signals)
+                           : g_v91_probe ? sc_install_filter_ex_v91(true, watch_signals)
+                           : g_v89_syscall ? sc_install_filter_ex_v89(true, watch_signals)
+                                           : sc_install_filter_ex(true, watch_signals);
     if (lfd < 0) {
         // Retry without TSYNC (covers the calling thread and all
         // threads created afterwards, which includes the guest's).
-        lfd = g_v92_probe ? sc_install_filter_ex_v92(true, true, false)
-                          : g_v91_probe ? sc_install_filter_ex_v91(true, true, false)
+        lfd = g_v92_probe ? sc_install_filter_ex_v92(true, watch_signals, false)
+                          : g_v91_probe ? sc_install_filter_ex_v91(true, watch_signals, false)
                           : g_v89_syscall
-                          ? sc_install_filter_ex_v89(true, true, false)
-                          : sc_install_filter_ex(true, true, false);
+                          ? sc_install_filter_ex_v89(true, watch_signals, false)
+                          : sc_install_filter_ex(true, watch_signals, false);
     }
     if (lfd >= 0) {
         g_sc_listener_fd = static_cast<int>(lfd);

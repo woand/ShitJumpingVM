@@ -376,6 +376,17 @@ class ActivityBinderWrap private constructor(
             null
         }
 
+        // v106: record only the shape of the optional Parcelable payload.
+        // Bitmap values are represented by their class name, never by their
+        // contents. This lets the device run distinguish a crash in the
+        // rewritten start parcel from a later guest Binder call.
+        trace(
+            "start payload: profiler=" +
+                (profilerInfo?.javaClass?.name ?: "null") +
+                " options=" + describeBundle(options) +
+                " asUser=" + asUser
+        )
+
         if (intent == null) {
             data.setDataPosition(0)
             val ok = real.transact(code, data, reply, flags)
@@ -451,6 +462,24 @@ class ActivityBinderWrap private constructor(
             return ok
         } finally {
             out.recycle()
+        }
+    }
+
+    private fun describeBundle(bundle: Bundle?): String {
+        if (bundle == null) return "null"
+        return try {
+            val keys = bundle.keySet().toList()
+            val shown = keys.take(20).joinToString(",") { key ->
+                val type = try {
+                    bundle.get(key)?.javaClass?.name ?: "null"
+                } catch (_: Throwable) {
+                    "<read-error>"
+                }
+                "$key=$type"
+            }
+            "count=${keys.size}[$shown${if (keys.size > 20) ",..." else ""}]"
+        } catch (t: Throwable) {
+            "<error:${t.javaClass.simpleName}>"
         }
     }
 
