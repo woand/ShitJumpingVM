@@ -3028,6 +3028,32 @@ internal class JobSchedulerProxyHandler(
                                 newArgs[i] = VirtualConstants.HOST_PACKAGE
                             }
                         }
+                        // v108: drop ShortcutInfo entries whose Icon Bitmap
+                        // cannot be parceled (launch131: Bitmap.writeToParcel
+                        // -> AParcel_writeInt32 fault 0x8). Valid entries
+                        // pass through unchanged; if every entry is dropped,
+                        // do not call the service at all (an empty call
+                        // would clear the guest's existing shortcuts).
+                        if (method.name in setOf(
+                                "setDynamicShortcuts",
+                                "addDynamicShortcuts",
+                                "updateShortcuts"
+                            )
+                        ) {
+                            for (i in newArgs.indices) {
+                                val arg = newArgs[i]
+                                if (arg is List<*> && arg.isNotEmpty()
+                                    && arg[0] is android.content.pm.ShortcutInfo
+                                ) {
+                                    @Suppress("UNCHECKED_CAST")
+                                    val kept = ShortcutInfoSanitizer.sanitize(
+                                        arg as List<android.content.pm.ShortcutInfo>
+                                    )
+                                    if (kept.isEmpty()) return null
+                                    newArgs[i] = kept
+                                }
+                            }
+                        }
                         return try { method.invoke(original, *newArgs) }
                         catch (e: Exception) {
                             val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
