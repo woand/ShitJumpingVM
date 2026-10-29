@@ -3028,45 +3028,20 @@ internal class JobSchedulerProxyHandler(
                                 newArgs[i] = VirtualConstants.HOST_PACKAGE
                             }
                         }
-                        // v108: drop ShortcutInfo entries whose Icon Bitmap
-                        // cannot be parceled (launch131: Bitmap.writeToParcel
-                        // -> AParcel_writeInt32 fault 0x8). Valid entries
-                        // pass through unchanged; if every entry is dropped,
-                        // do not call the service at all (an empty call
-                        // would clear the guest's existing shortcuts).
-                        // v109: ShortcutManager wraps the List in a
-                        // ParceledListSlice before calling the service, so
-                        // the proxy normally receives a slice, not a List
-                        // (v108's List-only branch never matched, which is
-                        // why launch132 still crashed identically). Handle
-                        // both shapes; a slice that cannot be inspected
-                        // or repacked is dropped whole, not forwarded.
+                        // v110 probe only: log the call shape and Bitmap
+                        // state, then forward the original arguments
+                        // unchanged (package-name rewrite above is kept).
+                        // Sanitizing (v108/v109) is deliberately bypassed
+                        // for this probe run, so the faulting input is
+                        // observed exactly as the guest sent it. Remove
+                        // this bypass in the fix version.
                         if (method.name in setOf(
                                 "setDynamicShortcuts",
                                 "addDynamicShortcuts",
                                 "updateShortcuts"
                             )
                         ) {
-                            for (i in newArgs.indices) {
-                                val arg = newArgs[i] ?: continue
-                                if (arg is List<*> && arg.isNotEmpty()
-                                    && arg[0] is android.content.pm.ShortcutInfo
-                                ) {
-                                    @Suppress("UNCHECKED_CAST")
-                                    val kept = ShortcutInfoSanitizer.sanitize(
-                                        arg as List<android.content.pm.ShortcutInfo>
-                                    )
-                                    if (kept.isEmpty()) return null
-                                    newArgs[i] = kept
-                                } else if (arg.javaClass.name ==
-                                    "android.content.pm.ParceledListSlice"
-                                ) {
-                                    val keptSlice =
-                                        ShortcutInfoSanitizer.sanitizeSlice(arg)
-                                            ?: return null
-                                    newArgs[i] = keptSlice
-                                }
-                            }
+                            ShortcutProbe.log(method.name, newArgs)
                         }
                         return try { method.invoke(original, *newArgs) }
                         catch (e: Exception) {
