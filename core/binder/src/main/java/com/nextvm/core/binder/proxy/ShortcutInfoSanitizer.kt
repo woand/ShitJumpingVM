@@ -49,6 +49,8 @@ internal object ShortcutInfoSanitizer {
             // lines were 0 in launches 134-137).
             Log.w("SvcProxyMgr",
                 "ShortcutInfo: dropped $dropped invalid ShortcutInfo(s) before setDynamicShortcuts")
+            ShortcutProbe.fileLog(
+                "ShortcutInfo: dropped $dropped invalid ShortcutInfo(s) before setDynamicShortcuts")
         }
         return kept
     }
@@ -71,6 +73,8 @@ internal object ShortcutInfoSanitizer {
         if (list == null) {
             Log.w("SvcProxyMgr",
                 "ShortcutInfo: cannot inspect ParceledListSlice, dropping call")
+            ShortcutProbe.fileLog(
+                "ShortcutInfo: cannot inspect ParceledListSlice, dropping call")
             return null
         }
         if (list.isEmpty() || list[0] !is ShortcutInfo) return slice
@@ -82,6 +86,8 @@ internal object ShortcutInfoSanitizer {
             slice.javaClass.getConstructor(List::class.java).newInstance(kept)
         } catch (e: Throwable) {
             Log.w("SvcProxyMgr",
+                "ShortcutInfo: cannot repack ParceledListSlice, dropping call: ${e.javaClass.simpleName}")
+            ShortcutProbe.fileLog(
                 "ShortcutInfo: cannot repack ParceledListSlice, dropping call: ${e.javaClass.simpleName}")
             null
         }
@@ -110,10 +116,20 @@ internal object ShortcutInfoSanitizer {
         return null
     }
 
+    /**
+     * v113: drop ANY ShortcutInfo whose Icon carries a Bitmap, whole,
+     * regardless of the Bitmap's Java-visible state. launch138 proved
+     * the Java-visible checks (recycled / dimensions / Intent) are
+     * insufficient: a kept entry, valid by every Java check, still
+     * faulted in native parcel. The trigger is therefore treated as
+     * "Bitmap icon present", not "Bitmap icon invalid by Java checks".
+     * Non-Bitmap icons (URI / data / resource) are kept unless the
+     * Intent check below fails; a null Icon is kept.
+     */
     private fun hasInvalidBitmap(info: ShortcutInfo): Boolean {
         try {
             val icon = getIcon(info) ?: return false
-            if (isInvalidIconBitmap(icon)) return true
+            if (hasBitmapIcon(icon)) return true
         } catch (_: Throwable) {
             return true
         }
@@ -124,6 +140,17 @@ internal object ShortcutInfoSanitizer {
             return true
         }
         return false
+    }
+
+    private fun hasBitmapIcon(icon: Icon): Boolean {
+        val type = try {
+            icon.type
+        } catch (_: Throwable) {
+            return true
+        }
+        if (type == Icon.TYPE_BITMAP || type == Icon.TYPE_ADAPTIVE_BITMAP) return true
+        // Bitmap-typed by content even if the type field says otherwise.
+        return getBitmap(icon) != null
     }
 
     private fun getIcon(info: ShortcutInfo): Icon? {
@@ -160,22 +187,4 @@ internal object ShortcutInfoSanitizer {
         }
     }
 
-    private fun isInvalidIconBitmap(icon: Icon): Boolean {
-        val type = try {
-            icon.type
-        } catch (_: Throwable) {
-            return true
-        }
-        val bitmap = getBitmap(icon)
-        if (bitmap == null) {
-            // Only bitmap-typed icons need a Bitmap; URI/data/resource
-            // icons parcel a string/bytes, not a Bitmap object.
-            return type == Icon.TYPE_BITMAP || type == Icon.TYPE_ADAPTIVE_BITMAP
-        }
-        return try {
-            bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0
-        } catch (_: Throwable) {
-            true
-        }
-    }
 }

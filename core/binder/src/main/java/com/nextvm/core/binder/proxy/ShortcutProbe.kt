@@ -27,12 +27,36 @@ import android.util.Log
  * The probe never parcels a Bitmap and never modifies the arguments.
  */
 internal object ShortcutProbe {
+    /**
+     * v113 file channel: logcat lines from this proxy were 0 in
+     * launches 134-138 even when the stackdump proves handleMethod
+     * ran, so the probe now also appends to a per-pid file that
+     * survives the guest process death and can be pulled with run-as
+     * (same mechanism as stackdump-<pid>.log: the Application's
+     * filesDir, which for a framework-bound guest resolves to the
+     * guest sandbox files dir). Log.i is kept as a second channel.
+     */
+    fun fileLog(msg: String) {
+        try {
+            val app = Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null)
+                as? android.app.Application ?: return
+            val out = java.io.File(
+                app.filesDir, "shortcut-probe-${android.os.Process.myPid()}.log"
+            )
+            out.appendText("ShortcutProbe: $msg\n")
+        } catch (_: Throwable) {
+            // Probe must never disturb the guest call.
+        }
+    }
+
     private fun i(msg: String) {
         try {
             Log.i("SvcProxyMgr", "ShortcutProbe: $msg")
         } catch (_: Throwable) {
             // Probe must never disturb the guest call.
         }
+        fileLog(msg)
     }
 
     /**

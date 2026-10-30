@@ -3076,6 +3076,11 @@ internal class JobSchedulerProxyHandler(
                                 newArgs[i] = keptSlice
                             }
                         }
+                        // v113: record in the probe file that sanitizing
+                        // completed and the call is being forwarded, so
+                        // the file alone distinguishes "kept and
+                        // forwarded" from "dropped whole".
+                        ShortcutProbe.fileLog("${method.name} sanitized, forwarding")
                         return try { method.invoke(original, *newArgs) }
                         catch (e: Exception) {
                             val cause = if (e is java.lang.reflect.InvocationTargetException) e.cause else e
