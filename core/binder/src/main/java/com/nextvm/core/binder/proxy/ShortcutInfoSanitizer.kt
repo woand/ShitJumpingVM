@@ -3,7 +3,7 @@ package com.nextvm.core.binder.proxy
 import android.content.pm.ShortcutInfo
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
-import timber.log.Timber
+import android.util.Log
 
 /**
  * v108: drop ShortcutInfo entries whose Icon Bitmap cannot be parceled,
@@ -32,7 +32,6 @@ import timber.log.Timber
  * the guest, an uninspected one can.
  */
 internal object ShortcutInfoSanitizer {
-    private const val TAG = "ShortcutInfo"
 
     fun sanitize(shortcuts: List<ShortcutInfo>): List<ShortcutInfo> {
         var dropped = 0
@@ -45,10 +44,11 @@ internal object ShortcutInfoSanitizer {
             kept.add(info)
         }
         if (dropped != 0) {
-            Timber.tag(TAG).w(
-                "dropped %d invalid ShortcutInfo(s) before setDynamicShortcuts",
-                dropped
-            )
+            // v112 reroute: direct Log under the proven SvcProxyMgr
+            // tag, same reason as ShortcutProbe (Timber-tagged probe
+            // lines were 0 in launches 134-137).
+            Log.w("SvcProxyMgr",
+                "ShortcutInfo: dropped $dropped invalid ShortcutInfo(s) before setDynamicShortcuts")
         }
         return kept
     }
@@ -69,7 +69,8 @@ internal object ShortcutInfoSanitizer {
     fun sanitizeSlice(slice: Any): Any? {
         val list = extractSliceList(slice)
         if (list == null) {
-            Timber.tag(TAG).w("cannot inspect ParceledListSlice, dropping call")
+            Log.w("SvcProxyMgr",
+                "ShortcutInfo: cannot inspect ParceledListSlice, dropping call")
             return null
         }
         if (list.isEmpty() || list[0] !is ShortcutInfo) return slice
@@ -80,7 +81,8 @@ internal object ShortcutInfoSanitizer {
         return try {
             slice.javaClass.getConstructor(List::class.java).newInstance(kept)
         } catch (e: Throwable) {
-            Timber.tag(TAG).w(e, "cannot repack ParceledListSlice, dropping call")
+            Log.w("SvcProxyMgr",
+                "ShortcutInfo: cannot repack ParceledListSlice, dropping call: ${e.javaClass.simpleName}")
             null
         }
     }

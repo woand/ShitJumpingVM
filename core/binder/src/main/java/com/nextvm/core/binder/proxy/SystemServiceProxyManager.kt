@@ -3019,28 +3019,36 @@ internal class JobSchedulerProxyHandler(
         ) { original ->
             object : BaseServiceProxy(original, this) {
                 override fun handleMethod(method: Method, args: Array<out Any>?, isVirtual: Boolean): Any? {
-                    // v111: probe BEFORE the gate, so the log proves
-                    // whether the gate passed (launch136: the pid gate
-                    // alone is always false in a guest process, because
-                    // registerProcessPid is never called).
-                    val orArgs = manager.isVirtualCallOrArgs(
-                        android.os.Process.myPid(), args)
-                    if (method.name in setOf(
+                    // v112: NO gate for set/add/update. launch137 proved
+                    // both gates are always false in a guest process:
+                    // pidToInstance is never filled (registerProcessPid
+                    // has no callers) and virtualPackages is never
+                    // filled either (SystemServiceProxyManager.
+                    // registerVirtualApp has no callers; VirtualEngine
+                    // registers with BinderProxyManager instead). Any
+                    // gate built on those two maps can never pass, so
+                    // the sanitizer below never ran in launches
+                    // 131/132/133/136/137. This proxy is installed by
+                    // VirtualEngine in guest processes, and dropping an
+                    // unparcelable Bitmap shortcut is safe for a host
+                    // caller too, so unconditional cleaning is the
+                    // correct scope here. Other shortcut-service
+                    // methods are forwarded unchanged.
+                    if (method.name !in setOf(
                             "setDynamicShortcuts",
                             "addDynamicShortcuts",
                             "updateShortcuts"
                         )
                     ) {
-                        ShortcutProbe.log(method.name, args, isVirtual, orArgs)
+                        return invokeOriginal(method, args)
                     }
-                    // v111 gate: pid gate OR parameter gate. The
-                    // parameter gate is the fallback the codebase
-                    // already documents for the single-process
-                    // architecture (args contain the virtual package
-                    // name as a String). Without it, the sanitizer
-                    // below never runs (launch131/132/133/136).
-                    if (!isVirtual && !orArgs) return invokeOriginal(method, args)
-                    // Rewrite virtual package names to host
+                    // Probe first, via direct Log (v112 reroute), so
+                    // the next run's log proves the call reached the
+                    // proxy and what the gate values were, even though
+                    // they no longer decide anything.
+                    val orArgs = manager.isVirtualCallOrArgs(
+                        android.os.Process.myPid(), args)
+                    ShortcutProbe.log(method.name, args, isVirtual, orArgs)
                     if (args != null) {
                         val newArgs = args.toMutableList().toTypedArray()
                         for (i in newArgs.indices) {
@@ -3048,38 +3056,24 @@ internal class JobSchedulerProxyHandler(
                                 newArgs[i] = VirtualConstants.HOST_PACKAGE
                             }
                         }
-                        // v109 sanitizing, restored: drop ShortcutInfo
-                        // entries whose Icon Bitmap cannot be parceled;
-                        // valid entries pass through unchanged. A List
-                        // or a ParceledListSlice are both handled; a
-                        // slice that cannot be inspected or repacked,
-                        // or a list that becomes empty, is not
-                        // forwarded at all.
-                        if (method.name in setOf(
-                                "setDynamicShortcuts",
-                                "addDynamicShortcuts",
-                                "updateShortcuts"
-                            )
-                        ) {
-                            for (i in newArgs.indices) {
-                                val arg = newArgs[i] ?: continue
-                                if (arg is List<*> && arg.isNotEmpty()
-                                    && arg[0] is android.content.pm.ShortcutInfo
-                                ) {
-                                    @Suppress("UNCHECKED_CAST")
-                                    val kept = ShortcutInfoSanitizer.sanitize(
-                                        arg as List<android.content.pm.ShortcutInfo>
-                                    )
-                                    if (kept.isEmpty()) return null
-                                    newArgs[i] = kept
-                                } else if (arg.javaClass.name ==
-                                    "android.content.pm.ParceledListSlice"
-                                ) {
-                                    val keptSlice =
-                                        ShortcutInfoSanitizer.sanitizeSlice(arg)
-                                            ?: return null
-                                    newArgs[i] = keptSlice
-                                }
+                        for (i in newArgs.indices) {
+                            val arg = newArgs[i] ?: continue
+                            if (arg is List<*> && arg.isNotEmpty()
+                                && arg[0] is android.content.pm.ShortcutInfo
+                            ) {
+                                @Suppress("UNCHECKED_CAST")
+                                val kept = ShortcutInfoSanitizer.sanitize(
+                                    arg as List<android.content.pm.ShortcutInfo>
+                                )
+                                if (kept.isEmpty()) return null
+                                newArgs[i] = kept
+                            } else if (arg.javaClass.name ==
+                                "android.content.pm.ParceledListSlice"
+                            ) {
+                                val keptSlice =
+                                    ShortcutInfoSanitizer.sanitizeSlice(arg)
+                                        ?: return null
+                                newArgs[i] = keptSlice
                             }
                         }
                         return try { method.invoke(original, *newArgs) }

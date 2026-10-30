@@ -3,10 +3,18 @@ package com.nextvm.core.binder.proxy
 import android.content.pm.ShortcutInfo
 import android.graphics.Bitmap
 import android.graphics.drawable.Icon
-import timber.log.Timber
+import android.util.Log
 
 /**
- * v110 probe, kept in v111 as a gate witness.
+ * v110 probe, kept in v111 as a gate witness, rerouted in v112.
+ *
+ * v112 reroute rationale: the Timber-tagged probe produced 0 lines
+ * in launches 134–137 even in a run (launch137) whose stackdump proves
+ * handleMethod reached the gate, while Timber-tagged SvcProxyMgr
+ * lines do reach logcat. The probe therefore bypasses Timber
+ * entirely and uses android.util.Log directly under the proven
+ * SvcProxyMgr tag, prefixed "ShortcutProbe: ", so a missing line
+ * can no longer be blamed on the Timber tag.
  *
  * Logs, for every shortcut-service call, the method name, every
  * argument's class name, the String arguments (package names), the
@@ -17,13 +25,15 @@ import timber.log.Timber
  * by IntentParcelSanitizer.
  *
  * The probe never parcels a Bitmap and never modifies the arguments.
- * In v111 it is called BEFORE the gate, so a run that still crashes
- * with 0 probe lines would mean the call never reached the proxy at
- * all, while probe lines with isVirtual=false/orArgs=true prove the
- * parameter gate (not the pid gate) let the sanitizer run.
  */
 internal object ShortcutProbe {
-    private const val TAG = "ShortcutProbe"
+    private fun i(msg: String) {
+        try {
+            Log.i("SvcProxyMgr", "ShortcutProbe: $msg")
+        } catch (_: Throwable) {
+            // Probe must never disturb the guest call.
+        }
+    }
 
     /**
      * v111: called BEFORE the isVirtual gate, so the log itself proves
@@ -31,16 +41,17 @@ internal object ShortcutProbe {
      * (launch136: always false in a guest process, registerProcessPid
      * is never called); orArgs is the isVirtualCallOrArgs fallback
      * (any String argument is a known virtual package).
+     * v112: the gate is gone for shortcut methods (see handleMethod),
+     * but both values are still logged for the record.
      */
     fun log(methodName: String, args: Array<out Any>?, isVirtual: Boolean, orArgs: Boolean) {
         if (args == null) {
-            Timber.tag(TAG).i("%s args=null isVirtual=%b orArgs=%b", methodName, isVirtual, orArgs)
+            i("$methodName args=null isVirtual=$isVirtual orArgs=$orArgs")
             return
         }
         val classes = args.joinToString(",") { it?.javaClass?.name ?: "null" }
         val strings = args.filterIsInstance<String>().joinToString(",")
-        Timber.tag(TAG).i("%s argc=%d isVirtual=%b orArgs=%b classes=[%s] strings=[%s]",
-            methodName, args.size, isVirtual, orArgs, classes, strings)
+        i("$methodName argc=${args.size} isVirtual=$isVirtual orArgs=$orArgs classes=[$classes] strings=[$strings]")
         for (arg in args) {
             when {
                 arg is List<*> -> logList(arg)
@@ -48,9 +59,9 @@ internal object ShortcutProbe {
                     "android.content.pm.ParceledListSlice" -> {
                     val list = sliceList(arg)
                     if (list == null) {
-                        Timber.tag(TAG).i("slice: cannot extract list")
+                        i("slice: cannot extract list")
                     } else {
-                        Timber.tag(TAG).i("slice: size=%d", list.size)
+                        i("slice: size=${list.size}")
                         logList(list)
                     }
                 }
@@ -84,20 +95,18 @@ internal object ShortcutProbe {
     private fun logList(list: List<*>) {
         for ((index, item) in list.withIndex()) {
             if (item !is ShortcutInfo) {
-                Timber.tag(TAG).i("entry %d: not ShortcutInfo (%s)", index,
-                    item?.javaClass?.name ?: "null")
+                i("entry $index: not ShortcutInfo (${item?.javaClass?.name ?: "null"})")
                 continue
             }
             val id = try { item.id } catch (_: Throwable) { "?" }
             val icon = getIcon(item)
             if (icon == null) {
-                Timber.tag(TAG).i("entry %d id=%s icon=null", index, id)
+                i("entry $index id=$id icon=null")
             } else {
                 val type = try { icon.type } catch (_: Throwable) { -1 }
                 val bitmap = getBitmap(icon)
                 if (bitmap == null) {
-                    Timber.tag(TAG).i(
-                        "entry %d id=%s iconType=%d bitmap=null", index, id, type)
+                    i("entry $index id=$id iconType=$type bitmap=null")
                 } else {
                     val state = try {
                         "recycled=${bitmap.isRecycled} " +
@@ -106,9 +115,7 @@ internal object ShortcutProbe {
                     } catch (t: Throwable) {
                         "unreadable: ${t.javaClass.simpleName}"
                     }
-                    Timber.tag(TAG).i(
-                        "entry %d id=%s iconType=%d bitmap: %s",
-                        index, id, type, state)
+                    i("entry $index id=$id iconType=$type bitmap: $state")
                 }
             }
             val intentDropped = try {
@@ -118,7 +125,7 @@ internal object ShortcutProbe {
             } catch (t: Throwable) {
                 "intentUnreadable: ${t.javaClass.simpleName}"
             }
-            Timber.tag(TAG).i("entry %d id=%s %s", index, id, intentDropped)
+            i("entry $index id=$id $intentDropped")
         }
     }
 
