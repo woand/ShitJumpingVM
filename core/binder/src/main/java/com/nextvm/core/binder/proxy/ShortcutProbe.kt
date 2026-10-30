@@ -6,31 +6,41 @@ import android.graphics.drawable.Icon
 import timber.log.Timber
 
 /**
- * v110 probe only — diagnostic, not a fix. Remove in the fix version.
+ * v110 probe, kept in v111 as a gate witness.
  *
- * Logs, for every shortcut-service call from a virtual app, the method
- * name, every argument's class name, and for each ShortcutInfo in a
- * List or ParceledListSlice: its id, its Icon type, and its Bitmap
- * state (null, isRecycled, width, height, config), plus whether its
- * Intent would be dropped by IntentParcelSanitizer.
+ * Logs, for every shortcut-service call, the method name, every
+ * argument's class name, the String arguments (package names), the
+ * isVirtual pid-gate value and the isVirtualCallOrArgs fallback
+ * value, and for each ShortcutInfo in a List or ParceledListSlice:
+ * its id, its Icon type, and its Bitmap state (null, isRecycled,
+ * width, height, config), plus whether its Intent would be dropped
+ * by IntentParcelSanitizer.
  *
- * The probe never parcels a Bitmap and never modifies the arguments:
- * the caller forwards the original arguments unchanged after logging,
- * so the faulting input is observed exactly as the guest sent it.
- * This distinguishes the two launch133 explanations: "sanitizer ran
- * but the Bitmap looked valid in Java" vs "sanitizer never ran
- * because the argument shape did not match".
+ * The probe never parcels a Bitmap and never modifies the arguments.
+ * In v111 it is called BEFORE the gate, so a run that still crashes
+ * with 0 probe lines would mean the call never reached the proxy at
+ * all, while probe lines with isVirtual=false/orArgs=true prove the
+ * parameter gate (not the pid gate) let the sanitizer run.
  */
 internal object ShortcutProbe {
     private const val TAG = "ShortcutProbe"
 
-    fun log(methodName: String, args: Array<out Any>?) {
+    /**
+     * v111: called BEFORE the isVirtual gate, so the log itself proves
+     * whether the gate passed. isVirtual is the pidToInstance check
+     * (launch136: always false in a guest process, registerProcessPid
+     * is never called); orArgs is the isVirtualCallOrArgs fallback
+     * (any String argument is a known virtual package).
+     */
+    fun log(methodName: String, args: Array<out Any>?, isVirtual: Boolean, orArgs: Boolean) {
         if (args == null) {
-            Timber.tag(TAG).i("%s args=null", methodName)
+            Timber.tag(TAG).i("%s args=null isVirtual=%b orArgs=%b", methodName, isVirtual, orArgs)
             return
         }
         val classes = args.joinToString(",") { it?.javaClass?.name ?: "null" }
-        Timber.tag(TAG).i("%s argc=%d classes=[%s]", methodName, args.size, classes)
+        val strings = args.filterIsInstance<String>().joinToString(",")
+        Timber.tag(TAG).i("%s argc=%d isVirtual=%b orArgs=%b classes=[%s] strings=[%s]",
+            methodName, args.size, isVirtual, orArgs, classes, strings)
         for (arg in args) {
             when {
                 arg is List<*> -> logList(arg)
