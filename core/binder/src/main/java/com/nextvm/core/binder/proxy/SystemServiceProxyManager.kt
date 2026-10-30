@@ -3065,14 +3065,37 @@ internal class JobSchedulerProxyHandler(
                                 val kept = ShortcutInfoSanitizer.sanitize(
                                     arg as List<android.content.pm.ShortcutInfo>
                                 )
-                                if (kept.isEmpty()) return null
+                                if (kept.isEmpty()) {
+                                    // v114: launch139 proved returning null
+                                    // here is fatal: ShortcutManager
+                                    // unboxes the service result to a
+                                    // boolean (ShortcutManager.java:148)
+                                    // and a null causes NPE -> process
+                                    // kill. set/add/update all return
+                                    // boolean, so answer TRUE without
+                                    // forwarding; non-boolean methods
+                                    // (should not occur here) keep null.
+                                    ShortcutProbe.fileLog(
+                                        "${method.name} all entries dropped, returning TRUE without forwarding")
+                                    return if (method.returnType ==
+                                        Boolean::class.javaPrimitiveType
+                                    ) java.lang.Boolean.TRUE else null
+                                }
                                 newArgs[i] = kept
                             } else if (arg.javaClass.name ==
                                 "android.content.pm.ParceledListSlice"
                             ) {
                                 val keptSlice =
                                     ShortcutInfoSanitizer.sanitizeSlice(arg)
-                                        ?: return null
+                                        ?: run {
+                                            // v114: same null-unboxing trap
+                                            // as the List branch above.
+                                            ShortcutProbe.fileLog(
+                                                "${method.name} slice dropped whole, returning TRUE without forwarding")
+                                            return if (method.returnType ==
+                                                Boolean::class.javaPrimitiveType
+                                            ) java.lang.Boolean.TRUE else null
+                                        }
                                 newArgs[i] = keptSlice
                             }
                         }
