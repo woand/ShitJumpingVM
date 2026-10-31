@@ -362,11 +362,61 @@ class ActivityManagerProxy(
                     )
                 }
                 newArgs[intentIndex] = safeIntent.intent
-                return method.invoke(original, *newArgs)
+                val result = method.invoke(original, *newArgs)
+                // v128-fold-retry: AMS answered DELIVERED_TO_TOP (3)
+                // for a rewritten Standard-stub start. launch154
+                // proved the folded intent is then delivered nowhere
+                // (no NewIntentItem ever reaches the guest process),
+                // so retrying is not a duplicate: re-send the same
+                // rewrite against a different Standard slot. A
+                // different component cannot fold onto the same top
+                // record, so the retry must create a fresh record
+                // and take the normal new-activity path. Exactly one
+                // retry; code=0 flows are untouched.
+                if (result is Int && result == 3) {
+                    val stubClass =
+                        safeIntent.intent.component?.className
+                    val alternate = stubClass?.let {
+                        alternateStandardStub(it)
+                    }
+                    if (alternate != null) {
+                        val retryIntent =
+                            Intent(safeIntent.intent).apply {
+                                setClassName(
+                                    safeIntent.intent.component
+                                        ?.packageName ?: hostPackage,
+                                    alternate
+                                )
+                            }
+                        val retryArgs = newArgs.clone() as Array<Any?>
+                        retryArgs[intentIndex] = retryIntent
+                        Timber.tag(TAG).i(
+                            "v128-fold-retry: %s -> %s " +
+                                "(AMS folded the first start)",
+                            stubClass, alternate
+                        )
+                        return method.invoke(original, *retryArgs)
+                    }
+                }
+                return result
             }
         }
 
         return method.invoke(original, *newArgs)
+    }
+
+    /**
+     * v128: next Standard stub slot for the same process slot.
+     * "…P2\$Standard00" -> "…P2\$Standard01", wrapping 04 -> 00.
+     * Returns null for non-Standard stub classes, so SingleTop /
+     * SingleTask / SingleInstance rewrites (where a DELIVERED_TO_TOP
+     * answer is legitimate onNewIntent delivery) never retry.
+     */
+    fun alternateStandardStub(stubClassName: String): String? {
+        val m = Regex("^(.*\\\$Standard)(\\d{2})$")
+            .matchEntire(stubClassName) ?: return null
+        val n = m.groupValues[2].toIntOrNull() ?: return null
+        return m.groupValues[1] + "%02d".format((n + 1) % 5)
     }
 
     /**

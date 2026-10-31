@@ -458,7 +458,77 @@ class ActivityBinderWrap private constructor(
             out.writeTypedObject(options, 0)
             if (asUser) out.writeTypedObject(userHandle, 0)
             val ok = real.transact(code, out, reply, flags)
-            traceStartResult(reply, "rewritten->" + rewritten.component)
+            val result = traceStartResult(
+                reply, "rewritten->" + rewritten.component
+            )
+            // v128-fold-retry: same fold handling as the proxy path
+            // (see ActivityManagerProxy.handleStartActivity). AMS
+            // answered DELIVERED_TO_TOP (3) for a rewritten
+            // Standard-stub start; launch154 proved the folded
+            // intent is delivered nowhere, so one re-send against a
+            // different Standard slot cannot duplicate anything and
+            // must create a fresh record. The retry runs in its own
+            // reply parcel (so its result is witnessed truthfully);
+            // the caller's reply keeps its layout, with only the
+            // result int overwritten by the retry's result.
+            if (result == 3) {
+                val stubClass = rewritten.component?.className
+                val alternate = stubClass?.let {
+                    proxy?.alternateStandardStub(it)
+                }
+                if (alternate != null) {
+                    val retryIntent = Intent(rewritten).apply {
+                        setClassName(
+                            rewritten.component?.packageName
+                                ?: VirtualConstants.HOST_PACKAGE,
+                            alternate
+                        )
+                    }
+                    trace(
+                        "v128-fold-retry: " + stubClass + " -> " +
+                            alternate
+                    )
+                    val out2 = Parcel.obtain()
+                    val retryReply = Parcel.obtain()
+                    try {
+                        out2.writeInterfaceToken(descriptor)
+                        out2.writeStrongBinder(caller)
+                        out2.writeString(VirtualConstants.HOST_PACKAGE)
+                        out2.writeString(callingFeatureId)
+                        out2.writeTypedObject(retryIntent, 0)
+                        out2.writeString(resolvedType)
+                        out2.writeStrongBinder(resultTo)
+                        out2.writeString(resultWho)
+                        out2.writeInt(requestCode)
+                        out2.writeInt(startFlags)
+                        out2.writeTypedObject(
+                            profilerInfo as? android.os.Parcelable, 0
+                        )
+                        out2.writeTypedObject(options, 0)
+                        if (asUser) out2.writeTypedObject(userHandle, 0)
+                        val retryOk = real.transact(
+                            code, out2, retryReply, flags
+                        )
+                        val retryResult = traceStartResult(
+                            retryReply, "retry->" + alternate
+                        )
+                        if (retryResult != null) {
+                            try {
+                                reply.setDataPosition(4)
+                                reply.writeInt(retryResult)
+                                reply.setDataPosition(0)
+                            } catch (_: Throwable) {
+                                // Caller keeps the original result;
+                                // the retry's side effect stands.
+                            }
+                        }
+                        return retryOk
+                    } finally {
+                        out2.recycle()
+                        retryReply.recycle()
+                    }
+                }
+            }
             return ok
         } finally {
             out.recycle()
@@ -495,10 +565,10 @@ class ActivityBinderWrap private constructor(
      * the delivery vanished". Best-effort: the parcel position is
      * restored and any parse failure is itself traced, never thrown.
      */
-    private fun traceStartResult(reply: Parcel?, label: String) {
+    private fun traceStartResult(reply: Parcel?, label: String): Int? {
         if (reply == null) {
             trace("start RESULT <no reply parcel> " + label)
-            return
+            return null
         }
         val saved = reply.dataPosition()
         try {
@@ -506,11 +576,13 @@ class ActivityBinderWrap private constructor(
             reply.readException()
             val result = reply.readInt()
             trace("start RESULT code=" + result + " " + label)
+            return result
         } catch (t: Throwable) {
             trace(
                 "start RESULT <unparseable: " +
                     t.javaClass.simpleName + "> " + label
             )
+            return null
         } finally {
             try {
                 reply.setDataPosition(saved)
