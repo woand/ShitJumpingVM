@@ -1735,6 +1735,69 @@ class VirtualApplicationManager @Inject constructor(
             } catch (_: Throwable) {
                 GuestBreadcrumb.log("v120-plugin-probe schedule failed")
             }
+            // v121 probe (read-only): AW delegate state + in-memory
+            // dex dump. The on-disk dex holds only the SecNeo shell
+            // (7 classes, no initLoader); the real dex lives only in
+            // ART anonymous memory, so the caller search needs the
+            // bytes from this process itself. Runs only for the
+            // SecNeo shell Application (AW); other guests skip it.
+            // The dex scan runs on a background thread so it can
+            // never stall bind; the AW state check is synchronous
+            // and cheap. Nothing here calls initLoader or changes
+            // any guest state.
+            try {
+                if (application.javaClass.name ==
+                    "com.secneo.apkwrapper.AW"
+                ) {
+                    val realField = try {
+                        findField(application.javaClass, "a")
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    val realApp = try {
+                        realField?.isAccessible = true
+                        realField?.get(null)
+                    } catch (_: Throwable) {
+                        "field-read-failed"
+                    }
+                    val realDesc = when (realApp) {
+                        null -> "null (real Application never created)"
+                        is Application -> {
+                            val base = try {
+                                realApp.baseContext
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            "class=${realApp.javaClass.name} " +
+                                "baseContext=" + if (base == null) {
+                                    "null (attachBaseContext never ran)"
+                                } else {
+                                    "attached (${base.javaClass.name})"
+                                }
+                        }
+                        else -> "unexpected=$realApp"
+                    }
+                    GuestBreadcrumb.log(
+                        "v121-plugin-probe AW realApplication: $realDesc"
+                    )
+                    Thread({
+                        try {
+                            dumpMemoryDex(application)
+                        } catch (_: Throwable) {
+                            GuestBreadcrumb.log(
+                                "v121-plugin-probe memdex dump failed"
+                            )
+                        }
+                    }, "v121-memdex-dump").start()
+                } else {
+                    GuestBreadcrumb.log(
+                        "v121-plugin-probe not AW " +
+                            "(${application.javaClass.name}), skipped"
+                    )
+                }
+            } catch (_: Throwable) {
+                GuestBreadcrumb.log("v121-plugin-probe AW state failed")
+            }
             try {
                 val pmAi = application.packageManager.getApplicationInfo(
                     application.packageName,
@@ -1830,6 +1893,212 @@ class VirtualApplicationManager @Inject constructor(
         } catch (_: Throwable) {
             // Probe must never disturb the guest.
         }
+    }
+
+    /**
+     * v121 probe (read-only, background thread): dump every dex
+     * blob reachable in this process's own address space so the
+     * initLoader caller search can run offline with dexdump.
+     * Scans only anonymous readable mappings (the shell's decrypted
+     * dex is anonymous; file-backed host/framework dex is skipped),
+     * skips JIT code caches, and validates each candidate header
+     * (magic, header_size 0x70, endian 0x12345678, file_size in
+     * range and inside its mapping) before writing it. Caps: 32
+     * blobs, 512MB total. A magic split across a 1MB chunk boundary
+     * would be missed (accepted: real mmapped dex is page-aligned).
+     * VMP caveat: if the caller method itself is VM-protected, its
+     * body is VM bytecode, not dex bytecode, and no dump will show
+     * the call — that outcome is itself a finding.
+     */
+    private fun dumpMemoryDex(application: Application) {
+        val pid = android.os.Process.myPid()
+        GuestBreadcrumb.log("v121-plugin-probe memdex scan started pid=$pid")
+        val dumpedRanges = ArrayList<Pair<Long, Long>>()
+        val dumpedKeys = HashSet<String>()
+        var count = 0
+        var totalBytes = 0L
+        val maxBlobs = 32
+        val maxTotal = 512L * 1024L * 1024L
+        try {
+            val maps = java.io.File("/proc/self/maps").readLines()
+            val mem = java.io.RandomAccessFile("/proc/self/mem", "r")
+            try {
+                val chunk = ByteArray(1024 * 1024)
+                for (line in maps) {
+                    if (count >= maxBlobs || totalBytes >= maxTotal) break
+                    val m = Regex(
+                        "^([0-9a-f]+)-([0-9a-f]+)\\s+(\\S+)\\s+\\S+\\s+" +
+                            "\\S+\\s+\\S+\\s*(.*)$"
+                    ).find(line) ?: continue
+                    val start = m.groupValues[1].toLong(16)
+                    val end = m.groupValues[2].toLong(16)
+                    val perms = m.groupValues[3]
+                    val path = m.groupValues[4].trim()
+                    if (!perms.startsWith("r")) continue
+                    if (path.isNotEmpty() && !path.startsWith("[")) continue
+                    if (path.contains("jit-cache")) continue
+                    var pos = start
+                    while (pos < end &&
+                        count < maxBlobs && totalBytes < maxTotal
+                    ) {
+                        val want = minOf(
+                            chunk.size.toLong(), end - pos
+                        ).toInt()
+                        val got = try {
+                            mem.seek(pos)
+                            var off = 0
+                            while (off < want) {
+                                val r = mem.read(chunk, off, want - off)
+                                if (r < 0) break
+                                off += r
+                            }
+                            off
+                        } catch (_: Throwable) {
+                            0
+                        }
+                        if (got > 8) {
+                            var i = 0
+                            while (i + 8 <= got) {
+                                if (chunk[i] == 'd'.code.toByte() &&
+                                    chunk[i + 1] == 'e'.code.toByte() &&
+                                    chunk[i + 2] == 'x'.code.toByte() &&
+                                    chunk[i + 3] == '\n'.code.toByte() &&
+                                    chunk[i + 4] == '0'.code.toByte() &&
+                                    chunk[i + 5] == '3'.code.toByte() &&
+                                    (chunk[i + 6] == '5'.code.toByte() ||
+                                        chunk[i + 6] == '7'.code.toByte() ||
+                                        chunk[i + 6] == '8'.code.toByte() ||
+                                        chunk[i + 6] == '9'.code.toByte()) &&
+                                    chunk[i + 7] == 0.toByte()
+                                ) {
+                                    val off = pos + i
+                                    val inside = dumpedRanges.any {
+                                        off >= it.first && off < it.second
+                                    }
+                                    if (!inside) {
+                                        val hdr = ByteArray(112)
+                                        val hgot = try {
+                                            mem.seek(off)
+                                            var ho = 0
+                                            while (ho < 112) {
+                                                val r = mem.read(
+                                                    hdr, ho, 112 - ho
+                                                )
+                                                if (r < 0) break
+                                                ho += r
+                                            }
+                                            ho
+                                        } catch (_: Throwable) {
+                                            0
+                                        }
+                                        if (hgot == 112) {
+                                            val fileSize = le32(hdr, 32)
+                                            val headerSize = le32(hdr, 36)
+                                            val endian = le32(hdr, 40)
+                                            val mapOff = le32(hdr, 52)
+                                            val checksum = le32(hdr, 8)
+                                            val key =
+                                                "$fileSize:$checksum"
+                                            if (headerSize == 0x70 &&
+                                                endian == 0x12345678 &&
+                                                fileSize >= 0x70 &&
+                                                fileSize <= 256 * 1024 * 1024 &&
+                                                off + fileSize <= end &&
+                                                mapOff > 0 &&
+                                                mapOff < fileSize &&
+                                                !dumpedKeys.contains(key)
+                                            ) {
+                                                val out = java.io.File(
+                                                    application.filesDir,
+                                                    "memdex-$pid-$count.dex"
+                                                )
+                                                var written = 0L
+                                                try {
+                                                    java.io.FileOutputStream(
+                                                        out
+                                                    ).use { fos ->
+                                                        mem.seek(off)
+                                                        var left =
+                                                            fileSize.toLong()
+                                                        val buf =
+                                                            ByteArray(65536)
+                                                        while (left > 0) {
+                                                            val w = minOf(
+                                                                buf.size.toLong(),
+                                                                left
+                                                            ).toInt()
+                                                            var bo = 0
+                                                            while (bo < w) {
+                                                                val r = mem.read(
+                                                                    buf, bo, w - bo
+                                                                )
+                                                                if (r < 0) break
+                                                                bo += r
+                                                            }
+                                                            if (bo == 0) break
+                                                            fos.write(
+                                                                buf, 0, bo
+                                                            )
+                                                            written += bo
+                                                            left -= bo
+                                                        }
+                                                    }
+                                                } catch (_: Throwable) {
+                                                    out.delete()
+                                                    written = 0
+                                                }
+                                                if (written ==
+                                                    fileSize.toLong()
+                                                ) {
+                                                    dumpedRanges.add(
+                                                        off to off + fileSize
+                                                    )
+                                                    dumpedKeys.add(key)
+                                                    count++
+                                                    totalBytes += written
+                                                    GuestBreadcrumb.log(
+                                                        "v121-plugin-probe " +
+                                                            "memdex dumped " +
+                                                            "idx=${count - 1} " +
+                                                            "size=$fileSize " +
+                                                            "checksum=" +
+                                                            checksum.toString(16) +
+                                                            " file=" + out.name
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                i++
+                            }
+                        }
+                        pos += want
+                    }
+                }
+            } finally {
+                try {
+                    mem.close()
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (e: Throwable) {
+            GuestBreadcrumb.log(
+                "v121-plugin-probe memdex scan aborted: " +
+                    "${e.javaClass.simpleName}"
+            )
+        }
+        GuestBreadcrumb.log(
+            "v121-plugin-probe memdex scan done " +
+                "count=$count totalBytes=$totalBytes"
+        )
+    }
+
+    private fun le32(b: ByteArray, off: Int): Int {
+        return (b[off].toInt() and 0xFF) or
+            ((b[off + 1].toInt() and 0xFF) shl 8) or
+            ((b[off + 2].toInt() and 0xFF) shl 16) or
+            ((b[off + 3].toInt() and 0xFF) shl 24)
     }
 
     private fun callApplicationOnCreate(application: Application) {
