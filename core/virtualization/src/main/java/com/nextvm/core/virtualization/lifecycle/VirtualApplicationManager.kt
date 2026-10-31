@@ -2198,6 +2198,33 @@ class VirtualApplicationManager @Inject constructor(
     @Volatile private var loginProbeLastSig: String? = null
 
     /**
+     * v125: logging delegating wrapper for the login button's
+     * OnClickListener. Logs entry, normal return, and any thrown
+     * exception (rethrowing it, so behavior is exactly preserved).
+     * Without it, a tap whose body is silent or whose exception is
+     * swallowed upstream is indistinguishable from a tap that never
+     * arrived; with it, CLICKED = the body ran, no CLICKED = input
+     * never reached the view.
+     */
+    private class V125ClickWrapper(
+        private val original: android.view.View.OnClickListener
+    ) : android.view.View.OnClickListener {
+        override fun onClick(v: android.view.View) {
+            GuestBreadcrumb.log("v125-login-probe CLICKED")
+            try {
+                original.onClick(v)
+                GuestBreadcrumb.log("v125-login-probe CLICKED returned")
+            } catch (e: Throwable) {
+                GuestBreadcrumb.log(
+                    "v125-login-probe CLICKED threw " +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+                throw e
+            }
+        }
+    }
+
+    /**
      * v124 probe (read-only, main thread only): is the 我的 tab
      * login button's click listener actually registered in the
      * guest? Walks the resumed Activity's view hierarchy once
@@ -2286,6 +2313,9 @@ class VirtualApplicationManager @Inject constructor(
             var detail = "found=${target != null} via=$via"
             var listenerCls = "-"
             var parents = "-"
+            var v125Info: Any? = null
+            var v125Field: java.lang.reflect.Field? = null
+            var v125Listener: android.view.View.OnClickListener? = null
             if (target != null) {
                 val hasListener = try {
                     target.hasOnClickListeners()
@@ -2304,6 +2334,10 @@ class VirtualApplicationManager @Inject constructor(
                             findField(info.javaClass, "mOnClickListener")
                         lField?.isAccessible = true
                         val l = lField?.get(info)
+                        v125Info = info
+                        v125Field = lField
+                        v125Listener =
+                            l as? android.view.View.OnClickListener
                         l?.javaClass?.name ?: "none"
                     }
                 } catch (_: Throwable) {
@@ -2338,6 +2372,29 @@ class VirtualApplicationManager @Inject constructor(
                     "v124-login-probe source=$source " +
                         "activity=${a.javaClass.name} $detail"
                 )
+            }
+            // v125: wrap the login button's listener with a logging
+            // delegator, so a tap is observable even when the
+            // original body is silent or its exception is swallowed
+            // upstream. Only this button (id match preferred), only
+            // once per listener instance (re-created views get
+            // re-wrapped on a later probe run). The wrapper logs
+            // entry, normal return, and thrown exceptions (rethrowing
+            // to preserve behavior exactly); a failed set leaves the
+            // original listener untouched.
+            val cur = v125Listener
+            if (target != null && cur != null &&
+                !cur.javaClass.name.contains("V125ClickWrapper")
+            ) {
+                try {
+                    v125Field?.set(v125Info, V125ClickWrapper(cur))
+                    GuestBreadcrumb.log(
+                        "v125-login-probe listener wrapped " +
+                            "view=${target.javaClass.name}"
+                    )
+                } catch (_: Throwable) {
+                    GuestBreadcrumb.log("v125-login-probe wrap failed")
+                }
             }
         } catch (_: Throwable) {
             GuestBreadcrumb.log(
