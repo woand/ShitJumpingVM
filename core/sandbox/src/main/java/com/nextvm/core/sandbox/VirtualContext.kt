@@ -77,7 +77,33 @@ class VirtualContext(
         }
     }
 
+    @Volatile
+    private var autofillSuppressedLogged = false
+
     override fun getSystemService(name: String): Any? {
+        // v132-autofill: service-level Autofill disable. launch159
+        // proved attribute-level disable (decor v129 + per-view
+        // v131) does not stop sessions: startSession still runs
+        // and blocks main ~5.5s on a never-answered service call.
+        // The guest has no working autofill service, so report
+        // none: Views that null-check the manager skip the
+        // session entirely. Host contexts are untouched.
+        // Literal "autofill": this SDK stub does not expose the
+        // Context.AUTOFILL_SERVICE symbol; the literal is the
+        // constant's value since API 26.
+        // NOTE: Context.getSystemService(Class) is final in
+        // this SDK, so Class-based lookups cannot be cut here;
+        // they delegate past this wrapper to the real base.
+        // This String cut is the testable first variant: if
+        // launch160 still stalls, the View path uses the Class
+        // overload and the next step is an sCache stub.
+        if (name == "autofill") {
+            if (!autofillSuppressedLogged) {
+                autofillSuppressedLogged = true
+                Timber.tag("v132-autofill").i("autofill service suppressed for guest")
+            }
+            return null
+        }
         // Prevent recursive getDisplay() through service lookup
         if (name == DISPLAY_SERVICE || name == WINDOW_SERVICE) {
             return realBaseContext.getSystemService(name)
