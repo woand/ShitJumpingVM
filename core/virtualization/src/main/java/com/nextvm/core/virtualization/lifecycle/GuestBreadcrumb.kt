@@ -116,6 +116,11 @@ object GuestBreadcrumb {
         }
     }
 
+    /** v126: directory the breadcrumb file lives in (guest files dir). */
+    fun filesDir(): File? {
+        synchronized(lock) { return file?.parentFile }
+    }
+
     /** Record an exception WITH full stack — the anti-swallow log. */
     fun logThrowable(event: String, t: Throwable) {
         if (!active) return
