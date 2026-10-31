@@ -272,6 +272,31 @@ class VirtualApplicationManager @Inject constructor(
      * Application — an activity breadcrumb independent of the
      * instrumentation chain (created/started/resumed/... per activity).
      */
+    /**
+     * v129-autofill: disable Autofill for a guest activity's window.
+     * launch156 proved taps on login/auth views park main in
+     * AutofillManager.notifyViewEntered -> SyncResultReceiver wait
+     * (the autofill service never answers promptly inside the
+     * sandbox) -> 5s input dispatch ANR. Setting
+     * NO_EXCLUDE_DESCENDANTS on the decor view makes the whole
+     * window report AUTOFILL_TYPE_NONE, so Views never call
+     * notifyViewEntered and no session is started. Only guest
+     * activities reach this callback (registered on the guest
+     * Application); host activities are untouched. Best-effort:
+     * a missing decor view (no content yet) just skips; the
+     * resumed callback covers it once content exists.
+     */
+    private fun disableAutofillForGuestActivity(a: android.app.Activity) {
+        try {
+            val decor = a.window?.decorView ?: return
+            decor.importantForAutofill =
+                android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+            GuestBreadcrumb.log("v129-autofill disabled " + a.javaClass.name)
+        } catch (_: Throwable) {
+            // never break activity lifecycle over autofill
+        }
+    }
+
     private fun registerBreadcrumbCallbacks(app: Application) {
         try {
             app.registerActivityLifecycleCallbacks(
@@ -282,6 +307,7 @@ class VirtualApplicationManager @Inject constructor(
                         a: android.app.Activity, b: android.os.Bundle?
                     ) {
                         GuestBreadcrumb.log("cb onActivityCreated " + a.javaClass.name)
+                        disableAutofillForGuestActivity(a)
                         if (!firstActivityProbed) {
                             firstActivityProbed = true
                             val rec = applications.values.firstOrNull {
@@ -301,6 +327,7 @@ class VirtualApplicationManager @Inject constructor(
                         // Activity, so the timer below covers those).
                         loginProbeLastActivity = a
                         probeLoginButtonState(a, "resumed")
+                        disableAutofillForGuestActivity(a)
                     }
 
                     override fun onActivityPaused(a: android.app.Activity) =
