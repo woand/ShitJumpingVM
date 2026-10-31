@@ -294,8 +294,14 @@ class VirtualApplicationManager @Inject constructor(
                     override fun onActivityStarted(a: android.app.Activity) =
                         GuestBreadcrumb.log("cb onActivityStarted " + a.javaClass.name)
 
-                    override fun onActivityResumed(a: android.app.Activity) =
+                    override fun onActivityResumed(a: android.app.Activity) {
                         GuestBreadcrumb.log("cb onActivityResumed " + a.javaClass.name)
+                        // v124: every resume re-checks the login button
+                        // (fragment tab switches do not resume a new
+                        // Activity, so the timer below covers those).
+                        loginProbeLastActivity = a
+                        probeLoginButtonState(a, "resumed")
+                    }
 
                     override fun onActivityPaused(a: android.app.Activity) =
                         GuestBreadcrumb.log("cb onActivityPaused " + a.javaClass.name)
@@ -311,6 +317,31 @@ class VirtualApplicationManager @Inject constructor(
                         GuestBreadcrumb.log("cb onActivityDestroyed " + a.javaClass.name)
                 })
             GuestBreadcrumb.log("engine breadcrumb callbacks registered on " + app.javaClass.name)
+            // v124: repeating login-button check on the main looper.
+            // Tab switches inside one Activity never resume a new
+            // Activity, so resume alone cannot see the 我的 tab's
+            // button appearing later; a 20s timer for 10 minutes
+            // covers it. Read-only hierarchy walk, main thread only.
+            if (!loginProbeTimerStarted) {
+                loginProbeTimerStarted = true
+                val handler = android.os.Handler(
+                    android.os.Looper.getMainLooper()
+                )
+                var runs = 0
+                val r = object : Runnable {
+                    override fun run() {
+                        try {
+                            loginProbeLastActivity?.let {
+                                probeLoginButtonState(it, "timer")
+                            }
+                        } catch (_: Throwable) {
+                        }
+                        runs++
+                        if (runs < 30) handler.postDelayed(this, 20_000L)
+                    }
+                }
+                handler.postDelayed(r, 20_000L)
+            }
         } catch (e: Throwable) {
             GuestBreadcrumb.logThrowable("register breadcrumb callbacks FAILED", e)
         }
@@ -2160,6 +2191,159 @@ class VirtualApplicationManager @Inject constructor(
             ((b[off + 1].toInt() and 0xFF) shl 8) or
             ((b[off + 2].toInt() and 0xFF) shl 16) or
             ((b[off + 3].toInt() and 0xFF) shl 24)
+    }
+
+    @Volatile private var loginProbeLastActivity: android.app.Activity? = null
+    @Volatile private var loginProbeTimerStarted = false
+    @Volatile private var loginProbeLastSig: String? = null
+
+    /**
+     * v124 probe (read-only, main thread only): is the 我的 tab
+     * login button's click listener actually registered in the
+     * guest? Walks the resumed Activity's view hierarchy once
+     * per call and reports: the mine_login_btn view itself
+     * (found by resource id, falling back to a Button with text
+     * "登录"), its clickable/enabled/shown state, whether it has
+     * an OnClickListener (public hasOnClickListeners() plus, best
+     * effort, the listener's class via mListenerInfo reflection),
+     * its parent chain, and a control count (clickable views with
+     * vs without listeners in the same hierarchy). The control
+     * count is the point: if NO view has a listener, listener
+     * registration is globally broken; if others have listeners
+     * but this button does not, the gap is specific to this
+     * button's binding. Logs only when the signature changes, so
+     * the 20s timer does not spam the breadcrumb.
+     */
+    private fun probeLoginButtonState(
+        a: android.app.Activity,
+        source: String
+    ) {
+        try {
+            val decor = try {
+                a.window?.decorView
+            } catch (_: Throwable) {
+                null
+            }
+            if (decor == null) {
+                GuestBreadcrumb.log(
+                    "v124-login-probe source=$source " +
+                        "activity=${a.javaClass.name} decor=null"
+                )
+                return
+            }
+            val idInt = try {
+                a.resources.getIdentifier(
+                    "mine_login_btn", "id", a.packageName
+                )
+            } catch (_: Throwable) {
+                0
+            }
+            var total = 0
+            var clickableTotal = 0
+            var clickableWithListener = 0
+            var match: android.view.View? = null
+            var textMatch: android.view.View? = null
+            val stack = ArrayDeque<android.view.View>()
+            stack.add(decor)
+            while (stack.isNotEmpty()) {
+                val v = stack.removeLast()
+                total++
+                try {
+                    if (v.isClickable) {
+                        clickableTotal++
+                        if (v.hasOnClickListeners()) {
+                            clickableWithListener++
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                if (match == null && idInt != 0 && v.id == idInt) {
+                    match = v
+                }
+                if (textMatch == null &&
+                    v is android.widget.TextView
+                ) {
+                    try {
+                        if (v.text?.toString() == "登录") textMatch = v
+                    } catch (_: Throwable) {
+                    }
+                }
+                if (v is android.view.ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        try {
+                            v.getChildAt(i)?.let { stack.add(it) }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+            val target = match ?: textMatch
+            val via = when {
+                match != null -> "id"
+                textMatch != null -> "text"
+                else -> "-"
+            }
+            var detail = "found=${target != null} via=$via"
+            var listenerCls = "-"
+            var parents = "-"
+            if (target != null) {
+                val hasListener = try {
+                    target.hasOnClickListeners()
+                } catch (_: Throwable) {
+                    null
+                }
+                listenerCls = try {
+                    val infoField =
+                        findField(target.javaClass, "mListenerInfo")
+                    infoField?.isAccessible = true
+                    val info = infoField?.get(target)
+                    if (info == null) {
+                        "none"
+                    } else {
+                        val lField =
+                            findField(info.javaClass, "mOnClickListener")
+                        lField?.isAccessible = true
+                        val l = lField?.get(info)
+                        l?.javaClass?.name ?: "none"
+                    }
+                } catch (_: Throwable) {
+                    "reflection-unavailable"
+                }
+                val chain = ArrayList<String>()
+                var p: android.view.ViewParent? = target.parent
+                while (p != null && chain.size < 4) {
+                    chain.add(
+                        p.javaClass.name.substringAfterLast('.')
+                    )
+                    p = try {
+                        (p as? android.view.View)?.parent
+                    } catch (_: Throwable) {
+                        null
+                    }
+                }
+                parents = chain.joinToString("<").ifEmpty { "-" }
+                detail += " view=${target.javaClass.name} " +
+                    "clickable=${target.isClickable} " +
+                    "enabled=${target.isEnabled} " +
+                    "shown=${target.isShown} " +
+                    "hasListener=$hasListener " +
+                    "listener=$listenerCls parents=$parents"
+            }
+            detail += " control=clickableWithListener" +
+                "=$clickableWithListener/$clickableTotal total=$total"
+            val sig = "${a.javaClass.name}|$detail"
+            if (sig != loginProbeLastSig) {
+                loginProbeLastSig = sig
+                GuestBreadcrumb.log(
+                    "v124-login-probe source=$source " +
+                        "activity=${a.javaClass.name} $detail"
+                )
+            }
+        } catch (_: Throwable) {
+            GuestBreadcrumb.log(
+                "v124-login-probe FAILED source=$source"
+            )
+        }
     }
 
     private fun callApplicationOnCreate(application: Application) {
