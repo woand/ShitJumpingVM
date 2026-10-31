@@ -2486,10 +2486,10 @@ class VirtualApplicationManager @Inject constructor(
     }
 
     /**
-     * v133: same technique as v125/v127, retargeted at the face
-     * verification page's "开始验证" button. launch161 proved
-     * the failure is fully silent inside guest code (no logcat,
-     * no breadcrumb event, no watchdog stall; the error reaches
+     * v134: same technique as v125/v127, retargeted at the face
+     * verification page's button. launch161 proved the failure
+     * is fully silent inside guest code (no logcat, no
+     * breadcrumb event, no watchdog stall; the error reaches
      * only the guest's generic dialog), so a wrapper alone may
      * show "returned" while the dialog still appears — the
      * method trace is the real instrument. First click only:
@@ -2498,8 +2498,14 @@ class VirtualApplicationManager @Inject constructor(
      * so the buffer covers the bursts that matter: handler
      * entry, the failing call, and the dialog show). A failed
      * start/stop never touches the original listener's behavior.
+     * v134 corrects v133's matcher: the real label (dumped
+     * 2026-11-01 after dismissing the error dialog) is
+     * "面部识别身份认证", on a TextView inside a clickable
+     * ViewGroup (id confirm); "开始验证" was the user's
+     * shorthand, not the label. The old exact match therefore
+     * never fired.
      */
-    private class V133ClickWrapper(
+    private class V134ClickWrapper(
         private val original: android.view.View.OnClickListener
     ) : android.view.View.OnClickListener {
         companion object {
@@ -2507,7 +2513,7 @@ class VirtualApplicationManager @Inject constructor(
         }
 
         override fun onClick(v: android.view.View) {
-            GuestBreadcrumb.log("v133-face-probe CLICKED")
+            GuestBreadcrumb.log("v134-face-probe CLICKED")
             if (traceCount == 0) {
                 try {
                     val dir = GuestBreadcrumb.filesDir()
@@ -2515,7 +2521,7 @@ class VirtualApplicationManager @Inject constructor(
                         traceCount++
                         val traceFile = java.io.File(
                             dir,
-                            "v133-trace-" +
+                            "v134-trace-" +
                                 android.os.Process.myPid() +
                                 "-1.trace"
                         )
@@ -2523,7 +2529,7 @@ class VirtualApplicationManager @Inject constructor(
                             traceFile.absolutePath, 64 * 1024 * 1024
                         )
                         GuestBreadcrumb.log(
-                            "v133-trace start file=" + traceFile.name
+                            "v134-trace start file=" + traceFile.name
                         )
                         android.os.Handler(
                             android.os.Looper.getMainLooper()
@@ -2531,12 +2537,12 @@ class VirtualApplicationManager @Inject constructor(
                             try {
                                 android.os.Debug.stopMethodTracing()
                                 GuestBreadcrumb.log(
-                                    "v133-trace stop delayed file=" +
+                                    "v134-trace stop delayed file=" +
                                         traceFile.name
                                 )
                             } catch (e: Throwable) {
                                 GuestBreadcrumb.log(
-                                    "v133-trace stop failed " +
+                                    "v134-trace stop failed " +
                                         "${e.javaClass.simpleName}: " +
                                         e.message
                                 )
@@ -2545,17 +2551,17 @@ class VirtualApplicationManager @Inject constructor(
                     }
                 } catch (e: Throwable) {
                     GuestBreadcrumb.log(
-                        "v133-trace start failed " +
+                        "v134-trace start failed " +
                             "${e.javaClass.simpleName}: ${e.message}"
                     )
                 }
             }
             try {
                 original.onClick(v)
-                GuestBreadcrumb.log("v133-face-probe CLICKED returned")
+                GuestBreadcrumb.log("v134-face-probe CLICKED returned")
             } catch (e: Throwable) {
                 GuestBreadcrumb.log(
-                    "v133-face-probe CLICKED threw " +
+                    "v134-face-probe CLICKED threw " +
                         "${e.javaClass.simpleName}: ${e.message}"
                 )
                 throw e
@@ -2563,22 +2569,26 @@ class VirtualApplicationManager @Inject constructor(
         }
     }
 
-    // Activities for which v133 already logged a
+    // Activities for which v134 already logged a
     // button-not-found / found-no-listener line (identity hash).
     // Prevents the 20s timer from spamming the breadcrumb while
     // the face page is still building; a successful wrap is
     // still logged when the button appears later.
-    private val v133ReportedActivities = mutableSetOf<Int>()
+    private val v134ReportedActivities = mutableSetOf<Int>()
 
     /**
-     * v133: find the face page's "开始验证" button and wrap its
-     * click listener with V133ClickWrapper (same reflection
-     * mechanism as v125). Only AuthenticationActivity, only
-     * once per listener instance (class-name check, as v125).
-     * The clickable view may be the text view itself or an
-     * ancestor, so walk up from the text match to the nearest
-     * view with a listener. Runs on resume and on the v124
-     * timer, so late-inflated buttons get wrapped too.
+     * v134: find the face page's button and wrap its click
+     * listener with V134ClickWrapper (same reflection mechanism
+     * as v125). Only AuthenticationActivity, only once per
+     * listener instance (class-name check, as v125). The label
+     * is "面部识别身份认证" (v133's "开始验证" never matched);
+     * the clickable view is the TextView's ViewGroup ancestor,
+     * so walk up from the text match to the nearest view with
+     * a listener. Runs on resume and on the v124 timer, so
+     * late-inflated buttons get wrapped too. When no match is
+     * found, log the clickable views' labels (first 10, input
+     * fields excluded so no user-entered text ever lands in a
+     * log) so a future mismatch is visible instead of blind.
      */
     private fun wrapFaceVerifyButton(a: android.app.Activity) {
         try {
@@ -2593,14 +2603,34 @@ class VirtualApplicationManager @Inject constructor(
                 null
             } ?: return
             var textView: android.view.View? = null
+            // Diagnostic for the not-found branch: labels of
+            // clickable views, input fields excluded (their text
+            // is user-entered data and must never land in a log).
+            val clickableLabels = mutableListOf<String>()
             val stack = ArrayDeque<android.view.View>()
             stack.add(decor)
             while (stack.isNotEmpty() && textView == null) {
                 val v = stack.removeLast()
                 if (v is android.widget.TextView) {
                     try {
-                        if (v.text?.toString() == "开始验证") {
+                        val t = v.text?.toString() ?: ""
+                        if (t == "面部识别身份认证" ||
+                            t == "开始验证"
+                        ) {
                             textView = v
+                        } else if (clickableLabels.size < 10 &&
+                            v !is android.widget.EditText
+                        ) {
+                            try {
+                                if (v.isClickable && t.isNotEmpty()) {
+                                    clickableLabels.add(
+                                        v.javaClass.name
+                                            .substringAfterLast('.') +
+                                            " text=" + t
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                            }
                         }
                     } catch (_: Throwable) {
                     }
@@ -2616,10 +2646,12 @@ class VirtualApplicationManager @Inject constructor(
             }
             val actId = System.identityHashCode(a)
             if (textView == null) {
-                if (v133ReportedActivities.add(actId)) {
+                if (v134ReportedActivities.add(actId)) {
                     GuestBreadcrumb.log(
-                        "v133-face-probe button-not-found " +
-                            "activity=${a.javaClass.name}"
+                        "v134-face-probe button-not-found " +
+                            "activity=${a.javaClass.name} " +
+                            "clickable=" +
+                            clickableLabels.joinToString(";")
                     )
                 }
                 return
@@ -2637,9 +2669,9 @@ class VirtualApplicationManager @Inject constructor(
                 }
             }
             if (candidate == null) {
-                if (v133ReportedActivities.add(actId)) {
+                if (v134ReportedActivities.add(actId)) {
                     GuestBreadcrumb.log(
-                        "v133-face-probe found-no-listener " +
+                        "v134-face-probe found-no-listener " +
                             "view=${textView.javaClass.name}"
                     )
                 }
@@ -2658,17 +2690,17 @@ class VirtualApplicationManager @Inject constructor(
                     lField?.get(info) as?
                         android.view.View.OnClickListener
                 if (cur != null &&
-                    !cur.javaClass.name.contains("V133ClickWrapper")
+                    !cur.javaClass.name.contains("V134ClickWrapper")
                 ) {
-                    lField.set(info, V133ClickWrapper(cur))
+                    lField.set(info, V134ClickWrapper(cur))
                     GuestBreadcrumb.log(
-                        "v133-face-probe listener wrapped " +
+                        "v134-face-probe listener wrapped " +
                             "view=${candidate.javaClass.name} " +
                             "listener=${cur.javaClass.name}"
                     )
                 }
             } catch (_: Throwable) {
-                GuestBreadcrumb.log("v133-face-probe wrap failed")
+                GuestBreadcrumb.log("v134-face-probe wrap failed")
             }
         } catch (_: Throwable) {
             // probe only; never break lifecycle
