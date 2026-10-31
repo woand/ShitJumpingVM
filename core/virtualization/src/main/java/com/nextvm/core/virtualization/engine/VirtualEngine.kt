@@ -1553,13 +1553,35 @@ class VirtualEngine @Inject constructor(
                     apkPath,
                     PackageManager.GET_PROVIDERS or PackageManager.GET_META_DATA
                 )
-                archiveInfo?.providers?.forEach { parsed ->
+                archiveInfo?.providers?.forEachIndexed { idx, parsed ->
                     parsed.metaData?.let { providerMetaData[parsed.name] = it }
                     if (providerAuthorities[parsed.name] == null &&
                         !parsed.authority.isNullOrEmpty()
                     ) {
                         providerAuthorities[parsed.name] = parsed.authority
                     }
+                    // v118 probe (read-only): system ProviderInfo
+                    // fields per provider, in system-parser order, so
+                    // the install order in breadcrumb can be compared
+                    // against it — and so initOrder / permissions /
+                    // multiprocess / processName are on record instead
+                    // of assumed. Logged to breadcrumb (buffered
+                    // before attachFile) and to Timber, since this
+                    // block may run before the breadcrumb file is
+                    // attached in some paths.
+                    val fields = "v118-provider-fields idx=$idx " +
+                        "name=${parsed.name} authority=${parsed.authority} " +
+                        "initOrder=${parsed.initOrder} " +
+                        "exported=${parsed.exported} enabled=${parsed.enabled} " +
+                        "multiprocess=${parsed.multiprocess} " +
+                        "readPermission=${parsed.readPermission} " +
+                        "writePermission=${parsed.writePermission} " +
+                        "process=${parsed.processName}"
+                    try {
+                        com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb.log(fields)
+                    } catch (_: Throwable) {
+                    }
+                    Timber.tag(TAG).i("%s", fields)
                 }
             } catch (e: Exception) {
                 Timber.tag(TAG).w(e, "Provider meta-data parse failed for $packageName")

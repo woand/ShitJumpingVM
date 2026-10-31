@@ -276,9 +276,20 @@ class VirtualApplicationManager @Inject constructor(
         try {
             app.registerActivityLifecycleCallbacks(
                 object : Application.ActivityLifecycleCallbacks {
+                    // v118: first Activity only, once per process.
+                    private var firstActivityProbed = false
                     override fun onActivityCreated(
                         a: android.app.Activity, b: android.os.Bundle?
-                    ) = GuestBreadcrumb.log("cb onActivityCreated " + a.javaClass.name)
+                    ) {
+                        GuestBreadcrumb.log("cb onActivityCreated " + a.javaClass.name)
+                        if (!firstActivityProbed) {
+                            firstActivityProbed = true
+                            val rec = applications.values.firstOrNull {
+                                it.application === app
+                            }
+                            probePluginStatePhase(app, rec, "firstActivity")
+                        }
+                    }
 
                     override fun onActivityStarted(a: android.app.Activity) =
                         GuestBreadcrumb.log("cb onActivityStarted " + a.javaClass.name)
@@ -1603,8 +1614,118 @@ class VirtualApplicationManager @Inject constructor(
                 "v116-plugin-probe initLoader present=$hasInitLoader, " +
                     "getApplication state=$state"
             )
+            // v118 probe (read-only): App Startup discovery check.
+            // InitializationProvider installed ok BEFORE
+            // PluginManagerProvider, so if the plugin init were an
+            // App Startup initializer, its entry would be an
+            // application meta-data key with value "androidx.startup".
+            // Listing those keys decides "not an App Startup path"
+            // vs "discovery lost the entry in the guest" — no dex
+            // needed. metaData null itself is a finding (discovery
+            // would find nothing).
+            try {
+                val md = application.applicationInfo?.metaData
+                if (md == null) {
+                    GuestBreadcrumb.log("v118-plugin-probe app metaData=null")
+                } else {
+                    val startups = ArrayList<String>()
+                    val pluginKeys = ArrayList<String>()
+                    for (k in md.keySet()) {
+                        val v = try {
+                            md.get(k)?.toString()
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        if (v == "androidx.startup") startups.add(k)
+                        if (k.contains("plugin", ignoreCase = true)) pluginKeys.add(k)
+                    }
+                    GuestBreadcrumb.log(
+                        "v118-plugin-probe startup initializers=" +
+                            startups.joinToString(",").ifEmpty { "none" }
+                    )
+                    GuestBreadcrumb.log(
+                        "v118-plugin-probe plugin meta keys=" +
+                            pluginKeys.joinToString(",").ifEmpty { "none" } +
+                            " (metaData keys=${md.size()})"
+                    )
+                }
+            } catch (_: Throwable) {
+                GuestBreadcrumb.log("v118-plugin-probe app metaData read failed")
+            }
         } catch (_: Throwable) {
             // Probe must never disturb guest bind.
+        }
+    }
+
+    /**
+     * v118 probe (read-only, first Activity only): re-check the
+     * plugin framework state after the first Activity is created.
+     * This is the measurement v116/v117 never made — it decides
+     * whether a generic delayed provider retry could ever work
+     * (retry only helps if the framework initializes between
+     * provider install and here). Runs once per process; the
+     * onCreate probe above stays the authoritative onCreate-end
+     * measurement and is left untouched.
+     */
+    private fun probePluginStatePhase(
+        application: Application,
+        record: ApplicationRecord?,
+        phase: String
+    ) {
+        try {
+            val registered = record?.contentProviders?.any {
+                it.javaClass.name.contains("PluginManagerProvider")
+            }
+            GuestBreadcrumb.log(
+                "v118-plugin-probe phase=$phase " +
+                    "PluginManagerProvider registered=$registered " +
+                    "(contentProviders=${record?.contentProviders?.size})"
+            )
+            val loaderCls = try {
+                Class.forName(
+                    "com.mc10086.plugin.core.PluginLoader",
+                    false,
+                    application.classLoader
+                )
+            } catch (e: Throwable) {
+                GuestBreadcrumb.log(
+                    "v118-plugin-probe phase=$phase " +
+                        "PluginLoader class not found: ${e.javaClass.simpleName}"
+                )
+                return
+            }
+            val getApp = try {
+                loaderCls.getMethod("getApplication")
+            } catch (_: Throwable) {
+                loaderCls.declaredMethods.firstOrNull { it.name == "getApplication" }
+            }
+            if (getApp == null) {
+                GuestBreadcrumb.log(
+                    "v118-plugin-probe phase=$phase getApplication method not found"
+                )
+                return
+            }
+            getApp.isAccessible = true
+            val state = try {
+                val app = if (java.lang.reflect.Modifier.isStatic(getApp.modifiers)) {
+                    getApp.invoke(null)
+                } else {
+                    "getApplication is not static, skipped"
+                }
+                if (app is Application) {
+                    "INITIALIZED (application=${app.javaClass.name})"
+                } else {
+                    "NOT_INITIALIZED (returned=$app)"
+                }
+            } catch (e: Throwable) {
+                val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
+                "NOT_INITIALIZED (${cause.javaClass.simpleName}: ${cause.message})"
+            }
+            GuestBreadcrumb.log(
+                "v118-plugin-probe phase=$phase getApplication state=$state"
+            )
+        } catch (_: Throwable) {
+            // Probe must never disturb the guest.
         }
     }
 
