@@ -2215,37 +2215,54 @@ class VirtualApplicationManager @Inject constructor(
 
         override fun onClick(v: android.view.View) {
             GuestBreadcrumb.log("v125-login-probe CLICKED")
-            // v126: bracket the body with method tracing so the
-            // body's own call chain is visible even though the body
-            // is silent (and even when it swallows an exception
-            // internally — the trace still shows the called methods
-            // and where the chain stops). First 4 clicks only, to
-            // bound trace storage. A failed start/stop never touches
-            // the original listener's behavior.
-            var traceFile: java.io.File? = null
-            var tracing = false
-            if (traceCount < 4) {
+            // v127: trace the first click only, and do NOT stop when
+            // the body returns: v126 proved the router posts its
+            // continuation to the main looper, which runs after the
+            // body returns — stopping in finally missed it. Stop via
+            // a delayed message on the same looper: FIFO guarantees
+            // the stop runs after the navigation continuation, so
+            // the continuation (interceptors -> terminal ->
+            // startActivity or silent drop) is inside the trace.
+            // 32MB buffer, 1.5s window. A failed start/stop never
+            // touches the original listener's behavior.
+            if (traceCount == 0) {
                 try {
                     val dir = GuestBreadcrumb.filesDir()
                     if (dir != null) {
                         traceCount++
-                        traceFile = java.io.File(
+                        val traceFile = java.io.File(
                             dir,
-                            "v126-trace-" +
+                            "v127-trace-" +
                                 android.os.Process.myPid() +
-                                "-" + traceCount + ".trace"
+                                "-1.trace"
                         )
                         android.os.Debug.startMethodTracing(
-                            traceFile.absolutePath, 8 * 1024 * 1024
+                            traceFile.absolutePath, 32 * 1024 * 1024
                         )
-                        tracing = true
                         GuestBreadcrumb.log(
-                            "v126-trace start file=" + traceFile.name
+                            "v127-trace start file=" + traceFile.name
                         )
+                        android.os.Handler(
+                            android.os.Looper.getMainLooper()
+                        ).postDelayed({
+                            try {
+                                android.os.Debug.stopMethodTracing()
+                                GuestBreadcrumb.log(
+                                    "v127-trace stop delayed file=" +
+                                        traceFile.name
+                                )
+                            } catch (e: Throwable) {
+                                GuestBreadcrumb.log(
+                                    "v127-trace stop failed " +
+                                        "${e.javaClass.simpleName}: " +
+                                        e.message
+                                )
+                            }
+                        }, 1500L)
                     }
                 } catch (e: Throwable) {
                     GuestBreadcrumb.log(
-                        "v126-trace start failed " +
+                        "v127-trace start failed " +
                             "${e.javaClass.simpleName}: ${e.message}"
                     )
                 }
@@ -2259,21 +2276,6 @@ class VirtualApplicationManager @Inject constructor(
                         "${e.javaClass.simpleName}: ${e.message}"
                 )
                 throw e
-            } finally {
-                if (tracing) {
-                    try {
-                        android.os.Debug.stopMethodTracing()
-                        GuestBreadcrumb.log(
-                            "v126-trace stopped file=" +
-                                traceFile?.name
-                        )
-                    } catch (e: Throwable) {
-                        GuestBreadcrumb.log(
-                            "v126-trace stop failed " +
-                                "${e.javaClass.simpleName}: ${e.message}"
-                        )
-                    }
-                }
             }
         }
     }
