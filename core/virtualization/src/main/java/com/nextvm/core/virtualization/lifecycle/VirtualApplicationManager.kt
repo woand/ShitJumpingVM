@@ -298,6 +298,7 @@ class VirtualApplicationManager @Inject constructor(
     }
 
     private fun registerBreadcrumbCallbacks(app: Application) {
+        startWatchdog()
         try {
             app.registerActivityLifecycleCallbacks(
                 object : Application.ActivityLifecycleCallbacks {
@@ -2223,6 +2224,99 @@ class VirtualApplicationManager @Inject constructor(
     @Volatile private var loginProbeLastActivity: android.app.Activity? = null
     @Volatile private var loginProbeTimerStarted = false
     @Volatile private var loginProbeLastSig: String? = null
+
+    // v130-watchdog: main-looper stall sampler state.
+    private var watchdogStarted = false
+    @Volatile private var watchdogLastBeat = 0L
+    @Volatile private var watchdogStallReported = false
+    private var watchdogStallCount = 0
+    private var watchdogStallStart = 0L
+
+    /**
+     * v130-watchdog: sample the main thread's stack whenever the
+     * main looper stops responding. A heartbeat runnable on the
+     * main looper refreshes watchdogLastBeat every 1s; a daemon
+     * thread checks it every 1s and, when main has not beaten for
+     * >3s, dumps main's stack into the breadcrumb file (once per
+     * stall, plus a RECOVERED line when main resumes). Read-only
+     * w.r.t. the guest: no behaviour change, bounded output (max
+     * 20 stalls per process). Started once per guest process.
+     * Motivation: launch157 ANRs persist on v129 but the ANR-time
+     * stack is unobtainable through system channels on this device
+     * (DropBox returns no new entries, /data/anr unreadable), so
+     * the engine must capture the stall itself, in its own file.
+     */
+    private fun startWatchdog() {
+        if (watchdogStarted) return
+        watchdogStarted = true
+        try {
+            val mainLooper = android.os.Looper.getMainLooper() ?: return
+            val mainHandler = android.os.Handler(mainLooper)
+            watchdogLastBeat = android.os.SystemClock.uptimeMillis()
+            val beat = object : Runnable {
+                override fun run() {
+                    watchdogLastBeat =
+                        android.os.SystemClock.uptimeMillis()
+                    try {
+                        mainHandler.postDelayed(this, 1000L)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            mainHandler.post(beat)
+            val t = Thread({
+                while (true) {
+                    try {
+                        Thread.sleep(1000L)
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        val now =
+                            android.os.SystemClock.uptimeMillis()
+                        val stuckFor = now - watchdogLastBeat
+                        if (stuckFor > 3000L) {
+                            if (!watchdogStallReported) {
+                                watchdogStallReported = true
+                                watchdogStallStart = now - stuckFor
+                                if (watchdogStallCount < 20) {
+                                    watchdogStallCount++
+                                    val frames = try {
+                                        mainLooper.thread?.stackTrace
+                                    } catch (_: Throwable) {
+                                        null
+                                    }
+                                    val top = frames?.take(25)
+                                        ?.joinToString(" | ") {
+                                            it.className + "." +
+                                                it.methodName
+                                        } ?: "<no stack>"
+                                    GuestBreadcrumb.log(
+                                        "v130-watchdog STUCK " +
+                                            stuckFor + "ms main=" + top
+                                    )
+                                }
+                            }
+                        } else {
+                            if (watchdogStallReported) {
+                                watchdogStallReported = false
+                                GuestBreadcrumb.log(
+                                    "v130-watchdog RECOVERED after " +
+                                        (now - watchdogStallStart) + "ms"
+                                )
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        // watchdog never dies on its own errors
+                    }
+                }
+            }, "v130-watchdog")
+            t.isDaemon = true
+            t.start()
+            GuestBreadcrumb.log("v130-watchdog started")
+        } catch (_: Throwable) {
+            // probe only; never break bind
+        }
+    }
 
     /**
      * v125: logging delegating wrapper for the login button's
