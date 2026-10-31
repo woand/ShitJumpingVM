@@ -1555,6 +1555,22 @@ class VirtualApplicationManager @Inject constructor(
             }
             val hasInitLoader = loaderCls.methods.any { it.name == "initLoader" } ||
                 loaderCls.declaredMethods.any { it.name == "initLoader" }
+            // v117 probe (read-only, still never calls initLoader):
+            // record the full signatures so the next step can judge
+            // whether the engine could call it at the right point
+            // with the right arguments. Signatures only, no invocation.
+            val initLoaderSigs = (loaderCls.methods + loaderCls.declaredMethods)
+                .filter { it.name == "initLoader" }
+                .distinctBy { it.toString() }
+                .joinToString(" | ") { m ->
+                    java.lang.reflect.Modifier.toString(m.modifiers) +
+                        " " + m.returnType.name + "(" +
+                        m.parameterTypes.joinToString(",") { it.name } + ")"
+                }
+                .ifEmpty { "none" }
+            GuestBreadcrumb.log(
+                "v117-plugin-probe initLoader signatures=$initLoaderSigs"
+            )
             val getApp = try {
                 loaderCls.getMethod("getApplication")
             } catch (_: Throwable) {
