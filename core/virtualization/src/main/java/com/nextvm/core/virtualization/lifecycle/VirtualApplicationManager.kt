@@ -1614,6 +1614,54 @@ class VirtualApplicationManager @Inject constructor(
                 "v116-plugin-probe initLoader present=$hasInitLoader, " +
                     "getApplication state=$state"
             )
+            // v123 probe (read-only): list PluginLoader's static
+            // fields (names + values) at onCreate end. getApplication
+            // throwing only says the flag is unset; the fields say
+            // WHY: all-initial values = initLoader was never called;
+            // a stored Application reference with an unset flag (or
+            // any half-set state) = it was called but failed midway.
+            // Values are rendered by type only (class name for
+            // objects, never toString) so reading them cannot run
+            // guest code. The class is already initialized (its
+            // methods ran above), so field reads initialize nothing
+            // new.
+            try {
+                val seen = HashSet<String>()
+                val parts = ArrayList<String>()
+                var c: Class<*>? = loaderCls
+                while (c != null && c != Any::class.java) {
+                    for (f in c.declaredFields) {
+                        if (!java.lang.reflect.Modifier.isStatic(
+                                f.modifiers
+                            )
+                        ) continue
+                        if (!seen.add(f.name)) continue
+                        val v = try {
+                            f.isAccessible = true
+                            f.get(null)
+                        } catch (e: Throwable) {
+                            "read-failed:${e.javaClass.simpleName}"
+                        }
+                        val rendered = when (v) {
+                            null -> "null"
+                            is Application -> "Application(${v.javaClass.name})"
+                            is Boolean, is Number, is String -> v.toString()
+                            is Array<*> -> "Array(len=${v.size})"
+                            else -> "obj(${(v as Any).javaClass.name})"
+                        }
+                        parts.add("${f.name}=$rendered")
+                    }
+                    c = c.superclass
+                }
+                GuestBreadcrumb.log(
+                    "v123-plugin-probe PluginLoader static fields: " +
+                        parts.joinToString(", ").ifEmpty { "none" }
+                )
+            } catch (_: Throwable) {
+                GuestBreadcrumb.log(
+                    "v123-plugin-probe static fields read failed"
+                )
+            }
             // v118 probe (read-only): App Startup discovery check.
             // InitializationProvider installed ok BEFORE
             // PluginManagerProvider, so if the plugin init were an
