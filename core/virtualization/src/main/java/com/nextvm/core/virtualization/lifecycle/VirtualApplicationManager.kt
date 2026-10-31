@@ -1702,6 +1702,39 @@ class VirtualApplicationManager @Inject constructor(
                         "${e.javaClass.simpleName}: ${e.message}"
                 )
             }
+            // v120 probe (read-only): timed re-checks for lazy init.
+            // Covers the H2/lazy-init branch left open by v118/v119:
+            // if the framework initializes on first use (e.g. a login
+            // tap), a later check flips to INITIALIZED and the generic
+            // provider retry regains meaning; if all three stay
+            // NOT_INITIALIZED, lazy init does not exist in this window
+            // either. Main-looper delayed posts only, reusing the
+            // v118 phase probe; if the process dies first, the checks
+            // simply never run. Scheduled once per bind, at onCreate
+            // end, so t30s/t60s/t120s are ~30/60/120s after onCreate.
+            try {
+                val handler = android.os.Handler(
+                    android.os.Looper.getMainLooper()
+                )
+                val delays = listOf(
+                    30_000L to "t30s",
+                    60_000L to "t60s",
+                    120_000L to "t120s"
+                )
+                for ((delay, phase) in delays) {
+                    handler.postDelayed({
+                        try {
+                            probePluginStatePhase(application, record, phase)
+                        } catch (_: Throwable) {
+                        }
+                    }, delay)
+                }
+                GuestBreadcrumb.log(
+                    "v120-plugin-probe timed re-checks scheduled t30s/t60s/t120s"
+                )
+            } catch (_: Throwable) {
+                GuestBreadcrumb.log("v120-plugin-probe schedule failed")
+            }
             try {
                 val pmAi = application.packageManager.getApplicationInfo(
                     application.packageName,
