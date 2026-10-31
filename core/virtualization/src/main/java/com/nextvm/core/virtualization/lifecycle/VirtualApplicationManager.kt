@@ -297,6 +297,86 @@ class VirtualApplicationManager @Inject constructor(
         }
     }
 
+    /**
+     * v131-autofill: per-view Autofill disable + type report.
+     * launch158 proved the v129 decor-only flag does not stop
+     * sessions: they still start on focus/click. Either the
+     * guest's input fields explicitly override the inherited
+     * mode, or this framework build does not check view type
+     * before startSession. Walk the hierarchy on resume (and
+     * on the v124 timer, for late-inflated views), set EVERY
+     * view to NO_EXCLUDE_DESCENDANTS, and report the pre-change
+     * modes (so the next verdict can see whether fields were
+     * explicitly YES) plus any views carrying autofillHints.
+     * If stalls stop, per-view override was the cause; if they
+     * persist, sessions start regardless of type and
+     * service-level interception is required.
+     */
+    private fun disableAutofillPerView(a: android.app.Activity) {
+        try {
+            val decor = try {
+                a.window?.decorView
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            var total = 0
+            var changed = 0
+            val modes = mutableMapOf<Int, Int>()
+            val explicit = mutableListOf<String>()
+            val stack = ArrayDeque<android.view.View>()
+            stack.add(decor)
+            while (stack.isNotEmpty()) {
+                val v = stack.removeLast()
+                total++
+                try {
+                    val mode = v.importantForAutofill
+                    modes[mode] = (modes[mode] ?: 0) + 1
+                    val hints = try {
+                        v.autofillHints
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    if (mode == android.view.View.IMPORTANT_FOR_AUTOFILL_YES ||
+                        mode == android.view.View.IMPORTANT_FOR_AUTOFILL_YES_EXCLUDE_DESCENDANTS ||
+                        (hints != null && hints.isNotEmpty())
+                    ) {
+                        if (explicit.size < 10) {
+                            explicit.add(
+                                v.javaClass.name + " mode=" + mode +
+                                    " hints=" +
+                                    (hints?.joinToString(",") ?: "-")
+                            )
+                        }
+                    }
+                    if (mode != android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS) {
+                        v.importantForAutofill =
+                            android.view.View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+                        changed++
+                    }
+                } catch (_: Throwable) {
+                }
+                if (v is android.view.ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        try {
+                            v.getChildAt(i)?.let { stack.add(it) }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+            }
+            GuestBreadcrumb.log(
+                "v131-autofill per-view " + a.javaClass.name +
+                    " total=" + total + " changed=" + changed +
+                    " modes=" + modes.entries.joinToString(",") {
+                        it.key.toString() + ":" + it.value
+                    } +
+                    " explicit=" + explicit.joinToString(";")
+            )
+        } catch (_: Throwable) {
+            // never break lifecycle over autofill
+        }
+    }
+
     private fun registerBreadcrumbCallbacks(app: Application) {
         startWatchdog()
         try {
@@ -329,6 +409,7 @@ class VirtualApplicationManager @Inject constructor(
                         loginProbeLastActivity = a
                         probeLoginButtonState(a, "resumed")
                         disableAutofillForGuestActivity(a)
+                        disableAutofillPerView(a)
                     }
 
                     override fun onActivityPaused(a: android.app.Activity) =
@@ -361,6 +442,7 @@ class VirtualApplicationManager @Inject constructor(
                         try {
                             loginProbeLastActivity?.let {
                                 probeLoginButtonState(it, "timer")
+                                disableAutofillPerView(it)
                             }
                         } catch (_: Throwable) {
                         }
