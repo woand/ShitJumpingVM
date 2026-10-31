@@ -242,6 +242,7 @@ class VirtualApplicationManager @Inject constructor(
 
             // Step 6: Call Application.onCreate()
             callApplicationOnCreate(application)
+            probePluginLoaderState(application, record)
             record.state = ApplicationState.RUNNING
             Timber.tag(TAG).i("Application.onCreate() complete for $packageName")
             restoreInstrumentation(legacyPrevInstr)
@@ -967,6 +968,7 @@ class VirtualApplicationManager @Inject constructor(
             }
 
             callApplicationOnCreate(application)
+            probePluginLoaderState(application, record)
             record.state = ApplicationState.RUNNING
             Timber.tag(TAG).i(
                 "Framework LoadedApk bind complete for $packageName " +
@@ -1511,6 +1513,85 @@ class VirtualApplicationManager @Inject constructor(
      * Mirrors:
      *   Instrumentation.callApplicationOnCreate(app) in ActivityThread.handleBindApplication()
      */
+    /**
+     * v116 probe (read-only, never initializes anything itself):
+     * after Application.onCreate, check whether the guest plugin
+     * framework (com.mc10086.plugin.core.PluginLoader) is
+     * initialized, and whether PluginManagerProvider survived
+     * provider installation. Decides between "never initialized",
+     * "initialized late but provider unregistered", and
+     * "initialized, login must die elsewhere".
+     *
+     * Deliberately does NOT call initLoader: invoking it would
+     * change the state being measured. getApplication() is a
+     * pure getter (returns the app or throws the same
+     * IllegalStateException the provider hit). All reflection
+     * is wrapped so a probe failure can never disturb bind.
+     */
+    private fun probePluginLoaderState(
+        application: Application,
+        record: ApplicationRecord
+    ) {
+        try {
+            val providerRegistered = record.contentProviders.any {
+                it.javaClass.name.contains("PluginManagerProvider")
+            }
+            GuestBreadcrumb.log(
+                "v116-plugin-probe PluginManagerProvider registered=" +
+                    "$providerRegistered (contentProviders=${record.contentProviders.size})"
+            )
+            val loaderCls = try {
+                Class.forName(
+                    "com.mc10086.plugin.core.PluginLoader",
+                    false,
+                    application.classLoader
+                )
+            } catch (e: Throwable) {
+                GuestBreadcrumb.log(
+                    "v116-plugin-probe PluginLoader class not found: " +
+                        "${e.javaClass.simpleName}"
+                )
+                return
+            }
+            val hasInitLoader = loaderCls.methods.any { it.name == "initLoader" } ||
+                loaderCls.declaredMethods.any { it.name == "initLoader" }
+            val getApp = try {
+                loaderCls.getMethod("getApplication")
+            } catch (_: Throwable) {
+                loaderCls.declaredMethods.firstOrNull { it.name == "getApplication" }
+            }
+            if (getApp == null) {
+                GuestBreadcrumb.log(
+                    "v116-plugin-probe initLoader present=$hasInitLoader, " +
+                        "getApplication method not found"
+                )
+                return
+            }
+            getApp.isAccessible = true
+            val state = try {
+                val app = if (java.lang.reflect.Modifier.isStatic(getApp.modifiers)) {
+                    getApp.invoke(null)
+                } else {
+                    "getApplication is not static, skipped"
+                }
+                if (app is Application) {
+                    "INITIALIZED (application=${app.javaClass.name})"
+                } else {
+                    "NOT_INITIALIZED (returned=$app)"
+                }
+            } catch (e: Throwable) {
+                val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
+                "NOT_INITIALIZED (${cause.javaClass.simpleName}: ${cause.message})"
+            }
+            GuestBreadcrumb.log(
+                "v116-plugin-probe initLoader present=$hasInitLoader, " +
+                    "getApplication state=$state"
+            )
+        } catch (_: Throwable) {
+            // Probe must never disturb guest bind.
+        }
+    }
+
     private fun callApplicationOnCreate(application: Application) {
         GuestBreadcrumb.log("Application.onCreate enter " + application.javaClass.name)
         try {
