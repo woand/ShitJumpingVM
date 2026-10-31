@@ -1652,6 +1652,76 @@ class VirtualApplicationManager @Inject constructor(
             } catch (_: Throwable) {
                 GuestBreadcrumb.log("v118-plugin-probe app metaData read failed")
             }
+            // v119 probe (read-only): replicate EXACTLY what
+            // AppInitializer.discoverAndInitialize sees. It does
+            // NOT read application-level meta-data; it calls
+            // getProviderInfo(InitializationProvider, GET_META_DATA)
+            // and reads that ProviderInfo's nested <meta-data>.
+            // Logging what the guest's own PackageManager returns
+            // for that lookup decides whether App Startup discovery
+            // in the guest finds any initializers at all, and
+            // whether the break is in the PM path or in the
+            // provider meta-data fill. Also compare the PM-route
+            // ApplicationInfo meta-data against the bound one
+            // (v118: bound is null) to locate where app-level
+            // meta-data is lost on the framework path.
+            try {
+                val cn = android.content.ComponentName(
+                    application.packageName,
+                    "androidx.startup.InitializationProvider"
+                )
+                val pi = application.packageManager.getProviderInfo(
+                    cn,
+                    android.content.pm.PackageManager.GET_META_DATA
+                )
+                val pmd = pi?.metaData
+                if (pmd == null) {
+                    GuestBreadcrumb.log(
+                        "v119-plugin-probe startup providerInfo metaData=null " +
+                            "(providerInfo found, authority=${pi?.authority})"
+                    )
+                } else {
+                    val keys = ArrayList<String>()
+                    for (k in pmd.keySet()) {
+                        val v = try {
+                            pmd.get(k)?.toString()
+                        } catch (_: Throwable) {
+                            "?"
+                        }
+                        keys.add("$k=$v")
+                    }
+                    GuestBreadcrumb.log(
+                        "v119-plugin-probe startup provider metaData keys=" +
+                            keys.joinToString(",").ifEmpty { "none" } +
+                            " (n=${pmd.size()})"
+                    )
+                }
+            } catch (e: Throwable) {
+                GuestBreadcrumb.log(
+                    "v119-plugin-probe startup getProviderInfo FAILED: " +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
+            try {
+                val pmAi = application.packageManager.getApplicationInfo(
+                    application.packageName,
+                    android.content.pm.PackageManager.GET_META_DATA
+                )
+                val pmMd = pmAi?.metaData
+                GuestBreadcrumb.log(
+                    "v119-plugin-probe PM ApplicationInfo metaData=" +
+                        if (pmMd == null) {
+                            "null"
+                        } else {
+                            "keys=${pmMd.size()}"
+                        }
+                )
+            } catch (e: Throwable) {
+                GuestBreadcrumb.log(
+                    "v119-plugin-probe PM getApplicationInfo FAILED: " +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+            }
         } catch (_: Throwable) {
             // Probe must never disturb guest bind.
         }
