@@ -159,7 +159,21 @@ class ActivityThreadHook(
                         // caused by virtualized GMS calls. Guest resource failures must
                         // remain fatal so missing resource injection is observable;
                         // compatibility belongs in the guest Resources instance.
+                        // v115: scan the whole cause chain for both
+                        // signals instead of only checking the chain
+                        // tail. launch141 proved the tail-only check
+                        // misses this exact failure: the chain is
+                        // RuntimeException("Adding window failed") ->
+                        // SecurityException("... not in UID ...") ->
+                        // RemoteException, so the old `root is
+                        // SecurityException` test was false even
+                        // though the guard ran (its lambda is in the
+                        // crash stack) and the mismatch was the real
+                        // cause. The walk must not break early: the
+                        // top frame already carries Toast frames while
+                        // the SecurityException sits one link down.
                         var isToastWindowFailure = false
+                        var uidMismatchSecurity: SecurityException? = null
                         var cursor: Throwable? = e
                         while (cursor != null) {
                             if (cursor.message?.contains("Adding window failed") == true ||
@@ -168,7 +182,10 @@ class ActivityThreadHook(
                                         it.className.startsWith("android.widget.Toast")
                                 }) {
                                 isToastWindowFailure = true
-                                break
+                            }
+                            if (cursor is SecurityException &&
+                                cursor.message?.contains("not in UID") == true) {
+                                uidMismatchSecurity = cursor
                             }
                             cursor = cursor.cause
                         }
@@ -176,13 +193,12 @@ class ActivityThreadHook(
                         // ToastPresenter validates the operation package against the
                         // host UID. Consume only this narrow mismatch; other Toast
                         // and all guest exceptions must still crash normally.
-                        if (root is SecurityException &&
-                            root.message?.contains("not in UID") == true &&
+                        if (uidMismatchSecurity != null &&
                             isToastWindowFailure) {
                             com.nextvm.core.virtualization.lifecycle.GuestBreadcrumb
                                 .logThrowable(
                                     "main-looper guard SUPPRESSED guest Toast UID mismatch", e)
-                            Timber.tag(TAG).w(e, "Suppressed guest Toast UID mismatch: ${root.message}")
+                            Timber.tag(TAG).w(e, "Suppressed guest Toast UID mismatch: ${uidMismatchSecurity.message}")
                         } else if (root is SecurityException &&
                             (root.message?.contains("Unknown calling package name") == true ||
                              root.message?.contains("does not belong to") == true)) {
