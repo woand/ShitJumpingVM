@@ -1745,23 +1745,35 @@ class VirtualApplicationManager @Inject constructor(
             // never stall bind; the AW state check is synchronous
             // and cheap. Nothing here calls initLoader or changes
             // any guest state.
+            // v122 correction: v121 read static field "a", which is
+            // the shell's own self-reference (attachBaseContext does
+            // sput this -> AW.a), NOT the delegate. The delegate is
+            // static field "realApplication". v122 reads BOTH so a
+            // future misread is visible in the same line: "a" must
+            // come back as AW itself, "realApplication" is the actual
+            // question (null = delegate never created in guest).
             try {
                 if (application.javaClass.name ==
                     "com.secneo.apkwrapper.AW"
                 ) {
-                    val realField = try {
-                        findField(application.javaClass, "a")
-                    } catch (_: Throwable) {
-                        null
+                    val readStaticApp = { name: String ->
+                        try {
+                            val f = findField(application.javaClass, name)
+                            f?.isAccessible = true
+                            f?.get(null)
+                        } catch (_: Throwable) {
+                            "field-read-failed"
+                        }
                     }
-                    val realApp = try {
-                        realField?.isAccessible = true
-                        realField?.get(null)
-                    } catch (_: Throwable) {
-                        "field-read-failed"
+                    val aApp = readStaticApp("a")
+                    val aDesc = when (aApp) {
+                        null -> "null"
+                        is Application -> aApp.javaClass.name
+                        else -> "unexpected=$aApp"
                     }
+                    val realApp = readStaticApp("realApplication")
                     val realDesc = when (realApp) {
-                        null -> "null (real Application never created)"
+                        null -> "null (delegate never created)"
                         is Application -> {
                             val base = try {
                                 realApp.baseContext
@@ -1778,7 +1790,8 @@ class VirtualApplicationManager @Inject constructor(
                         else -> "unexpected=$realApp"
                     }
                     GuestBreadcrumb.log(
-                        "v121-plugin-probe AW realApplication: $realDesc"
+                        "v122-plugin-probe AW a=$aDesc " +
+                            "realApplication: $realDesc"
                     )
                     Thread({
                         try {
