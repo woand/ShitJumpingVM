@@ -35,6 +35,13 @@ class VirtualContext(
 
     private val appDir: File = sandboxManager.getAppDir(instanceId)
 
+    // v135 path fidelity (CM-gated experiment): Java-layer getters return
+    // stock-install-looking paths; the native redirect rules registered at
+    // guest bind (v135-pathfidelity) map those paths back to the sandbox,
+    // so file I/O keeps working while the STRING values look real.
+    private val pathFidelity: Boolean =
+        VirtualConstants.isPathFidelityGuest(guestPackageName)
+
     /** Cached meta-data bundle from guest APK (parsed once) */
     private var cachedGuestMetaData: android.os.Bundle? = null
 
@@ -114,22 +121,49 @@ class VirtualContext(
     // === File system overrides ===
 
     override fun getFilesDir(): File =
-        sandboxManager.getFilesDir(instanceId)
+        if (pathFidelity) {
+            // Ensure the sandbox dir exists; return the stock-looking path.
+            // I/O on it is redirected to the sandbox by v135-pathfidelity.
+            sandboxManager.getFilesDir(instanceId)
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "files")
+        } else {
+            sandboxManager.getFilesDir(instanceId)
+        }
 
     override fun getCacheDir(): File =
-        sandboxManager.getCacheDir(instanceId)
+        if (pathFidelity) {
+            sandboxManager.getCacheDir(instanceId)
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "cache")
+        } else {
+            sandboxManager.getCacheDir(instanceId)
+        }
 
     override fun getCodeCacheDir(): File =
-        sandboxManager.getCodeCacheDir(instanceId)
+        if (pathFidelity) {
+            sandboxManager.getCodeCacheDir(instanceId)
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "code_cache")
+        } else {
+            sandboxManager.getCodeCacheDir(instanceId)
+        }
 
     override fun getDatabasePath(name: String): File {
         // Match framework behavior: absolute paths are returned as-is
         if (name.startsWith(File.separator)) return File(name)
-        return File(sandboxManager.getDatabasesDir(instanceId), name)
+        return if (pathFidelity) {
+            sandboxManager.getDatabasesDir(instanceId)
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "databases/$name")
+        } else {
+            File(sandboxManager.getDatabasesDir(instanceId), name)
+        }
     }
 
     override fun getDir(name: String, mode: Int): File =
-        File(appDir, "app_$name").also { it.mkdirs() }
+        if (pathFidelity) {
+            File(appDir, "app_$name").also { it.mkdirs() }
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "app_$name")
+        } else {
+            File(appDir, "app_$name").also { it.mkdirs() }
+        }
 
     override fun getExternalFilesDir(type: String?): File {
         return sandboxManager.getExternalAppFilesDir(instanceId, guestPackageName, type)
@@ -159,9 +193,19 @@ class VirtualContext(
     }
 
     override fun getNoBackupFilesDir(): File =
-        File(appDir, "no_backup").also { it.mkdirs() }
+        if (pathFidelity) {
+            File(appDir, "no_backup").also { it.mkdirs() }
+            File(VirtualConstants.syntheticDataDir(guestPackageName), "no_backup")
+        } else {
+            File(appDir, "no_backup").also { it.mkdirs() }
+        }
 
-    override fun getDataDir(): File = appDir
+    override fun getDataDir(): File =
+        if (pathFidelity) {
+            File(VirtualConstants.syntheticDataDir(guestPackageName))
+        } else {
+            appDir
+        }
 
     // === SharedPreferences override ===
 
@@ -238,6 +282,16 @@ class VirtualContext(
                     cachedGuestMetaData = fallback
                     metaData = fallback
                 }
+            }
+
+            // v135 path fidelity: report stock-install paths instead of
+            // sandbox paths. I/O on these is redirected by v135-pathfidelity.
+            if (pathFidelity) {
+                dataDir = VirtualConstants.syntheticDataDir(guestPackageName)
+                nativeLibraryDir = VirtualConstants.syntheticLibDir(guestPackageName)
+                val synthApk = VirtualConstants.syntheticApkPath(guestPackageName)
+                sourceDir = synthApk
+                publicSourceDir = synthApk
             }
         }
     }

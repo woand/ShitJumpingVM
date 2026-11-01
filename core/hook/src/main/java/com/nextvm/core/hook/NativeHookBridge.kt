@@ -355,6 +355,45 @@ class NativeHookBridge @Inject constructor() {
     }
 
     /**
+     * v135 path fidelity (experiment): register the file-I/O redirections
+     * that make the stock-looking paths reported by the Java layer actually
+     * work. MUST be called in the guest process before the guest Application
+     * is bound (the shell's H.b opens sourceDir and writes dataDir/.cache
+     * during attachBaseContext). The synthetic paths use the same token as
+     * the native /proc/self/maps spoof, so the Java layer and the maps
+     * layer agree.
+     *
+     * @param sandboxDataDir The sandbox app dir (files/virtual/data/<instance>)
+     * @param apkPath The sandbox APK file path
+     */
+    fun setupPathFidelityRedirections(
+        guestPackageName: String,
+        instanceId: String,
+        sandboxDataDir: String,
+        apkPath: String
+    ) {
+        setupAppRedirections(guestPackageName, instanceId, sandboxDataDir)
+        addPathRedirection(
+            VirtualConstants.syntheticApkPath(guestPackageName),
+            apkPath
+        )
+        addPathRedirection(
+            VirtualConstants.syntheticLibDir(guestPackageName) + "/",
+            "$sandboxDataDir/lib/"
+        )
+        Timber.tag("v135-pathfidelity").i(
+            "redirections set for $guestPackageName ($instanceId)"
+        )
+    }
+
+    /** Remove the v135 synthetic-path rules (data-dir rules via removeAppRedirections). */
+    fun removePathFidelityRedirections(guestPackageName: String) {
+        removePathRedirection(VirtualConstants.syntheticApkPath(guestPackageName))
+        removePathRedirection(VirtualConstants.syntheticLibDir(guestPackageName) + "/")
+        Timber.tag("v135-pathfidelity").d("redirections removed for $guestPackageName")
+    }
+
+    /**
      * Set up /proc/self spoofing for a virtual app.
      *
      * @param pid The spoofed PID to report

@@ -714,6 +714,17 @@ class PackageManagerProxy(
                     putInt("com.google.android.gms.version", 243431006)
                 }
             }
+
+            // v135 path fidelity (CM-gated experiment): report
+            // stock-install paths. I/O on these is redirected by
+            // v135-pathfidelity rules registered at guest bind.
+            if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
+                dataDir = VirtualConstants.syntheticDataDir(app.packageName)
+                nativeLibraryDir = VirtualConstants.syntheticLibDir(app.packageName)
+                val synthApk = VirtualConstants.syntheticApkPath(app.packageName)
+                sourceDir = synthApk
+                publicSourceDir = synthApk
+            }
         }
     }
 

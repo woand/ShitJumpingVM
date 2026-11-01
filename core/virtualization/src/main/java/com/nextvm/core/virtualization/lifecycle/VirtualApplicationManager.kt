@@ -2996,6 +2996,17 @@ class VirtualApplicationManager @Inject constructor(
                     putInt("com.google.android.gms.version", 243431006)
                 }
             }
+
+            // v135 path fidelity (CM-gated experiment): report
+            // stock-install paths. I/O on these is redirected by
+            // v135-pathfidelity rules registered at guest bind.
+            if (com.nextvm.core.model.VirtualConstants.isPathFidelityGuest(packageName)) {
+                this.dataDir = com.nextvm.core.model.VirtualConstants.syntheticDataDir(packageName)
+                this.nativeLibraryDir = com.nextvm.core.model.VirtualConstants.syntheticLibDir(packageName)
+                val synthApk = com.nextvm.core.model.VirtualConstants.syntheticApkPath(packageName)
+                this.sourceDir = synthApk
+                this.publicSourceDir = synthApk
+            }
         }
     }
 

@@ -652,6 +652,7 @@ class VirtualEngine @Inject constructor(
             // Deactivate storage hooks for this instance
             nativeHookBridge.removeExternalStorageRedirections()
             nativeHookBridge.removeAppRedirections(pkg)
+            nativeHookBridge.removePathFidelityRedirections(pkg)
             virtualEnvironmentHook.deactivate()
 
             // Clean up GMS state (FCM tokens, auth state, Binder connections, billing)
@@ -1666,6 +1667,26 @@ class VirtualEngine @Inject constructor(
                     nativeHookBridge.setProcSpoofSuspended(true)
                 } catch (e: Exception) {
                     Timber.tag(TAG).w(e, "setProcSpoofSuspended(true) failed")
+                }
+            }
+            // v135 path fidelity (experiment, CM-gated): register the
+            // file-I/O redirections BEFORE the guest Application binds.
+            // The shell's H.b opens sourceDir and writes dataDir/.cache
+            // during attachBaseContext, so the rules must already be live
+            // when makeApplication runs below. The Java layer then reports
+            // stock-install paths (VirtualContext/PM proxy/VAM v135 spoof)
+            // while I/O still lands in the sandbox. Verified post-boot via
+            // the v55 probe ai line (dataDir/sourceDir it received).
+            if (packageName == "com.greenpoint.android.mc10086.activity") {
+                try {
+                    nativeHookBridge.setupPathFidelityRedirections(
+                        packageName,
+                        instanceId,
+                        sandboxManager.getAppDir(instanceId).absolutePath,
+                        apkPath
+                    )
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("v135-pathfidelity setup failed: ${e.message}")
                 }
             }
             try {

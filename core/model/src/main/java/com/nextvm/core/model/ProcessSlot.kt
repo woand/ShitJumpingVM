@@ -141,4 +141,26 @@ object VirtualConstants {
 
     /** Stub class prefix */
     const val STUB_PREFIX = "com.nextvm.app.stub"
+
+    // ============ v135 path fidelity (experiment, CM-gated) ============
+    // Synthetic stock-install token. MUST match native-hook.cpp's
+    // synthetic_apk_path()/synthetic_lib_path() token (VmK8x2) so the
+    // Java-layer paths agree with what /proc/self/maps already shows.
+    const val CM_PACKAGE = "com.greenpoint.android.mc10086.activity"
+    const val SYNTHETIC_INSTALL_TOKEN = "VmK8x2"
+
+    fun isPathFidelityGuest(packageName: String): Boolean =
+        packageName == CM_PACKAGE
+
+    /** Real stock data dir for the guest package (deterministic). */
+    fun syntheticDataDir(packageName: String): String =
+        "/data/user/0/$packageName"
+
+    /** Stock-install APK path shape (same token as the maps spoof). */
+    fun syntheticApkPath(packageName: String): String =
+        "/data/app/~~$SYNTHETIC_INSTALL_TOKEN==/$packageName-$SYNTHETIC_INSTALL_TOKEN==/base.apk"
+
+    /** Stock-install native lib dir shape. */
+    fun syntheticLibDir(packageName: String): String =
+        "/data/app/~~$SYNTHETIC_INSTALL_TOKEN==/$packageName-$SYNTHETIC_INSTALL_TOKEN==/lib/arm64"
 }
