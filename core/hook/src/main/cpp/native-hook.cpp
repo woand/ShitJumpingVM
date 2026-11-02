@@ -1028,7 +1028,23 @@ static int hooked_system_property_get(const char* name, char* value) {
  * including the /proc/self spoofing — apply to the shell's own calls.
  */
 static void* hooked_dlopen(const char* filename, int flags) {
+    // v141 probe: log every dlopen for the CM guest, before AND after.
+    // The v140 SIGSEGV happens INSIDE real_dlopen (the .so's init), so
+    // the last enter line without a matching exit line IS the crashing
+    // .so. CM-gated via g_spoofed_package_name (same gate as v57).
+    const bool v141 = (g_spoofed_package_name ==
+                       "com.greenpoint.android.mc10086.activity");
+    if (v141) {
+        std::string redir = redirect_path(filename);
+        LOGI("v141 dlopen enter file=%s redir=%s",
+             filename != nullptr ? filename : "(null)",
+             redir.empty() ? "-" : redir.c_str());
+    }
     void* handle = real_dlopen != nullptr ? real_dlopen(filename, flags) : nullptr;
+    if (v141) {
+        LOGI("v141 dlopen exit file=%s handle=%p",
+             filename != nullptr ? filename : "(null)", handle);
+    }
     if (handle != nullptr) {
         patch_newly_loaded_libraries();
     }
@@ -1042,8 +1058,23 @@ static void* hooked_dlopen(const char* filename, int flags) {
  */
 static void* hooked_android_dlopen_ext(const char* filename, int flags,
                                        const android_dlextinfo* extinfo) {
+    // v141 probe: same enter/exit logging as hooked_dlopen. This is the
+    // entry point the native loader uses for System.loadLibrary, so it
+    // is the one the v140 crash path goes through.
+    const bool v141 = (g_spoofed_package_name ==
+                       "com.greenpoint.android.mc10086.activity");
+    if (v141) {
+        std::string redir = redirect_path(filename);
+        LOGI("v141 dlopen_ext enter file=%s redir=%s",
+             filename != nullptr ? filename : "(null)",
+             redir.empty() ? "-" : redir.c_str());
+    }
     void* handle = real_android_dlopen_ext != nullptr
         ? real_android_dlopen_ext(filename, flags, extinfo) : nullptr;
+    if (v141) {
+        LOGI("v141 dlopen_ext exit file=%s handle=%p",
+             filename != nullptr ? filename : "(null)", handle);
+    }
     if (handle != nullptr) {
         patch_newly_loaded_libraries();
     }
