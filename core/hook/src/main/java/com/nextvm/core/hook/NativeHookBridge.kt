@@ -172,6 +172,12 @@ class NativeHookBridge @Inject constructor() {
      * In Phase 1, sets up Java-level hooks only.
      * Returns true if at least Java hooks are active.
      */
+    // v138: synchronized — VE.initialize runs on a background thread while
+    // getOrCreateClassLoader may call this on the main thread; without the
+    // lock both could enter nativeInit concurrently, or a caller could
+    // observe nativeHooksAvailable=false mid-init and register rules that
+    // never reach native (v136/v137 empty-DexPathList crashes).
+    @Synchronized
     fun initNativeHooks(context: android.content.Context? = null): Boolean {
         if (initialized) return true
 

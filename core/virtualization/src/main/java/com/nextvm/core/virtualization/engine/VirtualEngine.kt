@@ -864,6 +864,19 @@ class VirtualEngine @Inject constructor(
      * Get or create the ClassLoader for a virtual app (used lazily in child processes).
      */
     fun getOrCreateClassLoader(instanceId: String, apkPath: String): ClassLoader {
+        // v138: ensure native hooks are installed synchronously BEFORE
+        // building any classloader. initNativeHooks runs on VE.initialize's
+        // background thread and was unsynchronized, so the first
+        // getOrCreateClassLoader could run while native was not ready:
+        // Kotlin rules registered but native map empty -> synthetic APK
+        // open failed -> empty DexPathList (v136/v137 crashes). init is
+        // now @Synchronized and idempotent: already initialized returns
+        // immediately, otherwise it installs here on the calling thread.
+        try {
+            nativeHookBridge.initNativeHooks(context)
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("v138 native init failed: ${e.message}")
+        }
         // v137 path fidelity: register the file-I/O redirections BEFORE
         // any classloader is built. v136 registered them later in
         // ensureGuestApplicationBooted (bind time), but the framework
