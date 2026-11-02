@@ -864,6 +864,28 @@ class VirtualEngine @Inject constructor(
      * Get or create the ClassLoader for a virtual app (used lazily in child processes).
      */
     fun getOrCreateClassLoader(instanceId: String, apkPath: String): ClassLoader {
+        // v137 path fidelity: register the file-I/O redirections BEFORE
+        // any classloader is built. v136 registered them later in
+        // ensureGuestApplicationBooted (bind time), but the framework
+        // classloader is built from the synthetic sourceDir here — before
+        // the rules existed — so the DexPathList came out empty and was
+        // cached, crashing StartPageActivity with ClassNotFoundException.
+        // This covers every caller (ATHook + boot); registration is
+        // idempotent (same keys overwritten).
+        findApp(instanceId)?.let { app ->
+            if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
+                try {
+                    nativeHookBridge.setupPathFidelityRedirections(
+                        app.packageName,
+                        instanceId,
+                        sandboxManager.getAppDir(instanceId).absolutePath,
+                        apkPath
+                    )
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("v137-pathfidelity setup failed: ${e.message}")
+                }
+            }
+        }
         return classLoaders.getOrPut(instanceId) {
             if (!::virtualRoot.isInitialized) {
                 // Use the SAME path as createVirtualDirectories() to avoid path mismatch
@@ -1683,26 +1705,10 @@ class VirtualEngine @Inject constructor(
                     Timber.tag(TAG).w(e, "setProcSpoofSuspended(true) failed")
                 }
             }
-            // v135 path fidelity (experiment, CM-gated): register the
-            // file-I/O redirections BEFORE the guest Application binds.
-            // The shell's H.b opens sourceDir and writes dataDir/.cache
-            // during attachBaseContext, so the rules must already be live
-            // when makeApplication runs below. The Java layer then reports
-            // stock-install paths (VirtualContext/PM proxy/VAM v135 spoof)
-            // while I/O still lands in the sandbox. Verified post-boot via
-            // the v55 probe ai line (dataDir/sourceDir it received).
-            if (packageName == "com.greenpoint.android.mc10086.activity") {
-                try {
-                    nativeHookBridge.setupPathFidelityRedirections(
-                        packageName,
-                        instanceId,
-                        sandboxManager.getAppDir(instanceId).absolutePath,
-                        apkPath
-                    )
-                } catch (e: Exception) {
-                    Timber.tag(TAG).w("v135-pathfidelity setup failed: ${e.message}")
-                }
-            }
+            // v137: path-fidelity redirections now live in
+            // getOrCreateClassLoader (before any classloader build);
+            // the v135 bind-time registration here was too late (the
+            // framework classloader was already built+cached empty).
             try {
                 // Boot the Application via ApplicationManager
                 applicationManager.bindApplication(

@@ -208,6 +208,21 @@ class NativeHookBridge @Inject constructor() {
             Timber.tag(TAG).i("Native hooks not available, using Java-level hooks only")
         }
 
+        // v137: push any path redirections registered before native was
+        // ready (addPathRedirection only touches the native map when
+        // nativeHooksAvailable). Without this, rules registered during the
+        // early guest-start window would stay Kotlin-only and never
+        // redirect native file opens.
+        if (nativeHooksAvailable) {
+            try {
+                pathRedirections.forEach { (from, to) ->
+                    nativeAddPathRedirection(from, to)
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).w("Failed to sync path redirections: ${e.message}")
+            }
+        }
+
         // Add default hidden paths (root/emulator detection files)
         ROOT_PATHS.forEach { hiddenPaths.add(it) }
         EMULATOR_PATHS.forEach { hiddenPaths.add(it) }
