@@ -950,6 +950,20 @@ class VirtualEngine @Inject constructor(
                 }
                 uid = android.os.Process.myUid()
                 deviceProtectedDataDir = dataDir
+                // v136 path fidelity (CM-gated): v135 spoofed the other
+                // ApplicationInfo construction paths, but this apply block
+                // overwrote them with sandbox values — and the framework
+                // LoadedApk's info is what guest activities actually see
+                // (getApplicationInfo/getFilesDir via ContextImpl). Report
+                // stock-install paths here; I/O on them is redirected by
+                // the v135-pathfidelity rules registered at guest bind.
+                if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
+                    sourceDir = VirtualConstants.syntheticApkPath(app.packageName)
+                    publicSourceDir = VirtualConstants.syntheticApkPath(app.packageName)
+                    dataDir = VirtualConstants.syntheticDataDir(app.packageName)
+                    nativeLibraryDir = VirtualConstants.syntheticLibDir(app.packageName)
+                    deviceProtectedDataDir = dataDir
+                }
                 // LoadedApk.makeApplication() instantiates
                 // ApplicationInfo.className; the VPMS copies leave it
                 // null, which silently substitutes a default
