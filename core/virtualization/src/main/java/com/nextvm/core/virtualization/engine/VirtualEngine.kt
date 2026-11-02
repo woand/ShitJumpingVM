@@ -1018,20 +1018,17 @@ class VirtualEngine @Inject constructor(
                 }
                 uid = android.os.Process.myUid()
                 deviceProtectedDataDir = dataDir
-                // v136 path fidelity (CM-gated): v135 spoofed the other
-                // ApplicationInfo construction paths, but this apply block
-                // overwrote them with sandbox values — and the framework
-                // LoadedApk's info is what guest activities actually see
-                // (getApplicationInfo/getFilesDir via ContextImpl). Report
-                // stock-install paths here; I/O on them is redirected by
-                // the v135-pathfidelity rules registered at guest bind.
-                if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
-                    sourceDir = VirtualConstants.syntheticApkPath(app.packageName)
-                    publicSourceDir = VirtualConstants.syntheticApkPath(app.packageName)
-                    dataDir = VirtualConstants.syntheticDataDir(app.packageName)
-                    nativeLibraryDir = VirtualConstants.syntheticLibDir(app.packageName)
-                    deviceProtectedDataDir = dataDir
-                }
+                // v142: the v136 framework-info spoof is REVERTED. A
+                // synthetic sourceDir breaks native code that libart loads
+                // without GOT patching (libart lives in a linker namespace
+                // the patch pass never enumerates — v139/v141): its dex
+                // opens bypass the redirect (empty DexPathList) and its
+                // direct native loads crash in .so init. So the framework
+                // LoadedApk keeps the real sandbox paths above (v135
+                // behavior, bootable), while the Java-layer getters
+                // (VirtualContext/PM/VAM, v135) still report synthetic
+                // paths — the face tap now tests the Java-level path
+                // hypothesis against a working guest.
                 // LoadedApk.makeApplication() instantiates
                 // ApplicationInfo.className; the VPMS copies leave it
                 // null, which silently substitutes a default
@@ -1142,15 +1139,16 @@ class VirtualEngine @Inject constructor(
         return try {
             val loadedApk = createFrameworkLoadedApk(app) ?: return null
             // v140: for path-fidelity guests, do NOT let
-            // LoadedApk.getClassLoader() build from the spoofed (synthetic)
-            // sourceDir — v139 proved ART's dex open bypasses the redirect,
-            // so that build always comes out empty. Instead build a
+            // LoadedApk.getClassLoader() build from the sourceDir — v139
+            // proved ART's dex open bypasses the redirect, so a synthetic
+            // sourceDir build always comes out empty. Instead build a
             // PathClassLoader from the REAL sandbox APK (plus splits) and
             // preset it as LoadedApk.mClassLoader; LoadedApk.getClassLoader
             // returns mClassLoader when already set, so later framework
-            // calls reuse it. ApplicationInfo.sourceDir stays synthetic
-            // for app-visible getters. Native libs use the real lib dir
-            // for the same reason.
+            // calls reuse it. Native libs use the real lib dir for the
+            // same reason. (v142: the framework sourceDir itself is real
+            // again, so this preset now duplicates what getClassLoader
+            // would build — kept as approved, plus its probe line.)
             if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
                 try {
                     val dexPath = (listOf(app.apkPath) + app.splitApkPaths)
