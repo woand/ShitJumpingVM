@@ -1138,54 +1138,21 @@ class VirtualEngine @Inject constructor(
     private fun createFrameworkClassLoader(app: VirtualApp): ClassLoader? {
         return try {
             val loadedApk = createFrameworkLoadedApk(app) ?: return null
-            // v140: for path-fidelity guests, do NOT let
-            // LoadedApk.getClassLoader() build from the sourceDir — v139
-            // proved ART's dex open bypasses the redirect, so a synthetic
-            // sourceDir build always comes out empty. Instead build a
-            // PathClassLoader from the REAL sandbox APK (plus splits) and
-            // preset it as LoadedApk.mClassLoader; LoadedApk.getClassLoader
-            // returns mClassLoader when already set, so later framework
-            // calls reuse it. Native libs use the real lib dir for the
-            // same reason. (v142: the framework sourceDir itself is real
-            // again, so this preset now duplicates what getClassLoader
-            // would build — kept as approved, plus its probe line.)
-            if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
-                try {
-                    val dexPath = (listOf(app.apkPath) + app.splitApkPaths)
-                        .joinToString(":")
-                    val realCl = dalvik.system.PathClassLoader(
-                        dexPath, app.libDir, this.javaClass.classLoader
-                    )
-                    var cls: Class<*>? = loadedApk.javaClass
-                    var f: java.lang.reflect.Field? = null
-                    while (cls != null && f == null) {
-                        f = try {
-                            cls.getDeclaredField("mClassLoader")
-                        } catch (e: NoSuchFieldException) {
-                            null
-                        }
-                        if (f == null) cls = cls.superclass
-                    }
-                    f?.apply { isAccessible = true }?.set(loadedApk, realCl)
-                    val filesDir =
-                        java.io.File(sandboxManager.getAppDir(app.instanceId), "files")
-                    filesDir.mkdirs()
-                    java.io.File(filesDir, "v139-probe.log").appendText(
-                        "v140 preset mClassLoader ok fieldFound=${f != null} " +
-                        "dexPath=$dexPath libDir=${app.libDir}\n"
-                    )
-                    Timber.tag(TAG).i(
-                        "v140 preset framework classloader from real apk for " +
-                            "${app.packageName}, mClassLoader field found=${f != null}"
-                    )
-                    return realCl
-                } catch (e: Exception) {
-                    Timber.tag(TAG).w(
-                        "v140 preset failed, falling back to framework " +
-                            "getClassLoader: ${e.message}"
-                    )
-                }
-            }
+            // v143: the v140 preset is REMOVED. It built a PathClassLoader
+            // whose parent was the engine's own (host) classloader, and
+            // v142 died on a same-package cross-loader split at the first
+            // AppCompat UI (privacy dialog): AppCompatDrawableManager from
+            // the shell's in-memory dex could not access package-private
+            // ResourceManagerInternal.getDrawable, i.e. the two classes
+            // landed under different loaders (IllegalAccessError). The
+            // preset was only ever needed because the framework sourceDir
+            // was synthetic (v139: ART dex opens bypass the redirect); v142
+            // restored the framework sourceDir to the real sandbox APK, so
+            // the framework's own getClassLoader() below now builds a
+            // normal DexPathList — the v135 loader configuration, which
+            // had no such split. If the dialog survives, the preset was
+            // the splitter; if the same error recurs, the split is in the
+            // in-memory dex loading itself.
             val classLoader = loadedApk.javaClass.getMethod("getClassLoader")
                 .invoke(loadedApk) as? ClassLoader
                 ?: return null
