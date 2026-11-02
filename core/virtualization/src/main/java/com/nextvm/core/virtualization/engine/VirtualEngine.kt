@@ -1141,6 +1141,53 @@ class VirtualEngine @Inject constructor(
     private fun createFrameworkClassLoader(app: VirtualApp): ClassLoader? {
         return try {
             val loadedApk = createFrameworkLoadedApk(app) ?: return null
+            // v140: for path-fidelity guests, do NOT let
+            // LoadedApk.getClassLoader() build from the spoofed (synthetic)
+            // sourceDir — v139 proved ART's dex open bypasses the redirect,
+            // so that build always comes out empty. Instead build a
+            // PathClassLoader from the REAL sandbox APK (plus splits) and
+            // preset it as LoadedApk.mClassLoader; LoadedApk.getClassLoader
+            // returns mClassLoader when already set, so later framework
+            // calls reuse it. ApplicationInfo.sourceDir stays synthetic
+            // for app-visible getters. Native libs use the real lib dir
+            // for the same reason.
+            if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
+                try {
+                    val dexPath = (listOf(app.apkPath) + app.splitApkPaths)
+                        .joinToString(":")
+                    val realCl = dalvik.system.PathClassLoader(
+                        dexPath, app.libDir, this.javaClass.classLoader
+                    )
+                    var cls: Class<*>? = loadedApk.javaClass
+                    var f: java.lang.reflect.Field? = null
+                    while (cls != null && f == null) {
+                        f = try {
+                            cls.getDeclaredField("mClassLoader")
+                        } catch (e: NoSuchFieldException) {
+                            null
+                        }
+                        if (f == null) cls = cls.superclass
+                    }
+                    f?.apply { isAccessible = true }?.set(loadedApk, realCl)
+                    val filesDir =
+                        java.io.File(sandboxManager.getAppDir(app.instanceId), "files")
+                    filesDir.mkdirs()
+                    java.io.File(filesDir, "v139-probe.log").appendText(
+                        "v140 preset mClassLoader ok fieldFound=${f != null} " +
+                        "dexPath=$dexPath libDir=${app.libDir}\n"
+                    )
+                    Timber.tag(TAG).i(
+                        "v140 preset framework classloader from real apk for " +
+                            "${app.packageName}, mClassLoader field found=${f != null}"
+                    )
+                    return realCl
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w(
+                        "v140 preset failed, falling back to framework " +
+                            "getClassLoader: ${e.message}"
+                    )
+                }
+            }
             val classLoader = loadedApk.javaClass.getMethod("getClassLoader")
                 .invoke(loadedApk) as? ClassLoader
                 ?: return null
