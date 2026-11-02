@@ -246,6 +246,12 @@ class NativeHookBridge @Inject constructor() {
      * Example:
      *   addPathRedirection("/data/data/com.whatsapp/", "/data/data/com.nextvm.app/virtual/data/com.whatsapp_12345/")
      */
+    // v139 probe getters (public for VirtualEngine's redirect probe;
+    // isNativeAvailable already exists below).
+    fun getPathRedirectSnapshot(): Map<String, String> = pathRedirections.toMap()
+    fun getNativeRedirectCount(): Int =
+        try { nativeGetRedirectCount() } catch (e: Exception) { -1 }
+
     fun addPathRedirection(fromPrefix: String, toPrefix: String) {
         pathRedirections[fromPrefix] = toPrefix
         Timber.tag(TAG).d("Path redirect: $fromPrefix -> $toPrefix")

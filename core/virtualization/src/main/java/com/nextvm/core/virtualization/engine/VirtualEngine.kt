@@ -899,6 +899,39 @@ class VirtualEngine @Inject constructor(
                 }
             }
         }
+        // v139 probe: record redirect state BEFORE any classloader is
+        // built. Written to a dedicated file (not GuestBreadcrumb, whose
+        // log() drops lines before begin()) so it survives the crash that
+        // follows when the DexPathList comes out empty. cached=false on
+        // the first call marks the build this probe precedes.
+        findApp(instanceId)?.let { app ->
+            if (VirtualConstants.isPathFidelityGuest(app.packageName)) {
+                try {
+                    val synth = VirtualConstants.syntheticApkPath(app.packageName)
+                    val synthOpen = try {
+                        java.io.FileInputStream(synth).use { it.read(); "OK" }
+                    } catch (e: Exception) {
+                        "FAIL ${e.javaClass.simpleName}:${e.message}"
+                    }
+                    val realOpen = try {
+                        java.io.FileInputStream(apkPath).use { it.read(); "OK" }
+                    } catch (e: Exception) {
+                        "FAIL ${e.javaClass.simpleName}:${e.message}"
+                    }
+                    val filesDir = java.io.File(sandboxManager.getAppDir(instanceId), "files")
+                    filesDir.mkdirs()
+                    java.io.File(filesDir, "v139-probe.log").appendText(
+                        "cached=${classLoaders.containsKey(instanceId)} " +
+                        "nativeAvailable=${nativeHookBridge.isNativeAvailable()} " +
+                        "nativeCount=${nativeHookBridge.getNativeRedirectCount()} " +
+                        "kotlinRules=${nativeHookBridge.getPathRedirectSnapshot()} " +
+                        "synth=$synth synthOpen=$synthOpen apkPath=$apkPath realOpen=$realOpen\n"
+                    )
+                } catch (e: Exception) {
+                    Timber.tag(TAG).w("v139 probe failed: ${e.message}")
+                }
+            }
+        }
         return classLoaders.getOrPut(instanceId) {
             if (!::virtualRoot.isInitialized) {
                 // Use the SAME path as createVirtualDirectories() to avoid path mismatch
