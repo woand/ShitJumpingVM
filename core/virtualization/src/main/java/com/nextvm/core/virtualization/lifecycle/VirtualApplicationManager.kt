@@ -411,6 +411,8 @@ class VirtualApplicationManager @Inject constructor(
                         disableAutofillForGuestActivity(a)
                         disableAutofillPerView(a)
                         wrapFaceVerifyButton(a)
+                        probeAuthIntentPhone(a)
+                        probeAuthIntentPhone145(a)
                     }
 
                     override fun onActivityPaused(a: android.app.Activity) =
@@ -445,6 +447,8 @@ class VirtualApplicationManager @Inject constructor(
                                 probeLoginButtonState(it, "timer")
                                 disableAutofillPerView(it)
                                 wrapFaceVerifyButton(it)
+                                probeAuthIntentPhone(it)
+                                probeAuthIntentPhone145(it)
                             }
                         } catch (_: Throwable) {
                         }
@@ -2590,6 +2594,160 @@ class VirtualApplicationManager @Inject constructor(
      * fields excluded so no user-entered text ever lands in a
      * log) so a future mismatch is visible instead of blind.
      */
+    /**
+     * v144 phone-pass probe, receive side (PII-safe by design: intent key
+     * names, data scheme/host and a phone-field empty boolean only — the
+     * EditText text itself is user-entered data and is never logged).
+     * Appends to the same v144-intent-probe.log the rewrite side writes,
+     * so send-in / send-out / recv for one navigation sit together.
+     */
+    private fun probeAuthIntentPhone(a: android.app.Activity) {
+        try {
+            if (a.javaClass.name !=
+                "com.mc10086.cmcc.authentication.common.AuthenticationActivity"
+            ) {
+                return
+            }
+            val intent = try {
+                a.intent
+            } catch (_: Throwable) {
+                null
+            }
+            val data = try {
+                intent?.data
+            } catch (_: Throwable) {
+                null
+            }
+            val keys = try {
+                intent?.extras?.keySet()?.toList() ?: emptyList()
+            } catch (_: Throwable) {
+                listOf("UNREADABLE")
+            }
+            var phoneFound = false
+            var phoneEmpty: Boolean? = null
+            try {
+                val decor = a.window?.decorView
+                val stack = ArrayDeque<android.view.View>()
+                if (decor != null) stack.add(decor)
+                while (stack.isNotEmpty() && !phoneFound) {
+                    val v = stack.removeLast()
+                    if (v is android.widget.EditText) {
+                        try {
+                            val name = try {
+                                a.resources.getResourceEntryName(v.id)
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            if (name == "phone") {
+                                phoneFound = true
+                                phoneEmpty = try {
+                                    v.text.isNullOrEmpty()
+                                } catch (_: Throwable) {
+                                    null
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    if (v is android.view.ViewGroup) {
+                        for (i in 0 until v.childCount) {
+                            try {
+                                stack.add(v.getChildAt(i))
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            val dir = try {
+                GuestBreadcrumb.filesDir()
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            java.io.File(dir, "v144-intent-probe.log").appendText(
+                "v144 recv dataPresent=${data != null} " +
+                    "scheme=${data?.scheme} host=${data?.host} " +
+                    "extraKeys=${keys.joinToString(",")} " +
+                    "phoneFound=$phoneFound phoneEmpty=$phoneEmpty\n"
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * v145 receive side: nested key names only (same contract as
+     * logV145Intent in ActivityManagerProxy — names, never values).
+     */
+    private fun probeAuthIntentPhone145(a: android.app.Activity) {
+        try {
+            if (a.javaClass.name !=
+                "com.mc10086.cmcc.authentication.common.AuthenticationActivity"
+            ) {
+                return
+            }
+            val intent = try {
+                a.intent
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            fun nestedKeys(key: String): String {
+                return try {
+                    if (!intent.hasExtra(key)) {
+                        "ABSENT"
+                    } else {
+                        val b = intent.getBundleExtra(key)
+                        if (b == null) {
+                            "NULL"
+                        } else {
+                            try {
+                                b.keySet().toList().joinToString(",")
+                            } catch (_: Throwable) {
+                                "UNREADABLE"
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                    "UNREADABLE"
+                }
+            }
+            val routerParams = try {
+                if (!intent.hasExtra("_componentRouterUri")) {
+                    "ABSENT"
+                } else {
+                    @Suppress("DEPRECATION")
+                    val uri = intent.getParcelableExtra(
+                        "_componentRouterUri"
+                    ) as? android.net.Uri
+                    if (uri == null) {
+                        "NOT_A_URI"
+                    } else {
+                        try {
+                            uri.queryParameterNames.toList()
+                                .joinToString(",")
+                        } catch (_: Throwable) {
+                            "UNREADABLE"
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                "UNREADABLE"
+            }
+            val dir = try {
+                GuestBreadcrumb.filesDir()
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            java.io.File(dir, "v145-intent-probe.log").appendText(
+                "v145 recv bundleKeys=${nestedKeys("bundle")} " +
+                    "queryBundleKeys=" +
+                    nestedKeys("_componentQueryBundle") + " " +
+                    "routerQueryParams=$routerParams\n"
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun wrapFaceVerifyButton(a: android.app.Activity) {
         try {
             if (a.javaClass.name !=

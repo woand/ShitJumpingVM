@@ -15,6 +15,17 @@ import timber.log.Timber
  * its native peer and can take the whole guest process down.  This sanitizer
  * is deliberately used only on the virtual-routing copy of an Intent; an
  * ordinary Binder call is still forwarded byte-for-byte.
+ *
+ * v146 rule (fix for the dropped AUTHENTICATION_REQ_KEY, found by the
+ * v145 probe): only a key PROVEN to contain a recycled Bitmap is removed.
+ * A key whose value cannot be read here (get() throws, typically because
+ * the value's class is not visible to this process's classloader) is
+ * passed through untouched — the receiving activity, which loads the
+ * guest's own classes, may well be able to read it, and deleting it
+ * silently breaks the receiver's pre-fill (the phone number case).
+ * A lazy value that was never materialized in this process is parceled
+ * through as raw bytes, so passing it on cannot trigger the
+ * Bitmap.writeToParcel crash the sanitizer exists to prevent.
  */
 internal object IntentParcelSanitizer {
     private const val TAG = "IntentParcel"
@@ -76,8 +87,13 @@ internal object IntentParcelSanitizer {
             val value = try {
                 copy.get(key)
             } catch (t: Throwable) {
-                copy.remove(key)
-                dropped++
+                // v146: unreadable here is NOT proven dangerous — keep
+                // the key's raw parcel bytes for the receiver instead
+                // of deleting data the receiver may be able to read.
+                Timber.tag(TAG).w(
+                    t,
+                    "keeping unreadable Intent extra (not proven unsafe)"
+                )
                 continue
             }
 
@@ -118,16 +134,19 @@ internal object IntentParcelSanitizer {
     }
 
     private fun bundleContainsInvalidBitmap(bundle: Bundle, depth: Int): Boolean {
+        // v146: same rule as the main loop — an unreadable entry is not
+        // proof of a recycled Bitmap, so it never by itself condemns
+        // the surrounding key; only a proven recycled Bitmap returns true.
         val keys = try {
             bundle.keySet()
         } catch (_: Throwable) {
-            return true
+            return false
         }
         for (key in keys) {
             val value = try {
                 bundle.get(key)
             } catch (_: Throwable) {
-                return true
+                continue
             }
             if (containsInvalidBitmap(value, depth + 1)) return true
         }

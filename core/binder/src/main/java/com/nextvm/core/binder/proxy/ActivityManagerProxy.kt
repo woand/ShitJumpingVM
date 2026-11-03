@@ -435,6 +435,15 @@ class ActivityManagerProxy(
         val app = virtualApps[pkg] ?: return null
         val targetClass = intent.component?.className ?: app.mainActivity
             ?: return null
+        // v144 phone-pass probe (PII-safe by design: intent key names,
+        // data scheme/host and presence booleans only — never a value,
+        // never data.toString() which could carry a query param).
+        val isAuthTarget = targetClass ==
+            "com.mc10086.cmcc.authentication.common.AuthenticationActivity"
+        if (isAuthTarget) {
+            logV144Intent("send-in", intent, app.instanceId)
+            logV145Intent("send-in", intent, app.instanceId)
+        }
         val rewritten = Intent(intent).apply {
             setClassName(hostPackage, getStubForApp(app))
             putExtra(VirtualIntentExtras.TARGET_PACKAGE, pkg)
@@ -444,7 +453,123 @@ class ActivityManagerProxy(
             putExtra(VirtualIntentExtras.PROCESS_SLOT, app.processSlot)
             clearSingleTopSemantics()
         }
-        return IntentParcelSanitizer.sanitize(rewritten).intent
+        val sanitized = IntentParcelSanitizer.sanitize(rewritten).intent
+        if (isAuthTarget) {
+            logV144Intent("send-out", sanitized, app.instanceId)
+            logV145Intent("send-out", sanitized, app.instanceId)
+        }
+        return sanitized
+    }
+
+    /**
+     * v145: one level deeper than v144 — inner key names of the nested
+     * `bundle` / `_componentQueryBundle` bundles, and query parameter
+     * NAMES of the `_componentRouterUri` Uri. Names only, never values
+     * (a query value or a nested value could be the phone number).
+     */
+    private fun logV145Intent(
+        stage: String,
+        intent: Intent,
+        instanceId: String
+    ) {
+        try {
+            fun nestedKeys(key: String): String {
+                return try {
+                    if (!intent.hasExtra(key)) {
+                        "ABSENT"
+                    } else {
+                        val b = intent.getBundleExtra(key)
+                        if (b == null) {
+                            "NULL"
+                        } else {
+                            try {
+                                b.keySet().toList().joinToString(",")
+                            } catch (_: Throwable) {
+                                "UNREADABLE"
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {
+                    "UNREADABLE"
+                }
+            }
+            val routerParams = try {
+                if (!intent.hasExtra("_componentRouterUri")) {
+                    "ABSENT"
+                } else {
+                    @Suppress("DEPRECATION")
+                    val uri = intent.getParcelableExtra(
+                        "_componentRouterUri"
+                    ) as? android.net.Uri
+                    if (uri == null) {
+                        "NOT_A_URI"
+                    } else {
+                        try {
+                            uri.queryParameterNames.toList()
+                                .joinToString(",")
+                        } catch (_: Throwable) {
+                            "UNREADABLE"
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                "UNREADABLE"
+            }
+            val dir = java.io.File(
+                java.io.File(
+                    java.io.File(context.filesDir, "virtual/data"),
+                    instanceId
+                ),
+                "files"
+            )
+            dir.mkdirs()
+            java.io.File(dir, "v145-intent-probe.log").appendText(
+                "v145 $stage bundleKeys=${nestedKeys("bundle")} " +
+                    "queryBundleKeys=" +
+                    nestedKeys("_componentQueryBundle") + " " +
+                    "routerQueryParams=$routerParams\n"
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * v144: append one PII-safe line about an AuthenticationActivity-bound
+     * intent to v144-intent-probe.log in the guest sandbox files dir.
+     * send-in vs send-out brackets the IntentParcelSanitizer: a key
+     * present in send-in but missing in send-out was stripped by it.
+     */
+    private fun logV144Intent(
+        stage: String,
+        intent: Intent,
+        instanceId: String
+    ) {
+        try {
+            val data = try {
+                intent.data
+            } catch (_: Throwable) {
+                null
+            }
+            val keys = try {
+                intent.extras?.keySet()?.toList() ?: emptyList()
+            } catch (_: Throwable) {
+                listOf("UNREADABLE")
+            }
+            val dir = java.io.File(
+                java.io.File(
+                    java.io.File(context.filesDir, "virtual/data"),
+                    instanceId
+                ),
+                "files"
+            )
+            dir.mkdirs()
+            java.io.File(dir, "v144-intent-probe.log").appendText(
+                "v144 $stage dataPresent=${data != null} " +
+                    "scheme=${data?.scheme} host=${data?.host} " +
+                    "extraKeys=${keys.joinToString(",")}\n"
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     /**
