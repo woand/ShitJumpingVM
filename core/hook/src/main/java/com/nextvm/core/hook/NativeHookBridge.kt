@@ -108,6 +108,25 @@ class NativeHookBridge @Inject constructor() {
 
         @JvmStatic
         external fun nativeReadRealMaps(): String?
+
+        /**
+         * v147: drain the native failed-connect / failed-DNS ring
+         * (hooked_connect / hooked_getaddrinfo). Null when the native
+         * library is unavailable or no new events since the last drain.
+         * Called from outside any hook body, so file I/O here is safe.
+         */
+        @JvmStatic
+        fun dumpConnectProbe(): String? {
+            if (!nativeLibLoaded) return null
+            return try {
+                nativeDumpConnectProbe()
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        @JvmStatic
+        external fun nativeDumpConnectProbe(): String?
     }
 
     fun initialize() {

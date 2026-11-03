@@ -30,6 +30,11 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <time.h>
 #include <link.h>
 #include <elf.h>
 #include <dirent.h>
@@ -186,6 +191,14 @@ static orig_lstat_t real_lstat = nullptr;
 static orig_readlink_t real_readlink = nullptr;
 static orig_fopen_t real_fopen = nullptr;
 static orig_system_property_get_t real_system_property_get = nullptr;
+
+typedef int (*orig_connect_t)(int, const struct sockaddr*, socklen_t);
+typedef int (*orig_getaddrinfo_t)(const char*, const char*,
+                                  const struct addrinfo*,
+                                  struct addrinfo**);
+
+static orig_connect_t real_connect = nullptr;
+static orig_getaddrinfo_t real_getaddrinfo = nullptr;
 
 typedef void* (*orig_dlopen_t)(const char*, int);
 typedef void* (*orig_android_dlopen_ext_t)(const char*, int, const android_dlextinfo*);
@@ -1381,6 +1394,110 @@ static bool is_address_readable(const void* addr, size_t len) {
     return true;
 }
 
+// ==================== v147: failed-connect / failed-DNS ring ====================
+// Diagnostic only, CM-gated. Hook bodies obey the forbidden-zone rule:
+// integer compares, one package-string compare, fixed-buffer copies and
+// atomic slot claims only — no PLT-routed libc calls, no allocation,
+// no file I/O (a hook body that opened a file would recurse through
+// hooked_open/hooked_fopen). Events are drained to v147-connect-probe.log
+// by Kotlin (face-tap delayed dump + 20s timer), never from a hook.
+// Recorded data is infrastructure only: endpoint IP/port, errno/EAI code,
+// wall-clock ms. No hostnames beyond the DNS query name, no URLs, no
+// request or response content.
+struct V147Event {
+    int64_t wall_ms;
+    int32_t kind;  // 0 = connect failed, 1 = getaddrinfo failed
+    int32_t err;   // errno (connect) or EAI code (getaddrinfo)
+    uint16_t port; // connect only
+    char ip[64];
+    char host[128]; // getaddrinfo node only
+};
+static constexpr int kV147Cap = 512;
+static V147Event g_v147_events[kV147Cap];
+static std::atomic<int> g_v147_ready[kV147Cap];
+static std::atomic<int> g_v147_head{0};
+static std::atomic<int> g_v147_drained{0};
+
+static int64_t v147_wall_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int hooked_connect(int sockfd, const struct sockaddr* addr,
+                          socklen_t addrlen) {
+    if (real_connect == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int rc = real_connect(sockfd, addr, addrlen);
+    if (rc < 0 && addr != nullptr &&
+        g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity") {
+        // Internet sockets only; AF_UNIX noise is skipped.
+        if (addr->sa_family == AF_INET || addr->sa_family == AF_INET6) {
+            int e = errno;
+            int slot = g_v147_head.fetch_add(1);
+            if (slot < kV147Cap) {
+                V147Event& ev = g_v147_events[slot];
+                ev.wall_ms = v147_wall_ms();
+                ev.kind = 0;
+                ev.err = e;
+                ev.port = 0;
+                ev.ip[0] = '\0';
+                ev.host[0] = '\0';
+                if (addr->sa_family == AF_INET &&
+                    addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+                    const struct sockaddr_in* in =
+                        (const struct sockaddr_in*)addr;
+                    ev.port = ntohs(in->sin_port);
+                    inet_ntop(AF_INET, &in->sin_addr, ev.ip, sizeof(ev.ip));
+                } else if (addr->sa_family == AF_INET6 &&
+                           addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+                    const struct sockaddr_in6* in6 =
+                        (const struct sockaddr_in6*)addr;
+                    ev.port = ntohs(in6->sin6_port);
+                    inet_ntop(AF_INET6, &in6->sin6_addr, ev.ip,
+                              sizeof(ev.ip));
+                }
+                g_v147_ready[slot].store(1, std::memory_order_release);
+            }
+        }
+    }
+    return rc;
+}
+
+static int hooked_getaddrinfo(const char* node, const char* service,
+                              const struct addrinfo* hints,
+                              struct addrinfo** res) {
+    if (real_getaddrinfo == nullptr) {
+        return EAI_SYSTEM;
+    }
+    int rc = real_getaddrinfo(node, service, hints, res);
+    if (rc != 0 &&
+        g_spoofed_package_name ==
+            "com.greenpoint.android.mc10086.activity") {
+        int slot = g_v147_head.fetch_add(1);
+        if (slot < kV147Cap) {
+            V147Event& ev = g_v147_events[slot];
+            ev.wall_ms = v147_wall_ms();
+            ev.kind = 1;
+            ev.err = rc;
+            ev.port = 0;
+            ev.ip[0] = '\0';
+            if (node != nullptr) {
+                strncpy(ev.host, node, sizeof(ev.host) - 1);
+                ev.host[sizeof(ev.host) - 1] = '\0';
+            } else {
+                strncpy(ev.host, "(null)", sizeof(ev.host) - 1);
+                ev.host[sizeof(ev.host) - 1] = '\0';
+            }
+            g_v147_ready[slot].store(1, std::memory_order_release);
+        }
+    }
+    return rc;
+}
+
 /**
  * Hook entry: maps a symbol name to our hook function and the saved original pointer.
  */
@@ -1411,6 +1528,8 @@ static HookEntry g_hook_entries[] = {
     {"opendir",                 (void*)hooked_opendir,              (void**)&real_opendir},
     {"mmap",                    (void*)hooked_mmap,                 (void**)&real_mmap},
     {"mprotect",                (void*)hooked_mprotect,             (void**)&real_mprotect},
+    {"connect",                 (void*)hooked_connect,              (void**)&real_connect},
+    {"getaddrinfo",             (void*)hooked_getaddrinfo,          (void**)&real_getaddrinfo},
 };
 static constexpr int g_hook_count = sizeof(g_hook_entries) / sizeof(g_hook_entries[0]);
 
@@ -1863,8 +1982,14 @@ static bool install_plt_hooks() {
         real_mmap = (orig_mmap_t)dlsym(RTLD_DEFAULT, "mmap");
     if (!real_mprotect)
         real_mprotect = (orig_mprotect_t)dlsym(RTLD_DEFAULT, "mprotect");
+    if (!real_connect)
+        real_connect = (orig_connect_t)dlsym(RTLD_DEFAULT, "connect");
+    if (!real_getaddrinfo)
+        real_getaddrinfo =
+            (orig_getaddrinfo_t)dlsym(RTLD_DEFAULT, "getaddrinfo");
 
-    if (!real_open || !real_openat || !real_access || !real_stat) {
+    if (!real_open || !real_openat || !real_access || !real_stat ||
+        !real_connect || !real_getaddrinfo) {
         LOGE("Failed to resolve one or more libc functions via dlsym");
         return false;
     }
@@ -5847,6 +5972,54 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeArmSeccompDiag(
         LOGI("seccomp-diag: arm rc=%d", rc);
         env->ReleaseStringUTFChars(logPath, p);
     }
+}
+
+/**
+ * v147: drain the failed-connect / failed-DNS ring as one string.
+ * MUST match Kotlin: nativeDumpConnectProbe(): String?
+ * Returns null when no new events since the last drain. Runs outside
+ * any hook body, so snprintf/String building here is safe.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_nextvm_core_hook_NativeHookBridge_nativeDumpConnectProbe(
+    JNIEnv* env, jobject thiz)
+{
+    (void)thiz;
+    int head = g_v147_head.load(std::memory_order_acquire);
+    int upto = g_v147_drained.load(std::memory_order_acquire);
+    if (head <= upto) {
+        return nullptr;
+    }
+    std::string out;
+    char line[320];
+    for (int i = upto; i < head && i < kV147Cap; ++i) {
+        if (!g_v147_ready[i].load(std::memory_order_acquire)) {
+            continue;
+        }
+        const V147Event& ev = g_v147_events[i];
+        if (ev.kind == 0) {
+            snprintf(line, sizeof(line),
+                     "v147 connect-fail wall_ms=%lld ip=%s port=%u "
+                     "errno=%d\n",
+                     (long long)ev.wall_ms, ev.ip,
+                     (unsigned)ev.port, ev.err);
+        } else {
+            snprintf(line, sizeof(line),
+                     "v147 gai-fail wall_ms=%lld host=%s eai=%d\n",
+                     (long long)ev.wall_ms, ev.host, ev.err);
+        }
+        out += line;
+    }
+    g_v147_drained.store(head, std::memory_order_release);
+    if (head > kV147Cap) {
+        char cap[64];
+        snprintf(cap, sizeof(cap), "v147 CAPPED head=%d\n", head);
+        out += cap;
+    }
+    if (out.empty()) {
+        return nullptr;
+    }
+    return env->NewStringUTF(out.c_str());
 }
 
 /**
