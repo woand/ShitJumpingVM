@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/nextvm-logo.png" alt="NEXTVM Logo" width="200" height="200" />
-</p>
+# ShitJumpingVM
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Android-3DDC84?style=for-the-badge&logo=android&logoColor=white" />
@@ -8,20 +6,18 @@
   <img src="https://img.shields.io/badge/NDK-C++-00599C?style=for-the-badge&logo=cplusplus&logoColor=white" />
   <img src="https://img.shields.io/badge/Min%20SDK-26-brightgreen?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Target%20SDK-35-blue?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/Status-Alpha-orange?style=for-the-badge" />
-</p>
-
-<h1 align="center">NEXTVM</h1>
-<h3 align="center">Next-Generation Android Virtual Environment Engine</h3>
-
-<p align="center">
-  <strong>Run any Android app inside a fully isolated, sandboxed virtual environment — without root, without emulators, directly on your phone.</strong>
 </p>
 
 <p align="center">
-  <a href="#architecture">Architecture</a> &bull;
-  <a href="#features">Features</a> &bull;
-  <a href="#roadmap">Roadmap</a> &bull;
+  <strong>A no-root, user-space Android virtualization engine: run a guest APK inside
+  an isolated sandbox process of a host app, on the phone itself.</strong>
+</p>
+
+<p align="center">
+  <a href="#what-it-is">What it is</a> &bull;
+  <a href="#how-it-works">How it works</a> &bull;
+  <a href="#module-structure">Module structure</a> &bull;
+  <a href="#status">Status</a> &bull;
   <a href="#building">Building</a> &bull;
   <a href="#contributing">Contributing</a> &bull;
   <a href="#license">License</a>
@@ -29,176 +25,191 @@
 
 ---
 
-## What is NEXTVM?
+## What it is
 
-NEXTVM is a **lightweight Android virtualization engine** that creates isolated virtual environments on Android devices. Unlike traditional emulators that simulate hardware, NEXTVM uses **Binder proxy interception** and **ActivityThread hooking** to run real Android apps in a sandboxed process — achieving near-native performance with complete isolation.
+ShitJumpingVM is a fork and rename of NEXTVM. It does not emulate hardware and
+does not modify the OS. A guest app runs as an ordinary app process, but its
+Binder IPC, activity launches, class loading, and file paths are intercepted
+and redirected into a per-instance sandbox, so the guest sees its own data
+directory, files, and storage instead of the host's.
 
-Think of it as a "parallel universe" for your Android apps — each app runs with its own identity, storage, accounts, and network configuration, completely isolated from the host device and from each other.
+The project is experimental and under active development
+(`versionName 1.0.0-alpha01`). It is aimed at app-compatibility work and
+controlled runtime diagnostics: getting real apps to boot and run inside the
+sandbox, and finding out exactly where they diverge from running normally.
 
-### Why NEXTVM?
-
-| Problem | NEXTVM Solution |
-|---------|----------------|
-| Testing apps without affecting your real data | Fully isolated sandbox with virtual filesystem |
-| Running multiple accounts of the same app | Up to 10 independent instances, each with unique identity |
-| Privacy concerns with untrusted apps | Apps see only what you allow — fake contacts, fake location, fake device identity |
-| Security research & app analysis | Built-in runtime analysis tools, no root required |
-| App compatibility testing across device profiles | Spoof any device model, Android version, carrier, screen config |
+> Note on naming: the repository and project are now ShitJumpingVM, but the
+> host app's `applicationId` / namespace is still `com.nextvm.app` — renaming
+> it was not part of the fork, so you will still see `com.nextvm` in code,
+> package names, and on-device paths.
 
 ---
 
-## Architecture
-
-NEXTVM is built on a **multi-layer interception architecture** that intercepts Android's IPC mechanism (Binder) at the application level, without requiring any OS modifications or root access.
+## How it works
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                    NEXTVM Engine                      │
-│                                                      │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │  Guest   │  │ Binder Proxy │  │  Android OS   │  │
-│  │   App    │──│    Layer     │──│  (Unmodified) │  │
-│  │          │  │              │  │               │  │
-│  └──────────┘  └──────────────┘  └───────────────┘  │
-│       │              │                    │          │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ Virtual  │  │ ActivityThread│  │  Native Hook  │  │
-│  │ Context  │  │  mH Hook     │  │  Engine (C++) │  │
-│  │ Sandbox  │  │  (Code 159)  │  │  GOT/PLT Patch│  │
-│  └──────────┘  └──────────────┘  └───────────────┘  │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐    │
-│  │              Identity Spoofing                │    │
-│  │  Build.* | IMEI | ANDROID_ID | MAC | Carrier │    │
-│  └──────────────────────────────────────────────┘    │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐    │
-│  │             Anti-Detection Engine             │    │
-│  │  Root | Emulator | Xposed | Virtual Env Hide │    │
-│  └──────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────┘
+Guest APK
+    │  installed into the sandbox (files/virtual/apks/<instance>.apk)
+    ▼
+Host app (com.nextvm.app)
+    │  VirtualEngine boots the guest: classloader, VirtualContext,
+    │  resources, ContentProviders, Binder proxies
+    ▼
+Stub components (manifest-declared, 10 process slots P0–P9)
+    │  startActivity/startService/bindService calls are rewritten
+    │  to a stub; ActivityThreadHook swaps the real guest class in
+    │  at launch time (EXECUTE_TRANSACTION interception)
+    ▼
+Guest Application / Activity running in a :pN stub process
+    │  file I/O goes through VirtualContext + native GOT/PLT hooks
+    │  and lands in files/virtual/data/<instance>/
+    ▼
+Android OS (unmodified, no root)
 ```
 
-### Core Mechanism
+### The interception layers
 
-1. **Binder Proxy Interception** — `IActivityManager`, `IPackageManager`, and system service proxies intercept all app-to-system IPC calls
-2. **ActivityThread.mH Hook** — Intercepts `EXECUTE_TRANSACTION` (code 159) to swap ClassLoaders and redirect Activity launches through stub components
-3. **Virtual Context** — Custom `ContextWrapper` that redirects all file I/O, databases, SharedPreferences, and identity queries to the sandbox
-4. **Native Hook Engine (C++)** — GOT/PLT patching for `libc` functions (`open`, `openat`, `stat`, `access`, `fopen`, `__system_property_get`) to enforce isolation at the native level
-5. **200 Stub Components** — 10 process slots × 20 components each (Activities, Services, ContentProviders, BroadcastReceivers) pre-declared in the manifest
+1. **Binder proxies** (`core/binder`) — `IActivityManager`, `IPackageManager`,
+   and system-service proxies intercept app-to-system IPC. Guest
+   `startActivity` calls are rewritten to a stub component
+   (`P<slot>$Standard00` and siblings); intents pass through
+   `IntentParcelSanitizer`, which only drops a key when it is proven to
+   carry a recycled `Bitmap` — unreadable keys are passed through
+   untouched, so guest data is not silently stripped in transit.
+2. **ActivityThread hook** (`core/virtualization`) — intercepts
+   `EXECUTE_TRANSACTION` to replace the stub classloader and class with
+   the guest's own, then instantiates the real guest component. This is
+   what makes a manifest-declared stub actually run guest code.
+3. **Virtual context and sandbox** (`core/sandbox`) — `VirtualContext`
+   redirects files, databases, and preferences into the sandbox layout
+   below, and `SandboxManager` owns that layout. The guest's
+   `dataDir` / `filesDir` / `cacheDir` live under the host app's files
+   directory, and its external-storage root is a simulated sdcard
+   inside the sandbox — not the device's real storage.
+4. **Native hooks** (`core/hook`, C++) — a GOT/PLT patcher
+   (`native-hook.cpp`) redirects libc calls (`open`, `openat`, `access`,
+   `stat`, `connect`, `getaddrinfo`, …) for guest processes, enforcing
+   path redirection at the native layer and recording failures for
+   diagnostics. Hook bodies are deliberately minimal (integer and
+   package-name comparisons only, no file I/O inside a hook) so a hook
+   cannot recurse through itself.
+5. **Class loading** (`core/apk`, `core/framework`) — the framework
+   `LoadedApk` for the guest is built from the sandbox APK path, and the
+   guest is loaded with the framework's own classloader. The guest's
+   `Application` and `Activity` classes therefore come from its own APK,
+   not from the host.
 
-### Module Structure
+### Sandbox layout
 
 ```
-NEXTVM/
-├── app/                          # Application entry point & DI
+<host files>/virtual/
+├── apks/<instance>.apk                  # guest APK copy
+└── data/<instance>/
+    ├── files/                           # guest filesDir (incl. guest probes/logs)
+    ├── cache/                           # guest cacheDir
+    ├── lib/                             # guest nativeLibraryDir
+    └── sdcard/                          # simulated external storage root
+```
+
+Guest processes are named after their stub slot (`:p0`, `:p2`, …), not
+after the guest package, and the guest runs with the host app's UID —
+both are visible differences from a normally installed app, and both
+matter when diagnosing compatibility problems.
+
+---
+
+## Module structure
+
+15 modules: 1 app + 10 core + 4 feature. Verified against
+`settings.gradle.kts`.
+
+```
+ShitJumpingVM/
+├── app/                          # Host entry: NextVmApplication, MainActivity,
+│                                 # stub components (StubComponents.kt), Hilt DI
 ├── core/
-│   ├── virtualization/           # VM engine, process management, lifecycle
-│   ├── hook/                     # Native (C++) + Java hooking, anti-detection, identity spoofing
-│   ├── binder/                   # Binder proxy interception (AM, PM, SystemServices)
-│   ├── sandbox/                  # File system isolation, virtual context
-│   ├── services/                 # Virtual system services, GMS integration
-│   ├── framework/                # Android framework parsing, package validation
-│   ├── apk/                      # APK parsing & class loading
-│   ├── model/                    # Data models (VirtualApp, DeviceProfile, ProcessSlot)
-│   ├── common/                   # Reflection utilities, compatibility helpers
-│   └── designsystem/             # Material 3 theme, design tokens
+│   ├── virtualization/           # VirtualEngine, ActivityThreadHook, process slots,
+│   │                             # guest lifecycle, breadcrumb diagnostics
+│   ├── binder/                   # BinderProxyManager, AM/PM/system-service proxies,
+│   │                             # intent rewriting (ActivityManagerProxy),
+│   │                             # IntentParcelSanitizer
+│   ├── sandbox/                  # SandboxManager layout, VirtualContext,
+│   │                             # NativeLibManager
+│   ├── hook/                     # Native GOT/PLT hooks (C++), NativeHookBridge,
+│   │                             # HookEngine, IdentitySpoofingEngine,
+│   │                             # AntiDetectionEngine (see Status)
+│   ├── apk/                      # ApkParser, VirtualClassLoader
+│   ├── framework/                # Framework LoadedApk construction, dex/pkg parsing
+│   ├── model/                    # VirtualApp, DeviceProfile, ProcessSlot, ApkInfo
+│   ├── services/                 # Virtual AM/PM/component/intent/network/
+│   │                             # permission services, GMS scaffolding
+│   ├── common/                   # Reflection and compatibility helpers
+│   └── designsystem/             # Material 3 theme
 ├── feature/
-│   ├── launcher/                 # App grid launcher UI
-│   ├── appmanager/               # APK install/uninstall management
-│   ├── settings/                 # Engine configuration & debugging
-│   └── filemanager/              # Virtual filesystem browser
-└── gradle/                       # Version catalog & wrapper
+│   ├── launcher/                 # Guest app grid (Compose)
+│   ├── appmanager/               # Guest install/uninstall management (Compose)
+│   ├── settings/                 # Engine configuration and debugging (Compose)
+│   └── filemanager/              # Sandbox filesystem browser (Compose)
+└── gradle/                       # Version catalog
 ```
 
----
+### Stub components
 
-## Features
+160 manifest-declared stub components in total, across 10 process slots:
 
-### Currently Implemented
+| Slots | Per slot | Components |
+|-------|----------|------------|
+| P0–P4 | 20 | 10 Activities (5 Standard, 2 SingleTop, 2 SingleTask, 1 SingleInstance), 5 Services, 3 ContentProviders, 2 Receivers |
+| P5–P9 | 12 | 6 Activities, 3 Services, 2 ContentProviders, 1 Receiver |
 
-- **App Virtualization** — Run third-party Android APKs in isolated sandbox processes
-- **Multi-Instance Support** — Up to 10 parallel app instances, each in its own process slot
-- **Complete File System Isolation** — Virtual `/data/data/`, `/sdcard/` per instance with native-level enforcement
-- **Identity Spoofing Engine** — Per-instance device fingerprinting: Build.MODEL, MANUFACTURER, FINGERPRINT, IMEI, ANDROID_ID, MAC address, carrier info — all deterministically generated
-- **Anti-Detection System** — 3-level bypass for root detection, emulator detection, virtual environment detection, Xposed detection, and signature verification
-- **GMS Integration** — Hybrid architecture bridging to the host's real Google Play Services for auth, FCM push notifications, and Play Store compatibility
-- **Native Hook Engine** — C++ GOT/PLT patcher for libc-level file path redirection and system property spoofing
-- **Modern UI** — Jetpack Compose with Material 3, featuring launcher grid, app manager, file browser, and settings
-- **Hilt DI** — Clean architecture with dependency injection across all 15 modules
-
-### Coming Soon — Roadmap
-
-<details>
-<summary><b>Privacy & Security</b></summary>
-
-| Feature | Description |
-|---------|-------------|
-| **Witness Protection** | AI-generated fake contacts, photos, SMS — apps see realistic but completely fake user data |
-| **Phantom Network** | Per-app DNS routing, carrier spoofing, and independent network identity |
-| **Panic Button** | One-tap encrypted wipe of all virtual data, launcher disguise as calculator app |
-| **Clipboard Firewall** | Prevent apps from reading sensitive clipboard content |
-| **Acoustic Sandbox** | Microphone isolation with optional white noise injection |
-| **Self-Destruct Protocol** | Remote wipe via push notification trigger |
-
-</details>
-
-<details>
-<summary><b>Power User Tools</b></summary>
-
-| Feature | Description |
-|---------|-------------|
-| **Time Prison** | Per-app time freezing — lock any app's clock to a specific date without affecting the system |
-| **Speed Controller** | Adjust app execution speed (0.1x to 10x) for games and testing |
-| **App X-Ray** | Real-time transparent overlay showing all API calls, network traffic, and permission usage live |
-| **Puppet Master API** | Local REST API to programmatically control any virtual app from another device on your network |
-| **Mimic Engine** | AI-powered behavior recording and replay with image recognition-based UI adaptation |
-| **Ghost Notifications** | Unified notification hub across all instances with smart grouping and stealth mode |
-
-</details>
-
-<details>
-<summary><b>Analysis & Research</b></summary>
-
-| Feature | Description |
-|---------|-------------|
-| **App Genome Mapping** | Automatic SDK/library detection with de-obfuscation and family fingerprinting |
-| **Vulnerability Radar** | Auto-discover security weaknesses during app runtime — zero expertise required |
-| **Forensic Camera** | Record all app behavior (screen, network, file I/O, crypto) in a unified timeline |
-| **Binary Diff Engine** | Compare app versions at the code level — see exactly what changed beyond "bug fixes" |
-| **Runtime Inspector** | Point-and-click runtime state viewer — tap any UI element to inspect/modify live objects |
-| **Sandbox Theater** | Create fake environments (slow network, low battery, different country) to test app behavior |
-
-</details>
-
-<details>
-<summary><b>Automation & Integration</b></summary>
-
-| Feature | Description |
-|---------|-------------|
-| **Tasker/IFTTT Integration** | Expose virtual app events as broadcast intents for automation workflows |
-| **Automation Engine** | Embedded scripting (Lua/Python) for complex app automation scenarios |
-| **State Teleportation** | Transfer running app state between devices via QR code scan — no re-login required |
-| **App Chimera** | Transplant visual themes and UI features between apps at runtime |
-
-</details>
+Totals: 80 Activities, 40 Services, 25 ContentProviders, 15 Receivers.
+(The old README's "200 components, 10 × 20" was wrong.)
 
 ---
 
-## Tech Stack
+## Status
 
-| Component | Technology |
-|-----------|-----------|
-| **Language** | Kotlin 2.0 + C++ (NDK) |
-| **UI Framework** | Jetpack Compose + Material 3 |
-| **Architecture** | MVI + Clean Architecture |
-| **DI** | Hilt (Dagger) |
-| **Build System** | Gradle 8.9 + Version Catalog |
-| **Native Hooks** | Custom GOT/PLT patcher (C++) |
-| **Java Hooks** | Reflection-based field modification |
-| **Min SDK** | 26 (Android 8.0) |
-| **Target SDK** | 35 (Android 15) |
-| **Modules** | 15 (1 app + 10 core + 4 feature) |
+### What works
+
+- Guest APK installation into the sandbox and launch into a stub process
+- Per-instance sandbox directories, with Java-layer file redirection
+- Guest `ContentProvider` installation during boot
+- Activity navigation through stub rewriting (including the
+  `DELIVERED_TO_TOP` re-send to a different Standard slot as a safety net)
+- Compose UI: launcher, app manager, settings, sandbox file browser
+- File-based diagnostics (per-process breadcrumb logs, intent-probe logs,
+  native connect/DNS failure logs) — logcat is unreliable for guest
+  processes on the devices used here, so durable files are the channel
+  diagnostics actually rely on
+
+### What is partial or not yet built
+
+- **Identity spoofing is not applied.** `IdentitySpoofingEngine` and
+  `DeviceProfile` exist in code, but no profile is applied in the current
+  boot path, and the system-service proxies currently pass real values
+  through (their virtual-call gate is never satisfied). Do not describe
+  this project as spoofing device identity — that is a direction, not a
+  working feature.
+- **No Java/ART method-hook infrastructure.** `HookEngine` lists LSPlant
+  (ART hooks) and Dobby (inline hooks) as future work. The native layer
+  is GOT/PLT patching only, and `libart.so` is explicitly never patched,
+  so ART's own dex opening bypasses the file hooks — a known limit when
+  reasoning about class-loading behavior.
+- **Guest compatibility varies by app.** Apps with packers or strong
+  integrity checks are the hardest cases; a guest that boots to its main
+  UI is not a guarantee that every feature (login, WebView, payments,
+  media, face verification, …) works inside the sandbox. Each guest and
+  each feature has to be verified on its own.
+- **No test suite.** Test coverage is thin; contributions of tests are
+  welcome (see Contributing).
+
+### Directions, not promises
+
+- Wiring up identity profiles behind the existing engine code
+- ART method-hook infrastructure, so app-layer callbacks can be observed
+  instead of only native calls
+- Broader guest compatibility, verified one app and one feature at a time
+- Documentation that stays in step with the code (this file included)
 
 ---
 
@@ -206,162 +217,77 @@ NEXTVM/
 
 ### Prerequisites
 
-- Android Studio Ladybug (2024.2.1) or later
 - JDK 17
 - Android SDK 35
 - NDK 27.1.12297006
-- CMake (for native hook module)
+- CMake (for the `core/hook` native module)
+- Gradle 8.9 (via the wrapper)
 
 ### Steps
 
 ```bash
 # Clone the repository
-git clone https://github.com/TanvirHossain2/NEXTVM.git
-cd NEXTVM
+git clone https://github.com/woand/ShitJumpingVM.git
+cd ShitJumpingVM
 
 # Build debug APK
 ./gradlew :app:assembleDebug
 
-# Install on connected device
+# Install on a connected device
 ./gradlew :app:installDebug
 ```
 
-> **Note:** The project is in active alpha development. Some modules may have compilation issues that are being actively resolved.
+The host app is a debug build signed with the project's debug keystore;
+`minSdk 26`, `targetSdk 35`, Kotlin 2.0.21, Compose BOM 2024.12.01,
+Hilt 2.53.1.
 
----
-
-## Project Status
-
-NEXTVM is currently in **alpha stage**. The core virtualization engine, sandbox isolation, and identity spoofing systems are functional. We're actively working on expanding app compatibility and building out the advanced feature set.
-
-### What Works
-
-- APK installation and launch in virtual environment
-- File system isolation with native-level enforcement
-- Per-instance identity generation (unique device fingerprint per clone)
-- Anti-detection bypasses for common root/emulator checks
-- Google Play Services integration (auth, FCM, Play Store)
-- Modern Compose UI with app launcher, file browser, and settings
-
-### What's In Progress
-
-- Expanding app compatibility (targeting 95% of Play Store apps)
-- WebView process isolation
-- Camera and media API proxying
-- Storage Access Framework (SAF) support
-- Comprehensive test suite
-- Performance optimization and memory management
-
-### Known Limitations
-
-- **Strong commercial packers (e.g. SecNeo / 爱加密)**: apps protected by
-  these shells crash inside the guest shortly after the shell library
-  loads (verified with China Unicom v13.0). The shell's integrity check
-  still detects the virtual environment even though every
-  process-identity surface now reports the guest identity — kernel comm
-  and argv[0], `/proc` contents (maps / status / stat / cmdline),
-  fd and task enumeration, and the framework bind data behind
-  `ActivityThread.currentProcessName()`. Root-causing the remaining
-  detection channel (suspected: the synthetic ClassLoader / DexFile
-  object graph the shell's ART hooks inspect) is not currently planned.
+> Note: ShitJumpingVM is a fork of NEXTVM
+> (upstream: `https://github.com/TanvirHossain2/NEXTVM`). The original
+> NEXTVM README's feature lists, roadmap, and comparison tables were
+> aspirational and did not match this codebase; they were removed in this
+> rewrite rather than carried over.
 
 ---
 
 ## Contributing
 
-NEXTVM is a complex systems-level project and contributions are welcome! Here's how you can help:
+Contributions are welcome — this is a systems-level codebase, and the
+fastest way in is to read the interception path end to end:
 
-### Good First Issues
+1. `core/virtualization` → `VirtualEngine` (boot) and
+   `ActivityThreadHook` (launch interception)
+2. `core/binder` → `ActivityManagerProxy` (intent rewriting) and
+   `IntentParcelSanitizer` (parcel safety)
+3. `core/sandbox` → `SandboxManager` and `VirtualContext`
+4. `core/hook/src/main/cpp/native-hook.cpp` → the GOT/PLT patcher
+5. `core/model` → `VirtualApp`, `ProcessSlot`, `DeviceProfile`
 
-- Writing unit tests for core modules (currently at 0% coverage)
-- Improving error handling and logging
-- UI polish and animations
-- Documentation for individual modules
+Good first contributions: tests for core modules, error handling and
+logging, UI polish, and documentation fixes. For compatibility work,
+please verify on a real device and report exactly what was observed
+(process alive, UI rendered, navigation completed, input usable) rather
+than what was expected.
 
-### Advanced Contributions
-
-- Android system service proxy implementations
-- Native hook improvements (migrating to [bhook](https://github.com/nicklhw/bhook) for broader compatibility)
-- App compatibility fixes for specific apps/frameworks
-- Multi-process ClassLoader isolation improvements
-- Performance profiling and optimization
-
-### Getting Started
+To contribute:
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Read through the module structure — start with `core/model` to understand data types, then `core/virtualization/engine/VirtualEngine.kt` for the main orchestrator
-4. Make your changes with clear commit messages
-5. Submit a pull request with description of what changed and why
-
-### Architecture Deep-Dive for Contributors
-
-The critical code path for understanding how app virtualization works:
-
-1. **`VirtualEngine.kt`** → `installApp()` and `launchApp()` — entry points
-2. **`StubRegistry.kt`** → How 200 stub components get mapped to real app components
-3. **`ActivityThreadHook.kt`** → The `EXECUTE_TRANSACTION` interception that makes everything work
-4. **`ActivityManagerProxy.kt`** → How `startActivity/startService/bindService` calls get redirected
-5. **`VirtualContext.kt`** → How file I/O and identity queries get sandboxed
-6. **`native-hook.cpp`** → The C++ GOT/PLT patcher that enforces isolation at the native layer
-
----
-
-## How It Compares
-
-| Feature | NEXTVM | VirtualApp | Parallel Space | Shelter |
-|---------|--------|-----------|---------------|---------|
-| No Root Required | Yes | Yes | Yes | Yes |
-| Multi-Instance | 10 slots | Limited | 2 | Work Profile |
-| Per-Instance Identity | Full spoof | Basic | None | None |
-| Native-Level Isolation | GOT/PLT hooks | Yes | No | No |
-| Anti-Detection | 3-level system | Basic | None | None |
-| GMS Integration | Hybrid bridge | Full copy | Basic | System |
-| Modern UI (Compose) | Yes | No | No | No |
-| Open Source | Yes | Partial | No | Yes |
-| Active Development | Yes | Abandoned | Closed | Minimal |
-| Target Compatibility | 95% goal | ~70% | ~60% | Work Profile |
+3. Make your changes with clear commit messages
+4. Submit a pull request describing what changed and why
 
 ---
 
 ## Disclaimer
 
-NEXTVM is designed for legitimate use cases including:
-
-- **Privacy protection** — Run untrusted apps in isolation
-- **App testing** — Test apps across different device configurations
-- **Security research** — Analyze app behavior in a controlled environment
-- **Multi-account management** — Run multiple instances of messaging and social apps
-- **Development** — Test your own apps with different device profiles
-
-Users are responsible for complying with applicable laws and terms of service when using this software. NEXTVM does not encourage or condone any form of software piracy, unauthorized access, or violation of third-party terms of service.
+ShitJumpingVM is built for legitimate compatibility and diagnostics work:
+running apps in isolation, testing them across configurations, and
+analyzing runtime behavior in a controlled environment. Users are
+responsible for complying with applicable laws and with the terms of
+service of any app they run inside it.
 
 ---
 
 ## License
 
-```
-Copyright 2024-2026 Tanvir Hossain
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
----
-
-<p align="center">
-  <b>Built with determination from Bangladesh</b>
-  <br><br>
-  <a href="https://github.com/TanvirHossain2/NEXTVM/stargazers">Star this repo</a> if you believe in the vision.
-  <br>
-  Let's build the most powerful Android virtual environment — together.
-</p>
+Licensed under the Apache License, Version 2.0. See `LICENSE` for the full
+text.
