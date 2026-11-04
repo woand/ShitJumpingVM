@@ -184,6 +184,36 @@ class PackageManagerProxy(
         }
     }
 
+    /**
+     * v149: legacy GET_SIGNATURES fallback. Disk-registered virtual
+     * records (registerPackageFromDisk) carry no signingInfo, so the
+     * data-layer fill in VirtualPackageManagerService leaves signatures
+     * null for them. Parse the sandbox APK directly (same bytes as the
+     * real APK, so same signatures) — the same extraction parseApkDirect
+     * already uses. getPackageArchiveInfo is not intercepted by this
+     * proxy, so there is no re-entrancy loop.
+     */
+    @Suppress("DEPRECATION")
+    private fun fillLegacySignatures(info: PackageInfo, flags: Int) {
+        if (flags and PackageManager.GET_SIGNATURES == 0) return
+        if (info.signatures != null) return
+        val apkPath = info.applicationInfo?.sourceDir ?: return
+        try {
+            val archive = context.packageManager.getPackageArchiveInfo(
+                apkPath, PackageManager.GET_SIGNATURES
+            )
+            val sigs = archive?.signatures
+            if (sigs != null) {
+                info.signatures = sigs
+                Timber.tag(TAG).d(
+                    "fillLegacySignatures: filled ${sigs.size} signatures from APK"
+                )
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("fillLegacySignatures failed: ${e.message}")
+        }
+    }
+
     private fun handleGetPackageInfo(method: Method, args: Array<out Any>?): Any? {
         if (args == null || args.isEmpty()) return invokeOriginal(method, args)
 
@@ -193,6 +223,7 @@ class PackageManagerProxy(
         // The virtual service is the source of truth for Guest package data.
         if (packageName != null && virtualPm.isVirtualPackage(packageName)) {
             val info = virtualPm.getPackageInfo(packageName, flags)
+            if (info != null) fillLegacySignatures(info, flags)
             Timber.tag(TAG).d("Returning virtual PackageInfo for $packageName")
             return info
         }

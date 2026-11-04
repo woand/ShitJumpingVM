@@ -216,6 +216,21 @@ class VirtualPackageManagerService @Inject constructor() {
                     this.signingInfo = record.packageInfo.signingInfo
                 }
             }
+            // v149: legacy GET_SIGNATURES compat. Old SDK code (e.g. CM
+            // DeviceInfoUtils.getKeyInfo) reads PackageInfo.signatures[0];
+            // the virtual record never filled this deprecated field, so
+            // guest callers NPE'd while the real device returns real
+            // signatures. Fill from signingInfo when available; the PM
+            // proxy adds an APK-parse fallback for disk-registered
+            // records, which carry no signingInfo.
+            if (flags and PackageManager.GET_SIGNATURES != 0) {
+                this.signatures = record.packageInfo.signatures
+                    ?: if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                        record.packageInfo.signingInfo?.apkContentsSigners
+                    } else {
+                        null
+                    }
+            }
         }
     }
 
