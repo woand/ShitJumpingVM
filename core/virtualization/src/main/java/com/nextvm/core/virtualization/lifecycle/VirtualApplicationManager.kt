@@ -2139,15 +2139,20 @@ class VirtualApplicationManager @Inject constructor(
      * VMP caveat: if the caller method itself is VM-protected, its
      * body is VM bytecode, not dex bytecode, and no dump will show
      * the call — that outcome is itself a finding.
+     * v150: also scan /memfd: mappings — the shell's MAIN decrypted
+     * dex is likely memfd-backed (InMemoryDexClassLoader), which the
+     * anonymous-only filter skipped (hence only small dexes were
+     * ever dumped). Blob cap raised to 64 so small dexes found
+     * first cannot crowd out the main dex; 512MB total cap kept.
      */
     private fun dumpMemoryDex(application: Application) {
         val pid = android.os.Process.myPid()
-        GuestBreadcrumb.log("v121-plugin-probe memdex scan started pid=$pid")
+        GuestBreadcrumb.log("v150-memdex scan started pid=$pid memfd=on")
         val dumpedRanges = ArrayList<Pair<Long, Long>>()
         val dumpedKeys = HashSet<String>()
         var count = 0
         var totalBytes = 0L
-        val maxBlobs = 32
+        val maxBlobs = 64
         val maxTotal = 512L * 1024L * 1024L
         try {
             val maps = java.io.File("/proc/self/maps").readLines()
@@ -2165,7 +2170,9 @@ class VirtualApplicationManager @Inject constructor(
                     val perms = m.groupValues[3]
                     val path = m.groupValues[4].trim()
                     if (!perms.startsWith("r")) continue
-                    if (path.isNotEmpty() && !path.startsWith("[")) continue
+                    if (path.isNotEmpty() && !path.startsWith("[") &&
+                        !path.startsWith("/memfd:")
+                    ) continue
                     if (path.contains("jit-cache")) continue
                     var pos = start
                     while (pos < end &&
