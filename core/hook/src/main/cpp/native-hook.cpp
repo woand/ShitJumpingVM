@@ -1394,17 +1394,20 @@ static bool is_address_readable(const void* addr, size_t len) {
     return true;
 }
 
-// ==================== v147: failed-connect / failed-DNS ring ====================
+// ==================== v148: failed-connect / failed-DNS ring ====================
+// v148 change vs v147: connect events with errno == EINPROGRESS are no
+// longer recorded (non-blocking "in progress", not a failure). Only hard
+// connect errors and getaddrinfo failures reach the ring.
 // Diagnostic only, CM-gated. Hook bodies obey the forbidden-zone rule:
 // integer compares, one package-string compare, fixed-buffer copies and
 // atomic slot claims only — no PLT-routed libc calls, no allocation,
 // no file I/O (a hook body that opened a file would recurse through
-// hooked_open/hooked_fopen). Events are drained to v147-connect-probe.log
+// hooked_open/hooked_fopen). Events are drained to v148-connect-probe.log
 // by Kotlin (face-tap delayed dump + 20s timer), never from a hook.
 // Recorded data is infrastructure only: endpoint IP/port, errno/EAI code,
 // wall-clock ms. No hostnames beyond the DNS query name, no URLs, no
 // request or response content.
-struct V147Event {
+struct V148Event {
     int64_t wall_ms;
     int32_t kind;  // 0 = connect failed, 1 = getaddrinfo failed
     int32_t err;   // errno (connect) or EAI code (getaddrinfo)
@@ -1412,13 +1415,13 @@ struct V147Event {
     char ip[64];
     char host[128]; // getaddrinfo node only
 };
-static constexpr int kV147Cap = 512;
-static V147Event g_v147_events[kV147Cap];
-static std::atomic<int> g_v147_ready[kV147Cap];
-static std::atomic<int> g_v147_head{0};
-static std::atomic<int> g_v147_drained{0};
+static constexpr int kV148Cap = 512;
+static V148Event g_v148_events[kV148Cap];
+static std::atomic<int> g_v148_ready[kV148Cap];
+static std::atomic<int> g_v148_head{0};
+static std::atomic<int> g_v148_drained{0};
 
-static int64_t v147_wall_ms() {
+static int64_t v148_wall_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -1437,10 +1440,21 @@ static int hooked_connect(int sockfd, const struct sockaddr* addr,
         // Internet sockets only; AF_UNIX noise is skipped.
         if (addr->sa_family == AF_INET || addr->sa_family == AF_INET6) {
             int e = errno;
-            int slot = g_v147_head.fetch_add(1);
-            if (slot < kV147Cap) {
-                V147Event& ev = g_v147_events[slot];
-                ev.wall_ms = v147_wall_ms();
+            // v148: EINPROGRESS is NOT a failure. It is the normal
+            // "in progress" return of a non-blocking connect — Android
+            // timed Socket.connect takes this path for every attempt,
+            // then resolves the outcome via poll + SO_ERROR. v147
+            // recorded it and drowned real errors in noise. Pending
+            // connects are skipped without consuming a ring slot;
+            // only hard errors (refused, timeout, unreachable,
+            // reset, ...) are recorded.
+            if (e == EINPROGRESS) {
+                return rc;
+            }
+            int slot = g_v148_head.fetch_add(1);
+            if (slot < kV148Cap) {
+                V148Event& ev = g_v148_events[slot];
+                ev.wall_ms = v148_wall_ms();
                 ev.kind = 0;
                 ev.err = e;
                 ev.port = 0;
@@ -1460,7 +1474,7 @@ static int hooked_connect(int sockfd, const struct sockaddr* addr,
                     inet_ntop(AF_INET6, &in6->sin6_addr, ev.ip,
                               sizeof(ev.ip));
                 }
-                g_v147_ready[slot].store(1, std::memory_order_release);
+                g_v148_ready[slot].store(1, std::memory_order_release);
             }
         }
     }
@@ -1477,10 +1491,10 @@ static int hooked_getaddrinfo(const char* node, const char* service,
     if (rc != 0 &&
         g_spoofed_package_name ==
             "com.greenpoint.android.mc10086.activity") {
-        int slot = g_v147_head.fetch_add(1);
-        if (slot < kV147Cap) {
-            V147Event& ev = g_v147_events[slot];
-            ev.wall_ms = v147_wall_ms();
+        int slot = g_v148_head.fetch_add(1);
+        if (slot < kV148Cap) {
+            V148Event& ev = g_v148_events[slot];
+            ev.wall_ms = v148_wall_ms();
             ev.kind = 1;
             ev.err = rc;
             ev.port = 0;
@@ -1492,7 +1506,7 @@ static int hooked_getaddrinfo(const char* node, const char* service,
                 strncpy(ev.host, "(null)", sizeof(ev.host) - 1);
                 ev.host[sizeof(ev.host) - 1] = '\0';
             }
-            g_v147_ready[slot].store(1, std::memory_order_release);
+            g_v148_ready[slot].store(1, std::memory_order_release);
         }
     }
     return rc;
@@ -5975,7 +5989,7 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeArmSeccompDiag(
 }
 
 /**
- * v147: drain the failed-connect / failed-DNS ring as one string.
+ * v148: drain the failed-connect / failed-DNS ring as one string.
  * MUST match Kotlin: nativeDumpConnectProbe(): String?
  * Returns null when no new events since the last drain. Runs outside
  * any hook body, so snprintf/String building here is safe.
@@ -5985,35 +5999,35 @@ Java_com_nextvm_core_hook_NativeHookBridge_nativeDumpConnectProbe(
     JNIEnv* env, jobject thiz)
 {
     (void)thiz;
-    int head = g_v147_head.load(std::memory_order_acquire);
-    int upto = g_v147_drained.load(std::memory_order_acquire);
+    int head = g_v148_head.load(std::memory_order_acquire);
+    int upto = g_v148_drained.load(std::memory_order_acquire);
     if (head <= upto) {
         return nullptr;
     }
     std::string out;
     char line[320];
-    for (int i = upto; i < head && i < kV147Cap; ++i) {
-        if (!g_v147_ready[i].load(std::memory_order_acquire)) {
+    for (int i = upto; i < head && i < kV148Cap; ++i) {
+        if (!g_v148_ready[i].load(std::memory_order_acquire)) {
             continue;
         }
-        const V147Event& ev = g_v147_events[i];
+        const V148Event& ev = g_v148_events[i];
         if (ev.kind == 0) {
             snprintf(line, sizeof(line),
-                     "v147 connect-fail wall_ms=%lld ip=%s port=%u "
+                     "v148 connect-fail wall_ms=%lld ip=%s port=%u "
                      "errno=%d\n",
                      (long long)ev.wall_ms, ev.ip,
                      (unsigned)ev.port, ev.err);
         } else {
             snprintf(line, sizeof(line),
-                     "v147 gai-fail wall_ms=%lld host=%s eai=%d\n",
+                     "v148 gai-fail wall_ms=%lld host=%s eai=%d\n",
                      (long long)ev.wall_ms, ev.host, ev.err);
         }
         out += line;
     }
-    g_v147_drained.store(head, std::memory_order_release);
-    if (head > kV147Cap) {
+    g_v148_drained.store(head, std::memory_order_release);
+    if (head > kV148Cap) {
         char cap[64];
-        snprintf(cap, sizeof(cap), "v147 CAPPED head=%d\n", head);
+        snprintf(cap, sizeof(cap), "v148 CAPPED head=%d\n", head);
         out += cap;
     }
     if (out.empty()) {

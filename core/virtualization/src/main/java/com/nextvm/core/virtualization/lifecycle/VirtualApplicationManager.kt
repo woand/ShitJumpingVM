@@ -45,13 +45,13 @@ import javax.inject.Singleton
  */
 @Singleton
 /**
- * v147: drain the native failed-connect / failed-DNS ring and append
- * new events to v147-connect-probe.log in the guest files dir.
+ * v148: drain the native failed-connect / failed-DNS ring and append
+ * new events to v148-connect-probe.log in the guest files dir.
  * File-private top-level so both the VAM timer and the nested
  * V134ClickWrapper can call it. Runs outside any native hook body,
  * so file I/O here is safe. No-op when there are no new events.
  */
-private fun dumpV147ConnectProbe() {
+private fun dumpV148ConnectProbe() {
     try {
         val ev = NativeHookBridge.dumpConnectProbe()
         if (ev.isNullOrEmpty()) return
@@ -60,7 +60,7 @@ private fun dumpV147ConnectProbe() {
         } catch (_: Throwable) {
             null
         } ?: return
-        java.io.File(dir, "v147-connect-probe.log").appendText(ev)
+        java.io.File(dir, "v148-connect-probe.log").appendText(ev)
     } catch (_: Throwable) {
     }
 }
@@ -470,7 +470,7 @@ class VirtualApplicationManager @Inject constructor(
                                 wrapFaceVerifyButton(it)
                                 probeAuthIntentPhone(it)
                                 probeAuthIntentPhone145(it)
-                                dumpV147ConnectProbe()
+                                dumpV148ConnectProbe()
                             }
                         } catch (_: Throwable) {
                         }
@@ -2582,14 +2582,14 @@ class VirtualApplicationManager @Inject constructor(
                     )
                 }
             }
-            // v147: the identityCheck failure lands ~0.5-1.5s after
+            // v148: the identityCheck failure lands ~0.5-1.5s after
             // the click returns, so dump the native connect/DNS ring
             // 15s later. Posted before invoking the original so it
             // fires even if the original throws.
             android.os.Handler(
                 android.os.Looper.getMainLooper()
             ).postDelayed({
-                dumpV147ConnectProbe()
+                dumpV148ConnectProbe()
             }, 15000L)
             try {
                 original.onClick(v)

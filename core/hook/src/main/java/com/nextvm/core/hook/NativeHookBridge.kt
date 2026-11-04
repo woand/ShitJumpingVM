@@ -110,7 +110,7 @@ class NativeHookBridge @Inject constructor() {
         external fun nativeReadRealMaps(): String?
 
         /**
-         * v147: drain the native failed-connect / failed-DNS ring
+         * v148: drain the native failed-connect / failed-DNS ring
          * (hooked_connect / hooked_getaddrinfo). Null when the native
          * library is unavailable or no new events since the last drain.
          * Called from outside any hook body, so file I/O here is safe.
