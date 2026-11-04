@@ -66,16 +66,19 @@ private fun dumpV148ConnectProbe() {
 }
 
 /**
- * v151: init-time trace, started once per process at bind entry.
+ * v152: init-time trace, started once per process at bind entry.
  * Same Debug.startMethodTracing technique as v134, retargeted at
  * the startup window: Application.onCreate + provider init + SDK
  * inits (in particular the risk SDK's device reads, which the
  * click trace never sees because they run at init, not per
- * request). 64MB buffer, 20s delayed stop. After stop, a
- * background filter pass extracts only device-identity method
- * entries (risk SDK, Telephony, Settings, Wifi/Location,
- * DeviceInfoUtils/key-info, package info) into
- * v151-init-filtered.log. Trace format (ART SLOW v3, same as the
+ * request). 64MB buffer, 90s delayed stop (window = min(90s,
+ * buffer fill)). After stop, a background filter pass extracts
+ * only device-identity method entries (risk SDK, Telephony,
+ * Settings, Wifi/Location, DeviceInfoUtils/key-info, package
+ * info, plus the bridge failure chain) into
+ * v152-init-filtered.log; v152 also runs the same pass on the
+ * v134 click trace (v152-click-filtered.log). Trace format
+ * (ART SLOW v3, same as the
  * v134 files): text header with a *methods section of
  * "hexId<TAB>class<TAB>method" lines up to "*end", then "SLOW"
  * + 14-byte records <u16 tid, u32 mid, u32 t1, u32 t2>; low bit
@@ -83,48 +86,50 @@ private fun dumpV148ConnectProbe() {
  * class + "." + method; only ENTER records are kept.
  */
 @Volatile
-private var v151InitTraceStarted = false
+private var v152InitTraceStarted = false
 
-private fun startV151InitTrace() {
-    if (v151InitTraceStarted) return
+private fun startV152InitTrace() {
+    if (v152InitTraceStarted) return
     try {
         val dir = GuestBreadcrumb.filesDir() ?: return
-        v151InitTraceStarted = true
+        v152InitTraceStarted = true
         val traceFile = java.io.File(
-            dir, "v151-trace-" + android.os.Process.myPid() + "-1.trace"
+            dir, "v152-trace-" + android.os.Process.myPid() + "-1.trace"
         )
         android.os.Debug.startMethodTracing(
             traceFile.absolutePath, 64 * 1024 * 1024
         )
-        GuestBreadcrumb.log("v151-trace start file=" + traceFile.name)
+        GuestBreadcrumb.log("v152-trace start file=" + traceFile.name)
         android.os.Handler(
             android.os.Looper.getMainLooper()
         ).postDelayed({
             try {
                 android.os.Debug.stopMethodTracing()
                 GuestBreadcrumb.log(
-                    "v151-trace stop delayed file=" + traceFile.name
+                    "v152-trace stop delayed file=" + traceFile.name
                 )
             } catch (e: Throwable) {
                 GuestBreadcrumb.log(
-                    "v151-trace stop failed " +
+                    "v152-trace stop failed " +
                         "${e.javaClass.simpleName}: " + e.message
                 )
             }
             Thread({
-                filterV151Trace(traceFile, dir)
-            }, "v151-trace-filter").start()
-        }, 20000L)
+                filterV152Trace(traceFile, dir)
+            }, "v152-trace-filter").start()
+        }, 90000L)
     } catch (e: Throwable) {
         GuestBreadcrumb.log(
-            "v151-trace start failed " +
+            "v152-trace start failed " +
                 "${e.javaClass.simpleName}: " + e.message
         )
     }
 }
 
-private fun filterV151Trace(
-    traceFile: java.io.File, dir: java.io.File
+private fun filterV152Trace(
+    traceFile: java.io.File, dir: java.io.File,
+    outName: String = "v152-init-filtered.log",
+    tag: String = "v152"
 ) {
     try {
         val data = traceFile.readBytes()
@@ -144,7 +149,7 @@ private fun filterV151Trace(
             i++
         }
         if (textEnd < 0) {
-            GuestBreadcrumb.log("v151-filter failed no *end")
+            GuestBreadcrumb.log("$tag-filter failed no *end")
             return
         }
         val methods = HashMap<Int, String>()
@@ -178,7 +183,7 @@ private fun filterV151Trace(
             data[blobOff + 2] != 'O'.code.toByte() ||
             data[blobOff + 3] != 'W'.code.toByte()
         ) {
-            GuestBreadcrumb.log("v151-filter failed no SLOW")
+            GuestBreadcrumb.log("$tag-filter failed no SLOW")
             return
         }
         fun u32(off: Int): Int {
@@ -189,16 +194,18 @@ private fun filterV151Trace(
         }
         val recSize = u32(blobOff + 16)
         if (recSize < 14) {
-            GuestBreadcrumb.log("v151-filter failed recSize=$recSize")
+            GuestBreadcrumb.log("$tag-filter failed recSize=$recSize")
             return
         }
         val keys = arrayOf(
             "zw/mobile/risk", "TelephonyManager",
             "Settings\$Secure", "WifiManager", "LocationManager",
             "DeviceInfoUtils", "RequestForBridge",
-            "getPackageInfo", "getPackageManager", "android.os.Build"
+            "getPackageInfo", "getPackageManager", "android.os.Build",
+            "ResponseProcess", "ErrorForBridge", "callBackError",
+            "onHttpFailure", "onHttpSuccess"
         )
-        val out = java.io.File(dir, "v151-init-filtered.log")
+        val out = java.io.File(dir, outName)
         var total = 0
         var matched = 0
         out.bufferedWriter().use { w ->
@@ -225,12 +232,12 @@ private fun filterV151Trace(
             }
         }
         GuestBreadcrumb.log(
-            "v151-filter done matched=$matched total=$total " +
+            "$tag-filter done matched=$matched total=$total " +
                 "file=" + out.name + " traceBytes=" + data.size
         )
     } catch (e: Throwable) {
         GuestBreadcrumb.log(
-            "v151-filter failed " +
+            "$tag-filter failed " +
                 "${e.javaClass.simpleName}: " + e.message
         )
     }
@@ -335,18 +342,18 @@ class VirtualApplicationManager @Inject constructor(
         // bind-complete schedule() calls below become no-ops.
         WebViewWatch.schedule(packageName, virtualContext.filesDir)
 
-        // v151: init-time method trace, CM-gated, once per process.
+        // v152: init-time method trace, CM-gated, once per process.
         // Starts at bind entry (before the framework bind creates
         // the Application), so Application.onCreate + provider init
-        // + SDK inits are inside the window. 64MB buffer, 20s
+        // + SDK inits are inside the window. 64MB buffer, 90s
         // delayed stop (whichever fills/stops first wins). After
         // stop, a background filter pass extracts only
-        // device-identity reads into v151-init-filtered.log, so
+        // device-identity reads into v152-init-filtered.log, so
         // the small file — not the 64MB trace — is what gets
         // pulled. The full trace stays on-device as backup. A
         // failed start/stop/filter never touches the bind.
         if (packageName == "com.greenpoint.android.mc10086.activity") {
-            startV151InitTrace()
+            startV152InitTrace()
         }
 
         var legacyPrevInstr: Instrumentation? = null
@@ -2765,6 +2772,16 @@ class VirtualApplicationManager @Inject constructor(
                                         e.message
                                 )
                             }
+                            // v152: same filter pass on the click
+                            // trace, so a Secure-setting read's
+                            // thread/time is captured in
+                            // v152-click-filtered.log.
+                            Thread({
+                                filterV152Trace(
+                                    traceFile, dir,
+                                    "v152-click-filtered.log", "v152-click"
+                                )
+                            }, "v152-click-filter").start()
                         }, 8000L)
                     }
                 } catch (e: Throwable) {
