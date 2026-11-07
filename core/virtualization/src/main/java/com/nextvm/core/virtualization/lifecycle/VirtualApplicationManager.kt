@@ -66,7 +66,7 @@ private fun dumpV148ConnectProbe() {
 }
 
 /**
- * v154: init-time trace, started once per process at bind entry.
+ * v155: init-time trace, started once per process at bind entry.
  * v153 tried Debug.startMethodTracingSampling(path, 64MB, 1000us)
  * with a 90s window — and FROZE the guest in all three test
  * sessions (2026-11-06: main thread stuck 7-9s in File.exists /
@@ -80,8 +80,8 @@ private fun dumpV148ConnectProbe() {
  * a background filter pass extracts only device-identity method
  * entries (risk SDK, Telephony, Settings, Wifi/Location,
  * DeviceInfoUtils/key-info, package info, plus the bridge
- * failure chain) into v154-init-filtered.log; the same pass runs
- * on the v134 click trace (v154-click-filtered.log). Trace
+ * failure chain) into v155-init-filtered.log; the same pass runs
+ * on the v134 click trace (v155-click-filtered.log). Trace
  * format (ART SLOW v3, same as the v134 files): text header with
  * a *methods section of "hexId<TAB>class<TAB>method" lines up to
  * "*end", then "SLOW" + 14-byte records <u16 tid, u32 mid,
@@ -90,13 +90,13 @@ private fun dumpV148ConnectProbe() {
  * ENTER records only.
  */
 @Volatile
-private var v154InitTraceStarted = false
+private var v155InitTraceStarted = false
 
 @Volatile
-private var v154InitTraceStoppedByClick = false
+private var v155InitTraceStoppedByClick = false
 
 /**
- * v154: stop-before-start for the click traces (kept from v153,
+ * v155: stop-before-start for the click traces (kept from v153,
  * which never fired in the frozen sessions — exonerated). If a
  * trace is active (the init trace's 20s timer has not fired
  * yet), stop it first — a second startMethodTracing while
@@ -108,17 +108,17 @@ private var v154InitTraceStoppedByClick = false
  * just log it — that tells us whether a trace was active at
  * click time.
  */
-private fun v154StopBeforeStart(dir: java.io.File, tag: String) {
+private fun v155StopBeforeStart(dir: java.io.File, tag: String) {
     try {
         android.os.Debug.stopMethodTracing()
         GuestBreadcrumb.log("$tag stop-before-start")
-        v154InitTraceStoppedByClick = true
+        v155InitTraceStoppedByClick = true
         val initFile = java.io.File(
-            dir, "v154-trace-" + android.os.Process.myPid() + "-1.trace"
+            dir, "v155-trace-" + android.os.Process.myPid() + "-1.trace"
         )
         Thread({
             filterV154Trace(initFile, dir)
-        }, "v154-trace-filter").start()
+        }, "v155-trace-filter").start()
     } catch (e: Throwable) {
         GuestBreadcrumb.log(
             "$tag stop-before-start none " +
@@ -128,44 +128,44 @@ private fun v154StopBeforeStart(dir: java.io.File, tag: String) {
 }
 
 private fun startV154InitTrace() {
-    if (v154InitTraceStarted) return
+    if (v155InitTraceStarted) return
     try {
         val dir = GuestBreadcrumb.filesDir() ?: return
-        v154InitTraceStarted = true
+        v155InitTraceStarted = true
         val traceFile = java.io.File(
-            dir, "v154-trace-" + android.os.Process.myPid() + "-1.trace"
+            dir, "v155-trace-" + android.os.Process.myPid() + "-1.trace"
         )
         android.os.Debug.startMethodTracing(
             traceFile.absolutePath, 64 * 1024 * 1024
         )
-        GuestBreadcrumb.log("v154-trace start file=" + traceFile.name)
+        GuestBreadcrumb.log("v155-trace start file=" + traceFile.name)
         android.os.Handler(
             android.os.Looper.getMainLooper()
         ).postDelayed({
-            if (v154InitTraceStoppedByClick) {
+            if (v155InitTraceStoppedByClick) {
                 GuestBreadcrumb.log(
-                    "v154-trace stop skipped already stopped by click"
+                    "v155-trace stop skipped already stopped by click"
                 )
             } else {
                 try {
                     android.os.Debug.stopMethodTracing()
                     GuestBreadcrumb.log(
-                        "v154-trace stop delayed file=" + traceFile.name
+                        "v155-trace stop delayed file=" + traceFile.name
                     )
                 } catch (e: Throwable) {
                     GuestBreadcrumb.log(
-                        "v154-trace stop failed " +
+                        "v155-trace stop failed " +
                             "${e.javaClass.simpleName}: " + e.message
                     )
                 }
                 Thread({
                     filterV154Trace(traceFile, dir)
-                }, "v154-trace-filter").start()
+                }, "v155-trace-filter").start()
             }
         }, 20000L)
     } catch (e: Throwable) {
         GuestBreadcrumb.log(
-            "v154-trace start failed " +
+            "v155-trace start failed " +
                 "${e.javaClass.simpleName}: " + e.message
         )
     }
@@ -173,8 +173,8 @@ private fun startV154InitTrace() {
 
 private fun filterV154Trace(
     traceFile: java.io.File, dir: java.io.File,
-    outName: String = "v154-init-filtered.log",
-    tag: String = "v154",
+    outName: String = "v155-init-filtered.log",
+    tag: String = "v155",
     sampled: Boolean = false
 ) {
     try {
@@ -388,14 +388,14 @@ class VirtualApplicationManager @Inject constructor(
         // bind-complete schedule() calls below become no-ops.
         WebViewWatch.schedule(packageName, virtualContext.filesDir)
 
-        // v154: init-time method trace, CM-gated, once per process.
+        // v155: init-time method trace, CM-gated, once per process.
         // Starts at bind entry (before the framework bind creates
         // the Application), so Application.onCreate + provider init
         // + SDK inits are inside the window. Full tracing (v153's
         // 1ms sampling froze the guest — reverted), 64MB buffer,
         // 20s delayed stop. After
         // stop, a background filter pass extracts only
-        // device-identity reads into v154-init-filtered.log, so
+        // device-identity reads into v155-init-filtered.log, so
         // the small file — not the 64MB trace — is what gets
         // pulled. The full trace stays on-device as backup. A
         // failed start/stop/filter never touches the bind.
@@ -692,8 +692,13 @@ class VirtualApplicationManager @Inject constructor(
             // v124: repeating login-button check on the main looper.
             // Tab switches inside one Activity never resume a new
             // Activity, so resume alone cannot see the 我的 tab's
-            // button appearing later; a 20s timer for 10 minutes
-            // covers it. Read-only hierarchy walk, main thread only.
+            // button appearing later. v155: the 20s timer missed
+            // the user's few-seconds visit to the 我的 tab, so the
+            // timer is 5s for 10 minutes now (120 runs) — a full
+            // hierarchy walk is milliseconds, and the breadcrumb
+            // only logs on signature change, so the finer tick
+            // costs no log spam. Read-only hierarchy walk, main
+            // thread only.
             if (!loginProbeTimerStarted) {
                 loginProbeTimerStarted = true
                 val handler = android.os.Handler(
@@ -714,10 +719,10 @@ class VirtualApplicationManager @Inject constructor(
                         } catch (_: Throwable) {
                         }
                         runs++
-                        if (runs < 30) handler.postDelayed(this, 20_000L)
+                        if (runs < 120) handler.postDelayed(this, 5_000L)
                     }
                 }
-                handler.postDelayed(r, 20_000L)
+                handler.postDelayed(r, 5_000L)
             }
         } catch (e: Throwable) {
             GuestBreadcrumb.logThrowable("register breadcrumb callbacks FAILED", e)
@@ -2713,10 +2718,10 @@ class VirtualApplicationManager @Inject constructor(
                                 android.os.Process.myPid() +
                                 "-1.trace"
                         )
-                        // v154: same stop-before-start as the face
+                        // v155: same stop-before-start as the face
                         // click trace — a login tap inside the init
                         // window otherwise starts nothing.
-                        v154StopBeforeStart(dir, "v154-login")
+                        v155StopBeforeStart(dir, "v155-login")
                         android.os.Debug.startMethodTracing(
                             traceFile.absolutePath, 32 * 1024 * 1024
                         )
@@ -2801,12 +2806,12 @@ class VirtualApplicationManager @Inject constructor(
                                 android.os.Process.myPid() +
                                 "-1.trace"
                         )
-                        // v154: stop any active trace first (the
+                        // v155: stop any active trace first (the
                         // init trace's 20s timer may not have
                         // fired); a second start while tracing is
                         // a silent no-op (v152's click trace came
                         // back 0 bytes).
-                        v154StopBeforeStart(dir, "v154-click")
+                        v155StopBeforeStart(dir, "v155-click")
                         android.os.Debug.startMethodTracing(
                             traceFile.absolutePath, 64 * 1024 * 1024
                         )
@@ -2829,16 +2834,16 @@ class VirtualApplicationManager @Inject constructor(
                                         e.message
                                 )
                             }
-                            // v154: same filter pass on the click
+                            // v155: same filter pass on the click
                             // trace, so a Secure-setting read's
                             // thread/time is captured in
-                            // v154-click-filtered.log.
+                            // v155-click-filtered.log.
                             Thread({
                                 filterV154Trace(
                                     traceFile, dir,
-                                    "v154-click-filtered.log", "v154-click"
+                                    "v155-click-filtered.log", "v155-click"
                                 )
-                            }, "v154-click-filter").start()
+                            }, "v155-click-filter").start()
                         }, 8000L)
                     }
                 } catch (e: Throwable) {
@@ -3196,18 +3201,27 @@ class VirtualApplicationManager @Inject constructor(
                 )
                 return
             }
-            val idInt = try {
-                a.resources.getIdentifier(
-                    "mine_login_btn", "id", a.packageName
-                )
-            } catch (_: Throwable) {
-                0
-            }
+            // v155: two id rules (mine_login_btn on the 我的 page,
+            // identity_login_tip = 人脸识别登录 on the login page)
+            // and two text rules ("登录", "人脸识别登录").
+            // Candidates are collected, not first-won: the old code
+            // stopped at the first "登录" TextView, which on the
+            // login page is the non-clickable one_key_login_tv
+            // label, and never wrapped the real button.
+            val idInts = listOf(
+                "mine_login_btn", "identity_login_tip"
+            ).map {
+                try {
+                    a.resources.getIdentifier(it, "id", a.packageName)
+                } catch (_: Throwable) {
+                    0
+                }
+            }.filter { it != 0 }
             var total = 0
             var clickableTotal = 0
             var clickableWithListener = 0
-            var match: android.view.View? = null
-            var textMatch: android.view.View? = null
+            val idMatches = ArrayList<android.view.View>()
+            val textMatches = ArrayList<android.view.View>()
             val stack = ArrayDeque<android.view.View>()
             stack.add(decor)
             while (stack.isNotEmpty()) {
@@ -3222,14 +3236,15 @@ class VirtualApplicationManager @Inject constructor(
                     }
                 } catch (_: Throwable) {
                 }
-                if (match == null && idInt != 0 && v.id == idInt) {
-                    match = v
+                if (idInts.contains(v.id)) {
+                    idMatches.add(v)
                 }
-                if (textMatch == null &&
-                    v is android.widget.TextView
-                ) {
+                if (v is android.widget.TextView) {
                     try {
-                        if (v.text?.toString() == "登录") textMatch = v
+                        val t = v.text?.toString()
+                        if (t == "登录" || t == "人脸识别登录") {
+                            textMatches.add(v)
+                        }
                     } catch (_: Throwable) {
                     }
                 }
@@ -3242,10 +3257,26 @@ class VirtualApplicationManager @Inject constructor(
                     }
                 }
             }
-            val target = match ?: textMatch
+            // Prefer a candidate that is clickable AND has a
+            // listener (the wrappable button); fall back to any id
+            // match, then any text match. A non-clickable label
+            // must never win over a real button elsewhere in the
+            // tree.
+            fun wrapCandidate(v: android.view.View): Boolean {
+                return try {
+                    v.isClickable && v.hasOnClickListeners()
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+            val idTarget = idMatches.firstOrNull(::wrapCandidate)
+                ?: idMatches.firstOrNull()
+            val textTarget = textMatches.firstOrNull(::wrapCandidate)
+                ?: textMatches.firstOrNull()
+            val target = idTarget ?: textTarget
             val via = when {
-                match != null -> "id"
-                textMatch != null -> "text"
+                idTarget != null -> "id"
+                textTarget != null -> "text"
                 else -> "-"
             }
             var detail = "found=${target != null} via=$via"
